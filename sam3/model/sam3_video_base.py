@@ -797,7 +797,17 @@ class Sam3VideoBase(nn.Module):
             # here `rank0_metadata` contains metadata stored on (and only accessible to) GPU 0;
             # we avoid broadcasting them to other GPUs to save communication cost, assuming
             # that `rank0_metadata` is not needed by other GPUs
-            rank0_metadata_new = deepcopy(tracker_metadata_prev["rank0_metadata"])
+            # Shallow-copy rank0_metadata — nested structures (unmatched_frame_inds,
+            # overlap_pair_to_frame_inds, suppressed_obj_ids, etc.) are append-only
+            # and the previous metadata is discarded after this frame. A deepcopy
+            # here caused O(N²) overhead as these structures grow per-frame.
+            rank0_metadata_new = dict(tracker_metadata_prev["rank0_metadata"])
+            if "masklet_confirmation" in rank0_metadata_new:
+                # masklet_confirmation arrays are replaced (not mutated) in
+                # update_masklet_confirmation_status, so a shallow dict copy suffices.
+                rank0_metadata_new["masklet_confirmation"] = dict(
+                    rank0_metadata_new["masklet_confirmation"]
+                )
             if not hasattr(self, "_warm_up_complete") or self._warm_up_complete:
                 obj_ids_newly_removed, rank0_metadata_new = self._process_hotstart(
                     frame_idx=frame_idx,
@@ -1150,8 +1160,6 @@ class Sam3VideoBase(nn.Module):
 
     def _create_planning_metadata(self, tracker_metadata_prev):
         """Create the metadata dict for the planning phase from previous metadata."""
-        from copy import deepcopy
-
         score_key = "obj_id_to_tracker_score_frame_wise"
         if score_key not in tracker_metadata_prev:
             score_key = "obj_id_to_sam2_score_frame_wise"
@@ -1160,9 +1168,11 @@ class Sam3VideoBase(nn.Module):
             "obj_ids_all_gpu": None,
             "num_obj_per_gpu": deepcopy(tracker_metadata_prev["num_obj_per_gpu"]),
             "obj_id_to_score": deepcopy(tracker_metadata_prev["obj_id_to_score"]),
-            score_key: deepcopy(tracker_metadata_prev[score_key]),
+            # This mapping is append-only across frames, so sharing it avoids
+            # quadratic metadata growth during long tracking runs.
+            score_key: tracker_metadata_prev[score_key],
             "obj_id_to_last_occluded": {},
-            "max_obj_id": deepcopy(tracker_metadata_prev["max_obj_id"]),
+            "max_obj_id": tracker_metadata_prev["max_obj_id"],
         }
         return metadata
 
@@ -1650,6 +1660,16 @@ class Sam3VideoBase(nn.Module):
                     )
 
         removed_obj_ids.update(obj_ids_newly_removed)
+        # Clean up metadata for newly removed objects to prevent unbounded growth
+        for obj_id in obj_ids_newly_removed:
+            unmatched_frame_inds.pop(obj_id, None)
+            trk_keep_alive.pop(obj_id, None)
+            # Clean overlap pairs involving the removed object
+            keys_to_remove = [
+                k for k in overlap_pair_to_frame_inds if obj_id in k
+            ]
+            for k in keys_to_remove:
+                del overlap_pair_to_frame_inds[k]
         return obj_ids_newly_removed, rank0_metadata
 
     def _tracker_update_memories(

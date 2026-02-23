@@ -354,6 +354,17 @@ class Sam3VideoInference(Sam3VideoBase):
                 else:
                     postprocessed_out = None  # no output on other GPUs
                 yield yield_frame_idx, postprocessed_out
+                # Evict stale per-frame data after yielding to prevent unbounded
+                # memory growth during streaming propagation
+                inference_state["cached_frame_outputs"].pop(yield_frame_idx, None)
+                tracker_md = inference_state["tracker_metadata"]
+                tracker_md["obj_id_to_tracker_score_frame_wise"].pop(
+                    yield_frame_idx, None
+                )
+                if self.rank == 0:
+                    tracker_md["rank0_metadata"]["suppressed_obj_ids"].pop(
+                        yield_frame_idx, None
+                    )
 
     def _run_single_frame_inference(self, inference_state, frame_idx, reverse):
         """
