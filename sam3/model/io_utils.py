@@ -237,6 +237,16 @@ def load_video_frames_from_video_file(
             img_std=img_std,
             offload_video_to_cpu=offload_video_to_cpu,
         )
+    elif video_loader_type == "cv2_lazy":
+        logger.info("Using lazy cv2 loader (on-demand frame reading)")
+        lazy_images = LazyCv2VideoFrameLoader(
+            video_path=video_path,
+            image_size=image_size,
+            offload_video_to_cpu=offload_video_to_cpu,
+            img_mean=img_mean,
+            img_std=img_std,
+        )
+        return lazy_images, lazy_images.video_height, lazy_images.video_width
     elif video_loader_type == "torchcodec":
         logger.info("Using torchcodec to load video file")
         lazy_images = AsyncVideoFileLoaderWithTorchCodec(
@@ -256,7 +266,7 @@ def load_video_frames_from_video_file(
                 async_thread.join()
         return lazy_images, lazy_images.video_height, lazy_images.video_width
     else:
-        raise RuntimeError("video_loader_type must be either 'cv2' or 'torchcodec'")
+        raise RuntimeError("video_loader_type must be 'cv2', 'cv2_lazy', or 'torchcodec'")
 
 
 def load_video_frames_from_video_file_using_cv2(
@@ -414,6 +424,134 @@ class AsyncImageFrameLoader:
 
     def __len__(self):
         return len(self.images)
+
+
+class LazyCv2VideoFrameLoader:
+    """
+    Lazy on-demand video frame loader using OpenCV.
+
+    Reads and preprocesses frames from the video file one at a time via
+    cv2.VideoCapture, avoiding loading all frames into RAM upfront.
+    Each frame is decoded, resized, and normalized identically to
+    ``load_video_frames_from_video_file_using_cv2``.
+    """
+
+    def __init__(
+        self,
+        video_path: str,
+        image_size: int,
+        offload_video_to_cpu: bool = False,
+        img_mean: tuple = (0.5, 0.5, 0.5),
+        img_std: tuple = (0.5, 0.5, 0.5),
+    ):
+        import cv2
+
+        self._cv2 = cv2
+        self._video_path = video_path
+        self.image_size = image_size
+        self._offload_video_to_cpu = offload_video_to_cpu
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video: {video_path}")
+
+        self.video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if num_frames <= 0:
+            raise ValueError(
+                f"Could not determine frame count for video: {video_path}"
+            )
+        self._num_frames = num_frames
+        self._cap = cap
+
+        # Normalization tensors — shape (3, 1, 1) for per-frame ops.
+        # NOTE: matching the existing cv2 loader, pixel values are NOT divided
+        # by 255 before normalization.
+        self._img_mean = torch.tensor(img_mean, dtype=torch.float16).view(3, 1, 1)
+        self._img_std = torch.tensor(img_std, dtype=torch.float16).view(3, 1, 1)
+
+        if offload_video_to_cpu:
+            self._device = torch.device("cpu")
+        else:
+            self._device = torch.device("cuda")
+            self._img_mean = self._img_mean.cuda()
+            self._img_std = self._img_std.cuda()
+
+        # Track current read position so sequential reads skip seeking.
+        self._current_pos = 0
+
+    def _read_frame(self, idx: int) -> torch.Tensor:
+        """Read, preprocess, and return a single frame as a (C, H, W) float16 tensor."""
+        if idx < 0 or idx >= self._num_frames:
+            raise IndexError(
+                f"Frame index {idx} out of range [0, {self._num_frames})"
+            )
+
+        if self._current_pos != idx:
+            self._cap.set(self._cv2.CAP_PROP_POS_FRAMES, idx)
+
+        ret, frame = self._cap.read()
+        if not ret:
+            raise RuntimeError(
+                f"Failed to read frame {idx} from {self._video_path}"
+            )
+        self._current_pos = idx + 1
+
+        # BGR -> RGB, resize, float — matches load_video_frames_from_video_file_using_cv2
+        frame_rgb = self._cv2.cvtColor(frame, self._cv2.COLOR_BGR2RGB)
+        frame_resized = self._cv2.resize(
+            frame_rgb,
+            (self.image_size, self.image_size),
+            interpolation=self._cv2.INTER_CUBIC,
+        )
+        frame_np = frame_resized.astype(np.float32)  # values 0-255
+        frame_tensor = torch.from_numpy(frame_np).permute(2, 0, 1)  # (C, H, W)
+        frame_tensor = frame_tensor.to(device=self._device, dtype=torch.float16)
+        frame_tensor -= self._img_mean
+        frame_tensor /= self._img_std
+        return frame_tensor
+
+    def __getitem__(self, index):
+        if isinstance(index, (int, np.integer)):
+            return self._read_frame(int(index))
+        elif isinstance(index, torch.Tensor):
+            if index.numel() == 1:
+                return self._read_frame(index.item()).unsqueeze(0)
+            return torch.stack([self._read_frame(i) for i in index.tolist()])
+        raise TypeError(
+            f"LazyCv2VideoFrameLoader indices must be int or torch.Tensor, "
+            f"got {type(index)}"
+        )
+
+    def __len__(self) -> int:
+        return self._num_frames
+
+    def to(self, device, *args, **kwargs):
+        """Satisfy ``_CopyableData`` protocol for ``copy_data_to_device``."""
+        self._device = torch.device(device) if isinstance(device, str) else device
+        self._img_mean = self._img_mean.to(self._device)
+        self._img_std = self._img_std.to(self._device)
+        return self
+
+    def close(self):
+        """Release the underlying cv2.VideoCapture."""
+        if hasattr(self, "_cap") and self._cap is not None:
+            if self._cap.isOpened():
+                self._cap.release()
+            self._cap = None
+
+    def __del__(self):
+        self.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"LazyCv2VideoFrameLoader("
+            f"video={self._video_path!r}, "
+            f"frames={self._num_frames}, "
+            f"size={self.image_size}, "
+            f"device={self._device})"
+        )
 
 
 class TorchCodecDecoder:
