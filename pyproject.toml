@@ -40,6 +40,7 @@ dependencies = [
     "psutil",
     # sam3/model_builder.py imports pkg_resources at runtime.
     "setuptools<81",
+    "opencv-python-headless>=4.13.0.92",
 ]
 
 [project.optional-dependencies]
