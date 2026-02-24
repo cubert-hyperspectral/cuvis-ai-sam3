@@ -152,5 +152,6 @@ Thumbs.db
 *.bpe
 *.vocab
 .history/
+.claude/
 models/
 outputs/

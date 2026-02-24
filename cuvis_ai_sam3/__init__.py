@@ -8,6 +8,14 @@ This package lives inside the forked SAM3 repository and provides:
   (see :mod:`cuvis_ai_sam3.node`).
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("cuvis-ai-sam3")
+except PackageNotFoundError:
+    # Package is not installed, likely in development mode
+    __version__ = "dev"
+
 from sam3.model_builder import (  # noqa: F401
     build_sam3_image_model,
     build_sam3_video_model,
@@ -33,6 +41,7 @@ def register_all_nodes() -> int:
 
 
 __all__ = [
+    "__version__",
     "build_sam3_image_model",
     "build_sam3_video_model",
     "build_sam3_video_predictor",
