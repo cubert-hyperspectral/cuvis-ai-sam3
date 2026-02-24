@@ -144,3 +144,54 @@ GPU kernel timings. A timing summary table is printed at the end of every run.
     ]
 }
 ```
+
+---
+
+## render_tracking_overlay.py
+
+Re-renders mask overlays from a `tracking_results.json` without re-running
+SAM3 inference. Useful for adjusting overlay settings (opacity, ID labels,
+contours) or rendering overlays onto a different video (e.g. a false-RGB
+export from the cuvis-ai repo).
+
+Uses the same colour palette, alpha blending, contour drawing, and ID label
+placement as the built-in overlay in `sam3_tracking_example.py`.
+
+### Example: overlay tracking results onto a false-RGB video
+
+```powershell
+uv run python examples/object_tracking/render_tracking_overlay.py `
+    --video-path "D:\code-repos\cuvis-ai\cuvis-ai-sam3\outputs\compare_methods\cie_tristimulus.mp4" `
+    --tracking-json "D:\code-repos\cuvis-ai-sam3\outputs\tracking_objects\tracking_results.json" `
+    --output-video-path outputs/tracking_objects/overlay_cie_tristimulus.mp4
+```
+
+### Customise rendering
+
+```powershell
+# Lower opacity, no contour outlines
+uv run python examples/object_tracking/render_tracking_overlay.py `
+    --video-path "D:\code-repos\cuvis-ai\cuvis-ai-sam3\outputs\compare_methods\cie_tristimulus.mp4" `
+    --tracking-json "D:\code-repos\cuvis-ai-sam3\outputs\tracking_objects\tracking_results.json" `
+    --mask-alpha 0.3 --no-contours
+
+# IDs only, no contours, first 50 frames
+uv run python examples/object_tracking/render_tracking_overlay.py `
+    --video-path path/to/video.mp4 `
+    --tracking-json path/to/tracking_results.json `
+    --no-contours --end-frame 50
+```
+
+### CLI arguments
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--video-path` | str | **required** | Path to the source MP4 video |
+| `--tracking-json` | str | **required** | Path to `tracking_results.json` |
+| `--output-video-path` | str | `<json_dir>/overlay.mp4` | Output overlay MP4 path |
+| `--mask-alpha` | float | `0.4` | Overlay opacity (0-1) |
+| `--show-ids` / `--no-show-ids` | flag | on | Render `ID:<n>` labels |
+| `--show-contours` / `--no-show-contours` | flag | on | Draw contour outlines |
+| `--start-frame` | int | `0` | First frame to render (inclusive) |
+| `--end-frame` | int | `-1` | Last frame to render (`-1` = end) |
+| `--frame-rate` | float | source FPS | Output video FPS |
