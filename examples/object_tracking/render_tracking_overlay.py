@@ -1,28 +1,8 @@
 """Render mask overlay video from SAM3 tracking results.
 
-Reads a video and a ``tracking_results.json`` (produced by sub-task 2.2) and
-renders coloured mask overlays with object IDs — no SAM3 inference required.
-
-The overlay rendering logic (colour palette, alpha blending, contours, ID
-labels) matches ``StreamingOverlayWriter`` in ``sam3_tracking_example.py``
-exactly so that the standalone re-render looks identical to the built-in
-overlay produced during tracking.
-
-Usage
------
-Basic::
-
-    uv run python examples/object_tracking/render_tracking_overlay.py \
-        --video-path outputs/false_rgb.mp4 \
-        --tracking-json outputs/tracking_test/tracking_results.json
-
-Custom output and settings::
-
-    uv run python examples/object_tracking/render_tracking_overlay.py \
-        --video-path outputs/false_rgb.mp4 \
-        --tracking-json outputs/tracking_test/tracking_results.json \
-        --output-video-path outputs/overlay.mp4 \
-        --mask-alpha 0.5 --no-contours
+Supports both tracker JSON formats:
+- Legacy frame-based format with a top-level "frames" list
+- Video COCO-like format with "videos" and "annotations"
 """
 
 from __future__ import annotations
@@ -36,10 +16,6 @@ import cv2
 import numpy as np
 from pycocotools import mask as mask_utils
 from tqdm import tqdm
-
-# ---------------------------------------------------------------------------
-# Colour palette — identical to sam3_tracking_example.py
-# ---------------------------------------------------------------------------
 
 OBJECT_COLORS: list[tuple[int, int, int]] = [
     (255, 0, 0),      # red
@@ -56,13 +32,9 @@ OBJECT_COLORS: list[tuple[int, int, int]] = [
 
 
 def get_object_color(obj_id: int) -> tuple[int, int, int]:
-    """Return a deterministic RGB colour for *obj_id*."""
+    """Return a deterministic RGB color for object id."""
     return OBJECT_COLORS[obj_id % len(OBJECT_COLORS)]
 
-
-# ---------------------------------------------------------------------------
-# Overlay rendering — mirrors StreamingOverlayWriter.write_frame()
-# ---------------------------------------------------------------------------
 
 def render_overlay_frame(
     frame_bgr: np.ndarray,
@@ -72,29 +44,7 @@ def render_overlay_frame(
     draw_contours: bool = True,
     draw_ids: bool = True,
 ) -> np.ndarray:
-    """Render coloured mask overlays onto a single BGR frame.
-
-    Produces the same visual result as ``StreamingOverlayWriter.write_frame()``
-    in ``sam3_tracking_example.py``.
-
-    Parameters
-    ----------
-    frame_bgr : np.ndarray
-        BGR image, shape ``(H, W, 3)``, dtype ``uint8``.
-    masks_by_id : dict[int, np.ndarray]
-        Mapping of ``object_id`` to binary mask ``(H, W)``.
-    alpha : float
-        Overlay opacity (0–1).
-    draw_contours : bool
-        Draw contour outlines on mask edges.
-    draw_ids : bool
-        Render ``ID:<n>`` labels above each mask.
-
-    Returns
-    -------
-    np.ndarray
-        BGR frame with overlays applied.
-    """
+    """Render colored mask overlays onto one BGR frame."""
     if not masks_by_id:
         return frame_bgr
 
@@ -136,20 +86,62 @@ def render_overlay_frame(
     return out
 
 
-# ---------------------------------------------------------------------------
-# RLE decoding
-# ---------------------------------------------------------------------------
-
 def decode_rle_mask(rle: dict) -> np.ndarray:
-    """Decode a single COCO-style RLE dict to a binary mask ``(H, W)``."""
+    """Decode one COCO-style RLE dict to a binary mask (H, W)."""
     if isinstance(rle["counts"], str):
         rle = {"size": rle["size"], "counts": rle["counts"].encode("utf-8")}
     return mask_utils.decode(rle).astype(np.uint8)
 
 
-# ---------------------------------------------------------------------------
-# Main rendering loop
-# ---------------------------------------------------------------------------
+def _frame_lookup_from_legacy(tracking: dict) -> dict[int, dict[int, dict]]:
+    frame_data: dict[int, dict[int, dict]] = {}
+    for entry in tracking["frames"]:
+        frame_idx = int(entry["frame_idx"])
+        objs: dict[int, dict] = {}
+        for obj in entry.get("objects", []):
+            objs[int(obj["object_id"])] = obj["mask_rle"]
+        frame_data[frame_idx] = objs
+    return frame_data
+
+
+def _frame_lookup_from_video_coco(tracking: dict) -> dict[int, dict[int, dict]]:
+    videos = tracking.get("videos", [])
+    annotations = tracking.get("annotations", [])
+    if not videos:
+        raise ValueError("COCO tracking JSON missing 'videos' entries")
+
+    video = videos[0]
+    frame_indices = video.get("frame_indices")
+    if frame_indices is None:
+        start_frame = int(video.get("start_frame", 0))
+        length = int(video.get("length", 0))
+        if length > 0:
+            frame_indices = list(range(start_frame, start_frame + length))
+        else:
+            max_len = max((len(ann.get("segmentations", [])) for ann in annotations), default=0)
+            frame_indices = list(range(start_frame, start_frame + max_len))
+
+    frame_data: dict[int, dict[int, dict]] = {}
+    for ann in annotations:
+        track_id = int(ann.get("track_id", ann.get("id", 0)))
+        segmentations = ann.get("segmentations", [])
+        for idx, seg in enumerate(segmentations):
+            if seg is None or idx >= len(frame_indices):
+                continue
+            frame_idx = int(frame_indices[idx])
+            frame_data.setdefault(frame_idx, {})[track_id] = seg
+
+    return frame_data
+
+
+def build_frame_lookup(tracking: dict) -> dict[int, dict[int, dict]]:
+    """Build frame->object->RLE lookup from either supported tracking JSON format."""
+    if "frames" in tracking:
+        return _frame_lookup_from_legacy(tracking)
+    if "videos" in tracking and "annotations" in tracking:
+        return _frame_lookup_from_video_coco(tracking)
+    raise ValueError("Unsupported tracking JSON format: expected legacy frames or video COCO")
+
 
 def render_overlay_video(
     video_path: str | Path,
@@ -163,48 +155,11 @@ def render_overlay_video(
     end_frame: int = -1,
     frame_rate: float | None = None,
 ) -> Path:
-    """Render an overlay video from tracking results.
-
-    Parameters
-    ----------
-    video_path : path-like
-        Source video (MP4).
-    tracking_json_path : path-like
-        ``tracking_results.json`` from SAM3 tracking (sub-task 2.2).
-    output_video_path : path-like
-        Destination overlay MP4.
-    mask_alpha : float
-        Overlay opacity (0–1).
-    show_ids : bool
-        Draw ``ID:<n>`` labels.
-    show_contours : bool
-        Draw contour outlines on mask edges.
-    start_frame : int
-        First frame to render (inclusive).
-    end_frame : int
-        Last frame to render (inclusive, -1 = end of video).
-    frame_rate : float or None
-        Output FPS.  ``None`` copies the source video's FPS.
-
-    Returns
-    -------
-    Path
-        Resolved path to the written overlay video.
-    """
-    with open(tracking_json_path) as f:
+    """Render an overlay video from tracker JSON outputs."""
+    with open(tracking_json_path, encoding="utf-8") as f:
         tracking = json.load(f)
 
-    if "frames" not in tracking:
-        raise ValueError("tracking JSON missing 'frames' key")
-
-    # Build lookup: frame_idx -> {object_id: rle_dict}
-    frame_data: dict[int, dict[int, dict]] = {}
-    for entry in tracking["frames"]:
-        idx = entry["frame_idx"]
-        objs: dict[int, dict] = {}
-        for obj in entry.get("objects", []):
-            objs[obj["object_id"]] = obj["mask_rle"]
-        frame_data[idx] = objs
+    frame_data = build_frame_lookup(tracking)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -229,7 +184,7 @@ def render_overlay_video(
         if start_frame > 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-        for fidx in tqdm(
+        for frame_idx in tqdm(
             range(start_frame, end_frame + 1),
             desc="Rendering overlay",
             unit="frame",
@@ -238,14 +193,16 @@ def render_overlay_video(
             if not ret:
                 break
 
-            # Decode masks for this frame.
             masks_by_id: dict[int, np.ndarray] = {}
-            for obj_id, rle in frame_data.get(fidx, {}).items():
+            for obj_id, rle in frame_data.get(frame_idx, {}).items():
                 masks_by_id[obj_id] = decode_rle_mask(rle)
 
             out = render_overlay_frame(
-                frame_bgr, masks_by_id,
-                alpha=mask_alpha, draw_contours=show_contours, draw_ids=show_ids,
+                frame_bgr,
+                masks_by_id,
+                alpha=mask_alpha,
+                draw_contours=show_contours,
+                draw_ids=show_ids,
             )
             writer.write(out)
     finally:
@@ -256,24 +213,35 @@ def render_overlay_video(
     return output_path
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Render mask overlay video from SAM3 tracking results.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--video-path", required=True, help="Path to the source MP4 video.")
-    p.add_argument("--tracking-json", required=True, help="Path to tracking_results.json.")
     p.add_argument(
-        "--output-video-path", default=None,
-        help="Output overlay MP4 path.  Default: <tracking_json_dir>/overlay.mp4",
+        "--tracking-json",
+        required=True,
+        help="Path to tracking_results.json (legacy frames JSON or video COCO JSON).",
+    )
+    p.add_argument(
+        "--output-video-path",
+        default=None,
+        help="Output overlay MP4 path. Default: <tracking_json_dir>/overlay.mp4",
     )
     p.add_argument("--mask-alpha", type=float, default=0.4, help="Overlay opacity (0-1).")
-    p.add_argument("--show-ids", action=argparse.BooleanOptionalAction, default=True, help="Render ID labels.")
-    p.add_argument("--show-contours", action=argparse.BooleanOptionalAction, default=True, help="Draw contour outlines.")
+    p.add_argument(
+        "--show-ids",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render ID labels.",
+    )
+    p.add_argument(
+        "--show-contours",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw contour outlines.",
+    )
     p.add_argument("--start-frame", type=int, default=0, help="First frame to render (inclusive).")
     p.add_argument("--end-frame", type=int, default=-1, help="Last frame to render (-1 = end).")
     p.add_argument("--frame-rate", type=float, default=None, help="Output FPS (default: same as source).")

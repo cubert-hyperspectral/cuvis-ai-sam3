@@ -1362,6 +1362,7 @@ class Sam3VideoBase(nn.Module):
 
             # propagate one frame
             num_frames_propagated = 0
+            out_frame_idx = None
             for out in self.tracker.propagate_in_video(
                 inference_state,
                 start_frame_idx=frame_idx,

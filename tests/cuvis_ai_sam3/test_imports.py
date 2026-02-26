@@ -23,3 +23,17 @@ def test_register_all_nodes_callable() -> None:
     from cuvis_ai_sam3 import register_all_nodes
 
     assert callable(register_all_nodes)
+
+
+def test_sam3_tracker_node_importable() -> None:
+    """SAM3TrackerInference is exported from the node package."""
+    from cuvis_ai_sam3.node import SAM3TrackerInference
+
+    assert SAM3TrackerInference.__name__ == "SAM3TrackerInference"
+
+
+def test_spectral_signature_node_importable() -> None:
+    """SpectralSignatureExtractor is exported from the node package."""
+    from cuvis_ai_sam3.node import SpectralSignatureExtractor
+
+    assert SpectralSignatureExtractor.__name__ == "SpectralSignatureExtractor"
