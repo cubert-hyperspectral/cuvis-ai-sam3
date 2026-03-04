@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import cv2
@@ -163,10 +164,17 @@ class SAM3TrackerInference(Node):
         checkpoint_path: str | None = None,
         prompt_text: str = "person",
         masklet_confirmation_consecutive_det_thresh: int = 3,
+        score_threshold_detection: float = 0.5,
+        new_det_thresh: float = 0.7,
+        det_nms_thresh: float = 0.1,
+        overlap_suppress_thresh: float = 0.7,
         compile_model: bool = False,
         confirmation_warmup_frames: int = 2,
         confirmation_warmup_thresh: int = 1,
         confirmation_high_confidence_thresh: float = 0.9,
+        max_tracker_states: int = 5,
+        enable_state_diagnostics: bool = False,
+        progress_log_interval: int = 50,
         **kwargs: Any,
     ) -> None:
         self.checkpoint_path = checkpoint_path
@@ -174,19 +182,33 @@ class SAM3TrackerInference(Node):
         self.masklet_confirmation_consecutive_det_thresh = int(
             masklet_confirmation_consecutive_det_thresh
         )
+        self.score_threshold_detection = float(score_threshold_detection)
+        self.new_det_thresh = float(new_det_thresh)
+        self.det_nms_thresh = float(det_nms_thresh)
+        self.overlap_suppress_thresh = float(overlap_suppress_thresh)
         self.compile_model = bool(compile_model)
         self.confirmation_warmup_frames = int(confirmation_warmup_frames)
         self.confirmation_warmup_thresh = int(confirmation_warmup_thresh)
         self.confirmation_high_confidence_thresh = float(confirmation_high_confidence_thresh)
+        self.max_tracker_states = int(max_tracker_states)
+        self.enable_state_diagnostics = bool(enable_state_diagnostics)
+        self.progress_log_interval = max(0, int(progress_log_interval))
 
         super().__init__(
             checkpoint_path=checkpoint_path,
             prompt_text=prompt_text,
             masklet_confirmation_consecutive_det_thresh=masklet_confirmation_consecutive_det_thresh,
+            score_threshold_detection=score_threshold_detection,
+            new_det_thresh=new_det_thresh,
+            det_nms_thresh=det_nms_thresh,
+            overlap_suppress_thresh=overlap_suppress_thresh,
             compile_model=compile_model,
             confirmation_warmup_frames=confirmation_warmup_frames,
             confirmation_warmup_thresh=confirmation_warmup_thresh,
             confirmation_high_confidence_thresh=confirmation_high_confidence_thresh,
+            max_tracker_states=max_tracker_states,
+            enable_state_diagnostics=enable_state_diagnostics,
+            progress_log_interval=progress_log_interval,
             **kwargs,
         )
 
@@ -194,11 +216,23 @@ class SAM3TrackerInference(Node):
             checkpoint_path=checkpoint_path,
             compile=self.compile_model,
         )
+        self._model.score_threshold_detection = self.score_threshold_detection
+        self._model.new_det_thresh = self.new_det_thresh
+        self._model.det_nms_thresh = self.det_nms_thresh
+        self._model.suppress_overlapping_based_on_recent_occlusion_threshold = (
+            self.overlap_suppress_thresh
+        )
         self._inference_state: dict[str, Any] | None = None
         self._frame_buffer: _FrameBuffer | None = None
         self._frame_id = 0
         self._det_count: dict[int, int] = {}
         self._prompted = False
+        self._evict_horizon: int = 4 * getattr(
+            getattr(self._model, "tracker", None), "max_obj_ptrs_in_encoder", 16
+        )
+        self._progress_start_time: float | None = None
+        self._progress_last_log_time: float | None = None
+        self._progress_last_log_frame: int = 0
 
     def reset(self) -> None:
         """Reset streaming state for a new sequence."""
@@ -207,6 +241,9 @@ class SAM3TrackerInference(Node):
         self._frame_id = 0
         self._det_count = {}
         self._prompted = False
+        self._progress_start_time = None
+        self._progress_last_log_time = None
+        self._progress_last_log_frame = 0
 
     def _model_device(self) -> torch.device:
         """Return the device of the first model parameter, defaulting to CPU."""
@@ -445,7 +482,13 @@ class SAM3TrackerInference(Node):
             container.pop(key, None)
 
     def _prune_state_for_frame(self, frame_idx: int) -> None:
-        """Free cached data for the given frame to limit memory growth."""
+        """Free cached data for the given frame to limit memory growth.
+
+        Because we call ``_run_single_frame_inference`` directly (bypassing
+        ``propagate_in_video``'s yield-loop cleanup), we must replicate its
+        eviction logic here to prevent unbounded dict growth in tracker
+        metadata and per-object output dicts.
+        """
         if self._inference_state is None:
             return
         state = self._inference_state
@@ -453,14 +496,62 @@ class SAM3TrackerInference(Node):
         state.get("cached_frame_outputs", {}).pop(frame_idx, None)
 
         tracker_md = state.get("tracker_metadata", {})
-        tracker_scores = tracker_md.get("obj_id_to_tracker_score_frame_wise", {})
-        if isinstance(tracker_scores, dict):
-            tracker_scores.pop(frame_idx, None)
 
+        # -- obj_id_to_tracker_score_frame_wise: evict all frames before current --
+        scores_fw = tracker_md.get("obj_id_to_tracker_score_frame_wise")
+        if isinstance(scores_fw, dict):
+            stale = [k for k in scores_fw if isinstance(k, int) and k < frame_idx]
+            for k in stale:
+                scores_fw.pop(k, None)
+
+        # -- rank0_metadata structures --
         rank0_md = tracker_md.get("rank0_metadata", {})
+
         suppressed_map = rank0_md.get("suppressed_obj_ids", {})
         if isinstance(suppressed_map, dict):
             suppressed_map.pop(frame_idx, None)
+
+        evict_before = frame_idx - self._evict_horizon
+
+        # unmatched_frame_inds: obj_id -> [frame_indices]
+        unmatched = rank0_md.get("unmatched_frame_inds")
+        if isinstance(unmatched, dict):
+            for obj_id in list(unmatched.keys()):
+                lst = unmatched[obj_id]
+                if isinstance(lst, list):
+                    unmatched[obj_id] = [f for f in lst if f >= evict_before]
+
+        # overlap_pair_to_frame_inds: (obj_a, obj_b) -> [frame_indices]
+        overlap = rank0_md.get("overlap_pair_to_frame_inds")
+        if isinstance(overlap, dict):
+            for pair in list(overlap.keys()):
+                lst = overlap[pair]
+                if isinstance(lst, list):
+                    overlap[pair] = [f for f in lst if f >= evict_before]
+
+        # -- per-object tracker output dicts (non-cond only; cond frames must
+        #    be kept because propagate_in_video_preflight asserts their presence) --
+        if evict_before > 0:
+            for tracker_state in state.get("tracker_inference_states", []):
+                if not isinstance(tracker_state, dict):
+                    continue
+                output_dict = tracker_state.get("output_dict", {})
+                non_cond = output_dict.get("non_cond_frame_outputs", {})
+                stale = [k for k in non_cond if isinstance(k, int) and k < evict_before]
+                for k in stale:
+                    del non_cond[k]
+                for obj_dict in tracker_state.get("output_dict_per_obj", {}).values():
+                    if not isinstance(obj_dict, dict):
+                        continue
+                    non_cond = obj_dict.get("non_cond_frame_outputs", {})
+                    stale = [k for k in non_cond if isinstance(k, int) and k < evict_before]
+                    for k in stale:
+                        del non_cond[k]
+                tracked = tracker_state.get("frames_already_tracked", {})
+                if isinstance(tracked, dict):
+                    stale = [k for k in tracked if isinstance(k, int) and k < evict_before]
+                    for k in stale:
+                        del tracked[k]
 
         if self._frame_buffer is not None:
             self._frame_buffer.prune_before(frame_idx)
@@ -477,6 +568,169 @@ class SAM3TrackerInference(Node):
             self._prune_dict(input_batch.find_inputs, frame_idx)
             self._prune_dict(input_batch.find_targets, frame_idx)
             self._prune_dict(input_batch.find_metadatas, frame_idx)
+
+    def _evict_excess_tracker_states(self, frame_idx: int) -> None:
+        """Remove the oldest non-primary tracker states when the count exceeds the limit.
+
+        Each tracker state requires a full SAM2 propagation per frame, so the
+        per-frame cost grows linearly with the state count.  We keep the first
+        state (ts0, which holds the initial prompt objects) and evict the oldest
+        remaining states by removing all their objects through the model's own
+        ``_tracker_remove_objects`` API so that metadata stays consistent.
+
+        After removing tracker states we must also patch ``tracker_metadata`` so
+        that ``obj_ids_per_gpu`` / ``obj_ids_all_gpu`` / ``num_obj_per_gpu`` stay
+        in sync — otherwise ``run_tracker_propagation`` will hit a shape-mismatch
+        assertion on the next frame.
+        """
+        if self._inference_state is None or self.max_tracker_states <= 0:
+            return
+        states = self._inference_state.get("tracker_inference_states", [])
+        if len(states) <= self.max_tracker_states:
+            return
+
+        from loguru import logger
+
+        # Collect object IDs from the oldest non-primary states that exceed the limit.
+        # States are ordered oldest-first; index 0 is the prompt state we always keep.
+        n_to_evict = len(states) - self.max_tracker_states
+        obj_ids_to_remove: list[int] = []
+        for ts in states[1 : 1 + n_to_evict]:
+            if not isinstance(ts, dict):
+                continue
+            obj_ids_to_remove.extend(ts.get("obj_ids", []))
+
+        if not obj_ids_to_remove:
+            return
+
+        logger.trace(
+            "Evicting {} tracker state(s) ({} -> {}), removing obj_ids={}",
+            n_to_evict,
+            len(states),
+            self.max_tracker_states,
+            obj_ids_to_remove,
+        )
+        # Remove the objects from tracker states (also drops empty states).
+        self._model._tracker_remove_objects(states, obj_ids_to_remove)
+
+        # Patch tracker_metadata so it matches the surviving objects.
+        removed_set = {int(i) for i in obj_ids_to_remove}
+        md = self._inference_state.get("tracker_metadata", {})
+        rank = getattr(self._model, "rank", 0)
+
+        # obj_ids_per_gpu: list of np arrays, one per GPU
+        ids_per_gpu = md.get("obj_ids_per_gpu")
+        if ids_per_gpu is not None and rank < len(ids_per_gpu):
+            old_ids = ids_per_gpu[rank]
+            keep = np.array([int(i) not in removed_set for i in old_ids], dtype=bool)
+            ids_per_gpu[rank] = old_ids[keep]
+
+        # obj_ids_all_gpu: flat np array of all object IDs
+        ids_all = md.get("obj_ids_all_gpu")
+        keep_all: np.ndarray | None = None
+        if ids_all is not None and hasattr(ids_all, "__len__") and len(ids_all) > 0:
+            keep_all = np.array([int(i) not in removed_set for i in ids_all], dtype=bool)
+            md["obj_ids_all_gpu"] = ids_all[keep_all]
+
+        # num_obj_per_gpu: np array of counts per GPU
+        num_per_gpu = md.get("num_obj_per_gpu")
+        if num_per_gpu is not None and ids_per_gpu is not None:
+            for g in range(len(num_per_gpu)):
+                if g < len(ids_per_gpu):
+                    num_per_gpu[g] = len(ids_per_gpu[g])
+
+        # obj_id_to_score: remove evicted IDs
+        scores = md.get("obj_id_to_score")
+        if isinstance(scores, dict):
+            for oid in obj_ids_to_remove:
+                scores.pop(int(oid), None)
+
+        # rank0_metadata: clean up per-object structures
+        r0 = md.get("rank0_metadata", {})
+        for key in ("obj_first_frame_idx", "trk_keep_alive"):
+            container = r0.get(key)
+            if isinstance(container, dict):
+                for oid in obj_ids_to_remove:
+                    container.pop(int(oid), None)
+        unmatched = r0.get("unmatched_frame_inds")
+        if isinstance(unmatched, dict):
+            for oid in obj_ids_to_remove:
+                unmatched.pop(int(oid), None)
+
+        # removed_obj_ids: mark evicted objects as removed so _process_hotstart
+        # guards (line 1438) skip them when iterating overlap_pair_to_frame_inds.
+        removed_set_r0 = r0.get("removed_obj_ids")
+        if isinstance(removed_set_r0, set):
+            removed_set_r0.update(removed_set)
+
+        # overlap_pair_to_frame_inds: drop any pair that references an evicted object.
+        # Without this, _process_hotstart iterates the pair and calls
+        # obj_first_frame_idx[evicted_id] which raises KeyError.
+        overlap = r0.get("overlap_pair_to_frame_inds")
+        if isinstance(overlap, dict):
+            stale_keys = [k for k in overlap if k[0] in removed_set or k[1] in removed_set]
+            for k in stale_keys:
+                del overlap[k]
+
+        # masklet_confirmation: filter arrays to match obj_ids_all_gpu
+        mc = r0.get("masklet_confirmation")
+        if isinstance(mc, dict) and keep_all is not None:
+            for arr_key in ("status", "consecutive_det_num"):
+                arr = mc.get(arr_key)
+                if arr is not None and hasattr(arr, "__len__") and len(arr) == len(keep_all):
+                    mc[arr_key] = arr[keep_all]
+
+    @staticmethod
+    def _should_log_progress(frame_idx: int, interval: int) -> bool:
+        """Return True when a periodic progress update should be emitted."""
+        if interval <= 0:
+            return False
+        # Always emit one early signal after the first processed frame,
+        # then every `interval` processed frames.
+        return frame_idx == 0 or (frame_idx + 1) % interval == 0
+
+    def _log_progress(self, frame_idx: int) -> None:
+        """Log lightweight periodic progress metrics for long-running jobs."""
+        if not self._should_log_progress(frame_idx, self.progress_log_interval):
+            return
+
+        from loguru import logger
+
+        now = time.perf_counter()
+        if self._progress_start_time is None:
+            self._progress_start_time = now
+        if self._progress_last_log_time is None:
+            self._progress_last_log_time = self._progress_start_time
+
+        frames_done = frame_idx + 1
+        elapsed_total = max(now - self._progress_start_time, 1e-6)
+        elapsed_chunk = max(now - self._progress_last_log_time, 1e-6)
+        chunk_frames = max(frame_idx - self._progress_last_log_frame, 1)
+        avg_s_per_frame = elapsed_total / frames_done
+        recent_s_per_frame = elapsed_chunk / chunk_frames
+
+        state_count = 0
+        object_count = 0
+        if self._inference_state is not None:
+            states = self._inference_state.get("tracker_inference_states", [])
+            if isinstance(states, list):
+                state_count = len(states)
+            md = self._inference_state.get("tracker_metadata", {})
+            ids_all = md.get("obj_ids_all_gpu")
+            if ids_all is not None and hasattr(ids_all, "__len__"):
+                object_count = len(ids_all)
+
+        logger.info(
+            "SAM3 progress: frame={} | states={} | objects={} | avg={:.2f}s/frame | recent={:.2f}s/frame",
+            frame_idx,
+            state_count,
+            object_count,
+            avg_s_per_frame,
+            recent_s_per_frame,
+        )
+
+        self._progress_last_log_time = now
+        self._progress_last_log_frame = frame_idx
 
     def forward(
         self,
@@ -513,6 +767,9 @@ class SAM3TrackerInference(Node):
 
         if self._frame_buffer is None or self._inference_state is None:
             raise RuntimeError("Streaming state was not initialized.")
+        if self._progress_start_time is None:
+            self._progress_start_time = time.perf_counter()
+            self._progress_last_log_time = self._progress_start_time
 
         frame_np = rgb_frame[0].detach().cpu().to(torch.float32).numpy()
         frame_uint8 = np.clip(frame_np * 255.0, 0.0, 255.0).astype(np.uint8)
@@ -559,9 +816,63 @@ class SAM3TrackerInference(Node):
             "confirmed_tracker_scores": self._pack_tracker_scores(confirmed, tracker_scores),
         }
 
+        self._evict_excess_tracker_states(frame_idx)
         self._prune_state_for_frame(frame_idx)
+        if torch.cuda.is_available() and frame_idx > 0 and frame_idx % 50 == 0:
+            torch.cuda.empty_cache()
+
+        # Optional diagnostics for long-run state-size debugging.
+        if self.enable_state_diagnostics and frame_idx % 25 == 0:
+            self._log_state_sizes(frame_idx)
+        self._log_progress(frame_idx)
+
         self._frame_id += 1
         return outputs
+
+    def _log_state_sizes(self, frame_idx: int) -> None:
+        """Log sizes of key state dicts to diagnose memory growth."""
+        from loguru import logger as _lg
+
+        state = self._inference_state
+        if state is None:
+            return
+        parts: list[str] = [f"frame={frame_idx}"]
+
+        md = state.get("tracker_metadata", {})
+        sfw = md.get("obj_id_to_tracker_score_frame_wise", {})
+        parts.append(f"score_fw={len(sfw)}")
+
+        r0 = md.get("rank0_metadata", {})
+        um = r0.get("unmatched_frame_inds", {})
+        parts.append(f"unmatched_keys={len(um)}")
+        um_total = sum(len(v) for v in um.values() if isinstance(v, list))
+        parts.append(f"unmatched_total={um_total}")
+        ol = r0.get("overlap_pair_to_frame_inds", {})
+        ol_total = sum(len(v) for v in ol.values() if isinstance(v, list))
+        parts.append(f"overlap_total={ol_total}")
+
+        for i, ts in enumerate(state.get("tracker_inference_states", [])):
+            if not isinstance(ts, dict):
+                continue
+            od = ts.get("output_dict", {})
+            nc = len(od.get("non_cond_frame_outputs", {}))
+            cc = len(od.get("cond_frame_outputs", {}))
+            parts.append(f"ts{i}_nc={nc}_cc={cc}")
+            for oi, obj_d in ts.get("output_dict_per_obj", {}).items():
+                if isinstance(obj_d, dict):
+                    onc = len(obj_d.get("non_cond_frame_outputs", {}))
+                    parts.append(f"ts{i}_obj{oi}_nc={onc}")
+            fat = len(ts.get("frames_already_tracked", {}))
+            parts.append(f"ts{i}_fat={fat}")
+
+        fb = self._frame_buffer
+        parts.append(f"fbuf={len(fb._frames) if fb else 0}")
+
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / (1024**3)
+            parts.append(f"gpu={alloc:.2f}GB")
+
+        _lg.debug("[state-diag] {}", " | ".join(parts))
 
 
 __all__ = ["SAM3TrackerInference", "_FrameBuffer"]

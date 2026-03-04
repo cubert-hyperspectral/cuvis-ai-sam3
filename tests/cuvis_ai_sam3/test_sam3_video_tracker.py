@@ -13,6 +13,7 @@ class _DummySAM3Model(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.detector = SimpleNamespace(world_size=1)
+        self.rank = 0
         self.image_size = 8
         self.image_mean = (0.5, 0.5, 0.5)
         self.image_std = (0.5, 0.5, 0.5)
@@ -106,6 +107,18 @@ class _DummySAM3Model(torch.nn.Module):
             "frame_stats": out.get("frame_stats"),
         }
 
+    def _tracker_remove_objects(
+        self, tracker_states: list[dict[str, object]], obj_ids_to_remove: list[int]
+    ) -> None:
+        removed = {int(v) for v in obj_ids_to_remove}
+        keep_states: list[dict[str, object]] = []
+        for ts in tracker_states:
+            obj_ids = [int(v) for v in ts.get("obj_ids", []) if int(v) not in removed]
+            ts["obj_ids"] = obj_ids
+            if obj_ids:
+                keep_states.append(ts)
+        tracker_states[:] = keep_states
+
 
 @pytest.fixture
 def tracker_node(
@@ -193,3 +206,64 @@ def test_extend_state_for_frame_syncs_tracker_inference_num_frames(
     tracker_states = node._inference_state["tracker_inference_states"]
     assert len(tracker_states) == 1
     assert tracker_states[0]["num_frames"] == 2
+
+
+def test_default_max_tracker_states_is_five(monkeypatch: pytest.MonkeyPatch) -> None:
+    dummy_model = _DummySAM3Model()
+    monkeypatch.setattr(
+        tracker_mod,
+        "build_sam3_video_model",
+        lambda **_: dummy_model,
+    )
+    node = tracker_mod.SAM3TrackerInference()
+    assert node.max_tracker_states == 5
+
+
+def test_should_log_progress_every_fifty_frames() -> None:
+    assert tracker_mod.SAM3TrackerInference._should_log_progress(frame_idx=0, interval=50) is True
+    assert tracker_mod.SAM3TrackerInference._should_log_progress(frame_idx=48, interval=50) is False
+    assert tracker_mod.SAM3TrackerInference._should_log_progress(frame_idx=49, interval=50) is True
+    assert tracker_mod.SAM3TrackerInference._should_log_progress(frame_idx=99, interval=50) is True
+    assert tracker_mod.SAM3TrackerInference._should_log_progress(frame_idx=100, interval=0) is False
+
+
+def test_evict_excess_tracker_states_enforces_cap_and_metadata(
+    tracker_node: tuple[tracker_mod.SAM3TrackerInference, _DummySAM3Model],
+) -> None:
+    node, _ = tracker_node
+    node.max_tracker_states = 2
+    node._inference_state = {
+        "tracker_inference_states": [
+            {"obj_ids": [1, 2]},  # primary state (kept)
+            {"obj_ids": [3]},
+            {"obj_ids": [4]},
+        ],
+        "tracker_metadata": {
+            "obj_ids_per_gpu": [np.asarray([1, 2, 3, 4], dtype=np.int64)],
+            "obj_ids_all_gpu": np.asarray([1, 2, 3, 4], dtype=np.int64),
+            "num_obj_per_gpu": np.asarray([4], dtype=np.int64),
+            "obj_id_to_score": {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.6},
+            "rank0_metadata": {
+                "obj_first_frame_idx": {1: 0, 2: 0, 3: 1, 4: 2},
+                "trk_keep_alive": {1: 4, 2: 4, 3: 2, 4: 2},
+                "unmatched_frame_inds": {3: [10], 4: [11]},
+                "removed_obj_ids": set(),
+                "overlap_pair_to_frame_inds": {(1, 3): [10], (2, 4): [11]},
+                "masklet_confirmation": {
+                    "status": np.asarray([1, 1, 1, 1], dtype=np.int32),
+                    "consecutive_det_num": np.asarray([3, 3, 1, 1], dtype=np.int32),
+                },
+            },
+        },
+    }
+
+    node._evict_excess_tracker_states(frame_idx=25)
+
+    states = node._inference_state["tracker_inference_states"]
+    assert len(states) <= 2
+    assert [int(v) for v in node._inference_state["tracker_metadata"]["obj_ids_all_gpu"]] == [
+        1,
+        2,
+        4,
+    ]
+    assert 3 not in node._inference_state["tracker_metadata"]["obj_id_to_score"]
