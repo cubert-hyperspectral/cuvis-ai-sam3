@@ -59,9 +59,20 @@ dependencies = [
     "setuptools<81",
     "opencv-python-headless>=4.13.0.92",
     "click>=8.3.1",
+    "uvicorn>=0.41.0",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.13.1",
+    "fastapi>=0.135.1",
+    "sse-starlette>=3.3.2",
 ]
 
 [project.optional-dependencies]
+rest = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "sse-starlette>=2.0",
+    "pydantic-settings>=2.0",
+]
 dev = [
     "pytest",
     "pytest-cov",
@@ -76,7 +87,12 @@ dev = [
     "detect-secrets>=1.4.0",
     "pip-licenses>=4.0.0",
     "cyclonedx-bom>=4.0.0",
+    # --- REST API test dependencies ---
+    "httpx>=0.27",
 ]
+
+[project.scripts]
+sam3-rest-api = "rest_api.__main__:main"
 
 [project.urls]
 Homepage = "https://www.cubert-hyperspectral.com/"
@@ -85,7 +101,7 @@ Changelog = "https://github.com/cubert-hyperspectral/cuvis-ai-sam3/releases"
 Issues = "https://github.com/cubert-hyperspectral/cuvis-ai-sam3/issues"
 
 [tool.setuptools.packages.find]
-include = ["sam3*", "cuvis_ai_sam3*"]
+include = ["sam3*", "cuvis_ai_sam3*", "rest_api*"]
 
 [tool.setuptools.package-data]
 sam3 = ["assets/*.txt.gz"]
@@ -95,7 +111,7 @@ torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 
 # Local development alternative (uncomment to use local path instead)
-# cuvis-ai-core = { path = "../cuvis-ai-core", editable = true }
+cuvis-ai-core = { path = "../../cuvis-ai-core/cuvis-ai-core-sam3", editable = true }
 
 # Optional git override (if a specific unreleased tag/commit is needed)
 # cuvis-ai-core = { git = "https://github.com/cubert-hyperspectral/cuvis-ai-core.git", tag = "v0.1.3" }

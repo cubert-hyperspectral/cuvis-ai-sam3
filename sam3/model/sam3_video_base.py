@@ -1568,11 +1568,21 @@ class Sam3VideoBase(nn.Module):
             else frame_idx + self.hotstart_delay
         )
 
-        # Step 1: log the frame index where each object ID first appears
-        for obj_id in new_det_obj_ids:
+        def _ensure_hotstart_metadata(obj_id: int) -> int:
+            # Prompt-seeded tracks may bypass detector-based initialization; hotstart
+            # still needs a first-seen frame and keep-alive entry for those IDs.
             if obj_id not in obj_first_frame_idx:
                 obj_first_frame_idx[obj_id] = frame_idx
-            assert obj_id not in trk_keep_alive
+                logger.debug(
+                    f"Initializing missing hotstart metadata for object {obj_id} at frame {frame_idx}"
+                )
+            if obj_id not in trk_keep_alive:
+                trk_keep_alive[obj_id] = self.init_trk_keep_alive
+            return obj_first_frame_idx[obj_id]
+
+        # Step 1: log the frame index where each object ID first appears
+        for obj_id in new_det_obj_ids:
+            _ensure_hotstart_metadata(obj_id)
             trk_keep_alive[obj_id] = self.init_trk_keep_alive
 
         matched_trks = set()
@@ -1580,11 +1590,13 @@ class Sam3VideoBase(nn.Module):
         for matched_trks_per_det in det_to_matched_trk_obj_ids.values():
             matched_trks.update(matched_trks_per_det)
         for obj_id in matched_trks:
+            _ensure_hotstart_metadata(obj_id)
             # NOTE: To minimize number of configurable params, we use the hotstart_unmatch_thresh to set the max value of trk_keep_alive
             trk_keep_alive[obj_id] = min(
                 self.max_trk_keep_alive, trk_keep_alive[obj_id] + 1
             )
         for obj_id in unmatched_trk_obj_ids:
+            _ensure_hotstart_metadata(obj_id)
             unmatched_frame_inds[obj_id].append(frame_idx)
             # NOTE: To minimize number of configurable params, we use the hotstart_unmatch_thresh to set the min value of trk_keep_alive
             # The max keep alive is 2x the min, means the model prefers to keep the prediction rather than suppress it if it was matched long enough.
@@ -1593,6 +1605,7 @@ class Sam3VideoBase(nn.Module):
             )
         if self.decrease_trk_keep_alive_for_empty_masklets:
             for obj_id in empty_trk_obj_ids:
+                _ensure_hotstart_metadata(obj_id)
                 # NOTE: To minimize number of configurable params, we use the hotstart_unmatch_thresh to set the min value of trk_keep_alive
                 trk_keep_alive[obj_id] = max(
                     self.min_trk_keep_alive, trk_keep_alive[obj_id] - 1
@@ -1607,10 +1620,11 @@ class Sam3VideoBase(nn.Module):
         for obj_id, frame_indices in unmatched_frame_inds.items():
             if obj_id in removed_obj_ids or obj_id in obj_ids_newly_removed:
                 continue  # skip if the object is already removed
+            first_frame_idx = _ensure_hotstart_metadata(obj_id)
             if len(frame_indices) >= self.hotstart_unmatch_thresh:
                 is_within_hotstart = (
-                    obj_first_frame_idx[obj_id] > hotstart_diff and not reverse
-                ) or (obj_first_frame_idx[obj_id] < hotstart_diff and reverse)
+                    first_frame_idx > hotstart_diff and not reverse
+                ) or (first_frame_idx < hotstart_diff and reverse)
                 if is_within_hotstart:
                     obj_ids_newly_removed.add(obj_id)
                     logger.debug(
@@ -1636,9 +1650,9 @@ class Sam3VideoBase(nn.Module):
             # if there are multiple matched track ids, we need to find the one that appeared first;
             # these later appearing ids may be removed since they may be considered as duplicates
             first_appear_obj_id = (
-                min(matched_trk_obj_ids, key=lambda x: obj_first_frame_idx[x])
+                min(matched_trk_obj_ids, key=_ensure_hotstart_metadata)
                 if not reverse
-                else max(matched_trk_obj_ids, key=lambda x: obj_first_frame_idx[x])
+                else max(matched_trk_obj_ids, key=_ensure_hotstart_metadata)
             )
             for obj_id in matched_trk_obj_ids:
                 if obj_id != first_appear_obj_id:
@@ -1650,8 +1664,9 @@ class Sam3VideoBase(nn.Module):
         for (first_obj_id, obj_id), frame_indices in overlap_pair_to_frame_inds.items():
             if obj_id in removed_obj_ids or obj_id in obj_ids_newly_removed:
                 continue  # skip if the object is already removed
-            if (obj_first_frame_idx[obj_id] > hotstart_diff and not reverse) or (
-                obj_first_frame_idx[obj_id] < hotstart_diff and reverse
+            first_frame_idx = _ensure_hotstart_metadata(obj_id)
+            if (first_frame_idx > hotstart_diff and not reverse) or (
+                first_frame_idx < hotstart_diff and reverse
             ):
                 if len(frame_indices) >= self.hotstart_dup_thresh:
                     obj_ids_newly_removed.add(obj_id)
