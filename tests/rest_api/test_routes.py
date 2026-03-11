@@ -91,7 +91,7 @@ def test_prompt_bbox_pvs(app_client):
         json={
             "frame_index": 0,
             "bounding_boxes": [[0.1, 0.2, 0.3, 0.5]],
-            "bounding_box_labels": [1],
+            "bounding_box_is_positive": [1],
         },
     )
     assert resp.status_code == 200
@@ -108,6 +108,7 @@ def test_prompt_no_prompt_type(app_client):
 
 def test_propagate_forward(app_client):
     """T9: direction=forward propagation."""
+    service = app_client.app.state.predictor_service
     resp = app_client.post(
         "/api/v1/sessions/test-session-123/propagate",
         json={"direction": "forward", "max_frames": 50},
@@ -115,6 +116,26 @@ def test_propagate_forward(app_client):
     assert resp.status_code == 200
     # SSE responses come as text/event-stream
     assert "text/event-stream" in resp.headers["content-type"]
+    assert service.propagate_in_video.called
+    _, request_obj = service.propagate_in_video.call_args.args[:2]
+    assert request_obj.disable_hotstart_retro_suppression is False
+
+
+def test_propagate_forward_with_hotstart_override(app_client):
+    """Propagation request forwards disable_hotstart_retro_suppression."""
+    service = app_client.app.state.predictor_service
+    resp = app_client.post(
+        "/api/v1/sessions/test-session-123/propagate",
+        json={
+            "direction": "forward",
+            "max_frames": 50,
+            "disable_hotstart_retro_suppression": True,
+        },
+    )
+    assert resp.status_code == 200
+    assert service.propagate_in_video.called
+    _, request_obj = service.propagate_in_video.call_args.args[:2]
+    assert request_obj.disable_hotstart_retro_suppression is True
 
 
 def test_remove_object(app_client):

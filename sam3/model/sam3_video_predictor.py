@@ -53,7 +53,6 @@ class Sam3VideoPredictor(Sam3BasePredictor):
             .cuda()
             .eval()
         )
-
     def remove_object(
         self,
         session_id: str,
@@ -71,7 +70,6 @@ class Sam3VideoPredictor(Sam3BasePredictor):
             is_user_action=is_user_action,
         )
         return {"is_success": True}
-
     def _get_session_stats(self):
         """Get a statistics string for live sessions and their GPU usage."""
         live_session_strs = []

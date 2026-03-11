@@ -116,7 +116,7 @@ class PredictorService:
                 points=request.points,
                 point_labels=request.point_labels,
                 bounding_boxes=request.bounding_boxes,
-                bounding_box_labels=request.bounding_box_labels,
+                bounding_box_is_positive=request.bounding_box_is_positive,
                 obj_id=request.obj_id,
             )
         objects = outputs_to_object_results(result["outputs"], include_masks=include_masks)
@@ -137,6 +137,7 @@ class PredictorService:
                 propagation_direction=request.direction,
                 start_frame_idx=request.start_frame_index,
                 max_frame_num_to_track=request.max_frames,
+                disable_hotstart_retro_suppression=request.disable_hotstart_retro_suppression,
             ):
                 objects = outputs_to_object_results(
                     frame_result["outputs"],

@@ -25,7 +25,7 @@ class AddPromptRequest(BaseModel):
     points: list[list[float]] | None = None
     point_labels: list[int] | None = None
     bounding_boxes: list[list[float]] | None = None
-    bounding_box_labels: list[int] | None = None
+    bounding_box_is_positive: list[int] | None = None  # 1 = foreground/include, 0 = background/exclude
     obj_id: int | None = None
 
     @model_validator(mode="after")
@@ -39,6 +39,7 @@ class PropagateRequest(BaseModel):
     direction: Literal["forward", "backward", "both"] = "forward"
     start_frame_index: int | None = None
     max_frames: int = 100
+    disable_hotstart_retro_suppression: bool = False
 
 
 # ---------------------------------------------------------------------------

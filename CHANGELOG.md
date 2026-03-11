@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Added `disable_hotstart_retro_suppression` to REST `PropagateRequest` to let clients opt out of retroactive hotstart output suppression during interactive propagation
+- Added end-to-end forwarding of `disable_hotstart_retro_suppression` from REST route/service through `Sam3VideoPredictor` into model `propagate_in_video` calls
+- Fixed propagation output suppression behavior by using per-frame removed-object snapshots when the new flag is enabled, preventing earlier yielded frames from being retroactively emptied
+- Added REST tests for the new propagate request field default/override and route forwarding behavior
 - Added cuvis_ai_sam3 wrapper package with plugin scaffolding and node stubs
 - Added UV/CUDA-ready pyproject.toml with optional torch+cu126 dependency group
 - Added uv.lock for reproducible dependency resolution

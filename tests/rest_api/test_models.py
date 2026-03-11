@@ -29,7 +29,7 @@ def test_add_prompt_bbox():
     req = AddPromptRequest(
         frame_index=0,
         bounding_boxes=[[0.1, 0.2, 0.3, 0.4]],
-        bounding_box_labels=[1],
+        bounding_box_is_positive=[1],
     )
     assert len(req.bounding_boxes) == 1
 
@@ -39,6 +39,12 @@ def test_propagate_defaults():
     assert req.direction == "forward"
     assert req.max_frames == 100
     assert req.start_frame_index is None
+    assert req.disable_hotstart_retro_suppression is False
+
+
+def test_propagate_accepts_hotstart_override():
+    req = PropagateRequest(disable_hotstart_retro_suppression=True)
+    assert req.disable_hotstart_retro_suppression is True
 
 
 def test_mask_to_rle():

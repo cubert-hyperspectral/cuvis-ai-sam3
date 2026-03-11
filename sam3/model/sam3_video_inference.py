@@ -254,6 +254,7 @@ class Sam3VideoInference(Sam3VideoBase):
         start_frame_idx=None,
         max_frame_num_to_track=None,
         reverse=False,
+        disable_hotstart_retro_suppression: bool = False,
     ):
         """
         Propagate the prompts to get grounding results for the entire video. This method
@@ -290,14 +291,21 @@ class Sam3VideoInference(Sam3VideoBase):
         for frame_idx in tqdm(
             processing_order, desc="propagate_in_video", disable=self.rank > 0
         ):
-            out = self._run_single_frame_inference(inference_state, frame_idx, reverse)
+            out = self._run_single_frame_inference(
+                inference_state,
+                frame_idx,
+                reverse,
+                disable_hotstart_retro_suppression=disable_hotstart_retro_suppression,
+            )
+            if self.rank == 0:
+                removed_snapshot = {int(i) for i in out.get("removed_obj_ids", set())}
+                hotstart_removed_obj_ids.update(removed_snapshot)
 
             if self.hotstart_delay > 0:
                 # accumulate the outputs for the first `hotstart_delay` frames
                 hotstart_buffer.append([frame_idx, out])
-                # update the object IDs removed by hotstart so that we don't output them
+                # update frame-local hidden IDs used by delayed confirmation logic
                 if self.rank == 0:
-                    hotstart_removed_obj_ids.update(out["removed_obj_ids"])
                     unconfirmed_obj_ids = out.get("unconfirmed_obj_ids", None)
                     if unconfirmed_obj_ids is not None:
                         unconfirmed_obj_ids_per_frame[frame_idx] = unconfirmed_obj_ids
@@ -335,10 +343,14 @@ class Sam3VideoInference(Sam3VideoBase):
                     unconfirmed_obj_ids = unconfirmed_obj_ids_per_frame.get(
                         unconfirmed_status_frame_idx, None
                     )
+                    if disable_hotstart_retro_suppression:
+                        removed_obj_ids_for_yield = set()
+                    else:
+                        removed_obj_ids_for_yield = hotstart_removed_obj_ids
                     postprocessed_out = self._postprocess_output(
                         inference_state,
                         yield_out,
-                        hotstart_removed_obj_ids,
+                        removed_obj_ids_for_yield,
                         suppressed_obj_ids,
                         unconfirmed_obj_ids,
                     )
@@ -348,7 +360,7 @@ class Sam3VideoInference(Sam3VideoBase):
                         yield_frame_idx,
                         yield_out["obj_id_to_mask"],
                         suppressed_obj_ids=suppressed_obj_ids,
-                        removed_obj_ids=hotstart_removed_obj_ids,
+                        removed_obj_ids=removed_obj_ids_for_yield,
                         unconfirmed_obj_ids=unconfirmed_obj_ids,
                     )
                 else:
@@ -366,7 +378,13 @@ class Sam3VideoInference(Sam3VideoBase):
                         yield_frame_idx, None
                     )
 
-    def _run_single_frame_inference(self, inference_state, frame_idx, reverse):
+    def _run_single_frame_inference(
+        self,
+        inference_state,
+        frame_idx,
+        reverse,
+        disable_hotstart_retro_suppression: bool = False,
+    ):
         """
         Perform inference on a single frame and get its inference results. This would
         also update `inference_state`.
@@ -403,6 +421,7 @@ class Sam3VideoInference(Sam3VideoBase):
             orig_vid_width=inference_state["orig_width"],
             is_image_only=inference_state["is_image_only"],
             allow_new_detections=has_text_prompt or has_geometric_prompt,
+            disable_hotstart_retro_suppression=disable_hotstart_retro_suppression,
         )
         # update inference state
         inference_state["tracker_inference_states"] = tracker_states_local_new
@@ -1010,6 +1029,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         start_frame_idx=None,
         max_frame_num_to_track=None,
         reverse=False,
+        disable_hotstart_retro_suppression: bool = False,
     ):
         # step 1: check which type of propagation to run, should be the same for all GPUs.
         propagation_type, obj_ids = self.parse_action_history_for_propagation(
@@ -1030,6 +1050,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 start_frame_idx=start_frame_idx,
                 max_frame_num_to_track=max_frame_num_to_track,
                 reverse=reverse,
+                disable_hotstart_retro_suppression=disable_hotstart_retro_suppression,
             )
             return
 

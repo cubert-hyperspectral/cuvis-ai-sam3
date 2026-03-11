@@ -386,6 +386,7 @@ class Sam3VideoBase(nn.Module):
         orig_vid_width: int,
         is_image_only: bool = False,
         allow_new_detections: bool = True,
+        disable_hotstart_retro_suppression: bool = False,
     ):
         """
         This function handles one-step inference for the DenseTracking model in an SPMD manner.
@@ -450,6 +451,7 @@ class Sam3VideoBase(nn.Module):
                 tracker_metadata_prev=tracker_metadata_prev,
                 tracker_states_local=tracker_states_local,
                 is_image_only=is_image_only,
+                disable_hotstart_retro_suppression=disable_hotstart_retro_suppression,
             )
         )
 
@@ -737,6 +739,7 @@ class Sam3VideoBase(nn.Module):
         tracker_metadata_prev: Dict[str, npt.NDArray],
         tracker_states_local: List[Any],
         is_image_only: bool = False,
+        disable_hotstart_retro_suppression: bool = False,
     ):
         # initialize new metadata from previous metadata (its values will be updated later)
         tracker_metadata_new = self._create_planning_metadata(tracker_metadata_prev)
@@ -808,7 +811,13 @@ class Sam3VideoBase(nn.Module):
                 rank0_metadata_new["masklet_confirmation"] = dict(
                     rank0_metadata_new["masklet_confirmation"]
                 )
-            if not hasattr(self, "_warm_up_complete") or self._warm_up_complete:
+            if disable_hotstart_retro_suppression:
+                # Keep hotstart metadata stable for this frame, but skip any suppression/removal.
+                # This preserves tracker state so long-range propagation is not cut short by
+                # hotstart-unmatched thresholds.
+                obj_ids_newly_removed = set()
+                rank0_metadata_new["suppressed_obj_ids"][frame_idx] = set()
+            elif not hasattr(self, "_warm_up_complete") or self._warm_up_complete:
                 obj_ids_newly_removed, rank0_metadata_new = self._process_hotstart(
                     frame_idx=frame_idx,
                     num_frames=num_frames,
