@@ -93,6 +93,7 @@ dev = [
 
 [project.scripts]
 sam3-rest-api = "rest_api.__main__:main"
+rest-api = "rest_api.__main__:main"
 
 [project.urls]
 Homepage = "https://www.cubert-hyperspectral.com/"
