@@ -78,6 +78,15 @@ def _make_mock_model(image_size: int = 8) -> MagicMock:
     # parameters() for device detection
     param = torch.nn.Parameter(torch.zeros(1))
     model.parameters.side_effect = lambda: iter([param])
+    model.add_prompt.return_value = (
+        0,
+        {
+            "out_obj_ids": np.array([1], dtype=np.int64),
+            "out_probs": np.array([0.9], dtype=np.float32),
+            "out_boxes_xywh": np.array([[0.1, 0.2, 0.3, 0.4]], dtype=np.float32),
+            "out_binary_masks": np.zeros((1, 1, 1), dtype=bool),
+        },
+    )
 
     return model
 
@@ -199,7 +208,129 @@ class TestSAM3StreamingPropagation:
         )
         results = self._run_streaming(node, num_frames=3)
         assert len(results) == 3
+        for r in results:
+            assert r["object_ids"].shape == (1, 1)
+            assert int(r["object_ids"][0, 0].item()) == 1
         node._model.add_prompt.assert_called_once()
+
+    def test_bbox_prompt_uses_provided_output_id(self) -> None:
+        node = SAM3StreamingPropagation(
+            num_frames=3,
+            prompt_type="bbox",
+            prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
+            prompt_obj_id=14,
+            name="test_bbox_obj_id_override",
+        )
+        mock_model = _make_mock_model()
+        mock_model.add_prompt.return_value = (
+            0,
+            {
+                "out_obj_ids": np.array([1, 3, 4], dtype=np.int64),
+                "out_probs": np.array([0.4, 0.95, 0.3], dtype=np.float32),
+                "out_boxes_xywh": np.array(
+                    [
+                        [0.6, 0.1, 0.1, 0.1],
+                        [0.1, 0.2, 0.3, 0.4],  # exact prompt match -> selected internal id 3
+                        [0.2, 0.1, 0.1, 0.2],
+                    ],
+                    dtype=np.float32,
+                ),
+                "out_binary_masks": np.zeros((3, 1, 1), dtype=bool),
+            },
+        )
+
+        def _bbox_gen(inference_state, **kwargs):  # noqa: ANN001
+            del kwargs
+            h, w = 10, 12
+            for frame_idx in range(inference_state["num_frames"]):
+                masks = np.zeros((3, h, w), dtype=bool)
+                masks[0, :2, :2] = True
+                masks[1, 2:8, 3:9] = True  # selected internal id 3
+                masks[2, 0:2, 8:10] = True
+                yield frame_idx, {
+                    "out_obj_ids": np.array([1, 3, 4], dtype=np.int64),
+                    "out_probs": np.array([0.4, 0.95, 0.3], dtype=np.float32),
+                    "out_binary_masks": masks,
+                    "out_boxes_xywh": np.array(
+                        [
+                            [0.6, 0.1, 0.1, 0.1],
+                            [0.1, 0.2, 0.3, 0.4],
+                            [0.2, 0.1, 0.1, 0.2],
+                        ],
+                        dtype=np.float32,
+                    ),
+                }
+
+        mock_model.propagate_in_video.side_effect = _bbox_gen
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        results = self._run_streaming(node, num_frames=3)
+        assert node._selected_internal_bbox_obj_id == 3
+        assert node._effective_output_bbox_obj_id == 14
+        for r in results:
+            assert r["object_ids"].shape == (1, 1)
+            assert int(r["object_ids"][0, 0].item()) == 14
+            assert r["detection_scores"].shape == (1, 1)
+            assert float(r["detection_scores"][0, 0].item()) == pytest.approx(0.95)
+            mask_vals = set(torch.unique(r["mask"]).cpu().tolist())
+            assert mask_vals.issubset({0, 14})
+
+    def test_bbox_prompt_without_obj_id_uses_selected_sam_id(self) -> None:
+        node = SAM3StreamingPropagation(
+            num_frames=2,
+            prompt_type="bbox",
+            prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
+            prompt_obj_id=None,
+            name="test_bbox_obj_id_from_sam",
+        )
+        mock_model = _make_mock_model()
+        mock_model.add_prompt.return_value = (
+            0,
+            {
+                "out_obj_ids": np.array([5, 3], dtype=np.int64),
+                "out_probs": np.array([0.2, 0.9], dtype=np.float32),
+                "out_boxes_xywh": np.array(
+                    [
+                        [0.7, 0.1, 0.1, 0.1],
+                        [0.1, 0.2, 0.3, 0.4],  # selected SAM id 3
+                    ],
+                    dtype=np.float32,
+                ),
+                "out_binary_masks": np.zeros((2, 1, 1), dtype=bool),
+            },
+        )
+
+        def _bbox_gen(inference_state, **kwargs):  # noqa: ANN001
+            del kwargs
+            h, w = 10, 12
+            for frame_idx in range(inference_state["num_frames"]):
+                masks = np.zeros((2, h, w), dtype=bool)
+                masks[0, :2, :2] = True
+                masks[1, 1:9, 2:8] = True
+                yield frame_idx, {
+                    "out_obj_ids": np.array([5, 3], dtype=np.int64),
+                    "out_probs": np.array([0.2, 0.9], dtype=np.float32),
+                    "out_binary_masks": masks,
+                    "out_boxes_xywh": np.array(
+                        [
+                            [0.7, 0.1, 0.1, 0.1],
+                            [0.1, 0.2, 0.3, 0.4],
+                        ],
+                        dtype=np.float32,
+                    ),
+                }
+
+        mock_model.propagate_in_video.side_effect = _bbox_gen
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        results = self._run_streaming(node, num_frames=2)
+        assert node._selected_internal_bbox_obj_id == 3
+        assert node._effective_output_bbox_obj_id == 3
+        for r in results:
+            assert r["object_ids"].shape == (1, 1)
+            assert int(r["object_ids"][0, 0].item()) == 3
 
     def test_bbox_multiple_initial_boxes_rejected(self) -> None:
         with pytest.raises(ValueError, match="exactly one initial bbox prompt"):

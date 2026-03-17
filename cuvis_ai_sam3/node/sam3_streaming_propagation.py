@@ -1,4 +1,4 @@
-"""SAM3 streaming propagation node — one RGB frame per forward(), all prompt types."""
+"""SAM3 streaming propagation node â€” one RGB frame per forward(), all prompt types."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ class _FrameBuffer:
     """Pre-allocated frame buffer that implements SAM3's ``img_batch`` protocol.
 
     Receives RGB frames from the pipeline one at a time.  SAM3's engine reads
-    ``img_batch[frame_idx]`` during propagation — this object returns the
+    ``img_batch[frame_idx]`` during propagation â€” this object returns the
     pre-processed tensor for the requested index.
     """
 
@@ -50,7 +50,7 @@ class _FrameBuffer:
             raise ValueError(
                 f"Expected frame shape [H, W, 3], got {tuple(frame_float_hwc.shape)}."
             )
-        # float [0,1] → uint8 [0,255]
+        # float [0,1] â†’ uint8 [0,255]
         frame_uint8 = np.clip(frame_float_hwc * 255.0, 0, 255).astype(np.uint8)
         # resize to model image_size
         frame_resized = cv2.resize(
@@ -58,7 +58,7 @@ class _FrameBuffer:
             (self.image_size, self.image_size),
             interpolation=cv2.INTER_CUBIC,
         )
-        # uint8 → float32 CHW → float16 → normalize
+        # uint8 â†’ float32 CHW â†’ float16 â†’ normalize
         frame_np = frame_resized.astype(np.float32)
         frame_tensor = torch.from_numpy(frame_np).permute(2, 0, 1)
         frame_tensor = frame_tensor.to(device=self.device, dtype=torch.float16)
@@ -120,13 +120,18 @@ class _FrameBuffer:
 
 
 class SAM3StreamingPropagation(Node):
-    """Streaming SAM3 propagation node — consumes one RGB frame per ``forward()``.
+    """Streaming SAM3 propagation node â€” consumes one RGB frame per ``forward()``.
 
     Accepts prompt configuration via constructor params. On the first frame it
     initializes state/buffers. Once ``prompt_frame_idx`` is reached, it applies the
     prompt and starts a single ``propagate_in_video`` generator. On subsequent
     frames, it advances the generator with ``next()``. The generator preserves all
     temporal memory across frames.
+
+    Bbox prompt ID semantics:
+    - if ``prompt_obj_id`` is provided, emitted outputs use that ID;
+    - otherwise outputs use the selected SAM object ID.
+    For point/mask prompts, ``prompt_obj_id`` targets the SAM object directly.
 
     Compatible with ``TrackingOverlayNode`` and ``TrackingCocoJsonNode`` sinks.
     """
@@ -154,7 +159,10 @@ class SAM3StreamingPropagation(Node):
         prompt_bbox_labels: list[int] | None = None,
         prompt_points: list[list[float]] | None = None,
         prompt_point_labels: list[int] | None = None,
-        prompt_obj_id: int = 1,
+        # For bbox prompts, this is an output-ID override:
+        # if provided, outputs use this ID; otherwise the selected SAM ID is used.
+        # For point/mask prompts, this remains the SAM object ID to target.
+        prompt_obj_id: int | None = None,
         prompt_mask_path: str | None = None,
         # -- SAM3 thresholds --
         score_threshold_detection: float = 0.5,
@@ -205,6 +213,8 @@ class SAM3StreamingPropagation(Node):
         self._inference_state: dict[str, Any] | None = None
         self._generator: Any = None
         self._frame_idx: int = 0
+        self._selected_internal_bbox_obj_id: int | None = None
+        self._effective_output_bbox_obj_id: int | None = None
 
         super().__init__(
             num_frames=num_frames,
@@ -401,6 +411,68 @@ class SAM3StreamingPropagation(Node):
                 f"{requested_frame_idx} (configured num_frames={self._num_frames})."
             ) from exc
 
+    @staticmethod
+    def _empty_output(frame_idx: int) -> dict[str, torch.Tensor]:
+        return {
+            "frame_id": torch.tensor([frame_idx], dtype=torch.int64),
+            "mask": torch.zeros(1, 1, 1, dtype=torch.int32),
+            "object_ids": torch.zeros(1, 0, dtype=torch.int64),
+            "detection_scores": torch.zeros(1, 0, dtype=torch.float32),
+        }
+
+    @staticmethod
+    def _bbox_iou_xywh(box_a: np.ndarray, box_b: np.ndarray) -> float:
+        ax1, ay1, aw, ah = [float(v) for v in box_a.tolist()]
+        bx1, by1, bw, bh = [float(v) for v in box_b.tolist()]
+        if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+            return 0.0
+        ax2, ay2 = ax1 + aw, ay1 + ah
+        bx2, by2 = bx1 + bw, by1 + bh
+
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter = inter_w * inter_h
+
+        area_a = aw * ah
+        area_b = bw * bh
+        union = area_a + area_b - inter
+        if union <= 0:
+            return 0.0
+        return inter / union
+
+    def _select_bbox_object_id(
+        self,
+        *,
+        prompt_box_xywh: np.ndarray,
+        postprocessed: dict | None,
+    ) -> int | None:
+        if postprocessed is None:
+            return None
+        raw_obj_ids = postprocessed.get("out_obj_ids")
+        if raw_obj_ids is None or len(raw_obj_ids) == 0:
+            return None
+
+        obj_ids = np.asarray(raw_obj_ids, dtype=np.int64)
+        raw_boxes = postprocessed.get("out_boxes_xywh")
+        if raw_boxes is None:
+            return int(obj_ids[0])
+        boxes = np.asarray(raw_boxes, dtype=np.float32)
+        if boxes.ndim != 2 or boxes.shape[0] != obj_ids.shape[0] or boxes.shape[1] != 4:
+            return int(obj_ids[0])
+
+        best_idx = 0
+        best_iou = -1.0
+        for idx in range(obj_ids.shape[0]):
+            iou = self._bbox_iou_xywh(prompt_box_xywh, boxes[idx])
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = idx
+        return int(obj_ids[best_idx])
+
     # -- Prompt application ---------------------------------------------------
 
     def _apply_prompt(self) -> None:
@@ -421,18 +493,40 @@ class SAM3StreamingPropagation(Node):
                 if self._prompt_bbox_labels
                 else torch.ones(len(boxes), dtype=torch.long, device=device)
             )
-            self._model.add_prompt(
+            _, postprocessed = self._model.add_prompt(
                 state,
                 frame_idx=prompt_frame_idx,
                 boxes_xywh=boxes,
                 box_labels=labels,
             )
+            selected_internal = self._select_bbox_object_id(
+                prompt_box_xywh=boxes[0],
+                postprocessed=postprocessed,
+            )
+            self._selected_internal_bbox_obj_id = selected_internal
+            if selected_internal is None:
+                self._effective_output_bbox_obj_id = None
+                logger.warning(
+                    "bbox prompt produced no selectable object on frame {}",
+                    prompt_frame_idx,
+                )
+            else:
+                self._effective_output_bbox_obj_id = (
+                    self._prompt_obj_id if self._prompt_obj_id is not None else selected_internal
+                )
+                logger.info(
+                    "bbox selected internal SAM id {} -> output id {}",
+                    selected_internal,
+                    self._effective_output_bbox_obj_id,
+                )
 
         elif self._prompt_type == "point":
             if not self._prompt_points:
                 raise ValueError("prompt_points required for point prompt_type.")
             if not self._prompt_point_labels:
                 raise ValueError("prompt_point_labels required for point prompt_type.")
+            if self._prompt_obj_id is None:
+                raise ValueError("prompt_obj_id required for point prompt_type.")
             points = torch.tensor(self._prompt_points, dtype=torch.float32, device=device)
             point_labels = torch.tensor(self._prompt_point_labels, dtype=torch.int64, device=device)
             self._model.add_prompt(
@@ -446,6 +540,8 @@ class SAM3StreamingPropagation(Node):
         elif self._prompt_type == "mask":
             if not self._prompt_mask_path:
                 raise ValueError("prompt_mask_path required for mask prompt_type.")
+            if self._prompt_obj_id is None:
+                raise ValueError("prompt_obj_id required for mask prompt_type.")
             mask_gray = cv2.imread(self._prompt_mask_path, cv2.IMREAD_GRAYSCALE)
             if mask_gray is None:
                 raise FileNotFoundError(f"Cannot load mask: {self._prompt_mask_path}")
@@ -475,20 +571,30 @@ class SAM3StreamingPropagation(Node):
 
     # -- Output conversion ----------------------------------------------------
 
-    @staticmethod
-    def _pack_output(frame_idx: int, postprocessed: dict | None) -> dict[str, torch.Tensor]:
+    def _pack_output(self, frame_idx: int, postprocessed: dict | None) -> dict[str, torch.Tensor]:
         """Convert SAM3 per-object output to per-frame label map format."""
         if postprocessed is None or len(postprocessed.get("out_obj_ids", [])) == 0:
-            return {
-                "frame_id": torch.tensor([frame_idx], dtype=torch.int64),
-                "mask": torch.zeros(1, 1, 1, dtype=torch.int32),
-                "object_ids": torch.zeros(1, 0, dtype=torch.int64),
-                "detection_scores": torch.zeros(1, 0, dtype=torch.float32),
-            }
+            return self._empty_output(frame_idx)
 
-        obj_ids = postprocessed["out_obj_ids"]
-        binary_masks = postprocessed["out_binary_masks"]
-        probs = postprocessed["out_probs"]
+        obj_ids = np.asarray(postprocessed["out_obj_ids"], dtype=np.int64)
+        binary_masks = np.asarray(postprocessed["out_binary_masks"], dtype=bool)
+        probs = np.asarray(postprocessed["out_probs"], dtype=np.float32)
+
+        if self._prompt_type == "bbox":
+            if self._selected_internal_bbox_obj_id is None:
+                return self._empty_output(frame_idx)
+            selected_matches = np.nonzero(obj_ids == int(self._selected_internal_bbox_obj_id))[0]
+            if selected_matches.size == 0:
+                return self._empty_output(frame_idx)
+            sel_idx = int(selected_matches[0])
+            out_id = (
+                int(self._effective_output_bbox_obj_id)
+                if self._effective_output_bbox_obj_id is not None
+                else int(obj_ids[sel_idx])
+            )
+            obj_ids = np.array([out_id], dtype=np.int64)
+            binary_masks = binary_masks[sel_idx : sel_idx + 1]
+            probs = probs[sel_idx : sel_idx + 1]
 
         h, w = binary_masks.shape[1], binary_masks.shape[2]
         label_map = np.zeros((h, w), dtype=np.int32)
