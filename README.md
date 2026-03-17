@@ -62,6 +62,24 @@ This breakthrough is driven by an innovative data engine that has automatically 
 - A new suite of improved model checkpoints (denoted as **SAM 3.1**) are released on [Hugging Face](https://huggingface.co/facebook/sam3.1). See [`RELEASE_SAM3p1.md`](RELEASE_SAM3p1.md) for full details.
   * To use the new SAM 3.1 checkpoints, you need the latest model code from this repo. If you have installed an earlier version of this repo, pull the latest code from this repo (with `git pull`), and then reinstall the repo following [Installation](#installation) below.
 
+## Windows Installer (CuvisAI Phase 11B)
+
+This repository now includes a Windows installer pipeline under `installer/` for:
+
+- `sam3-rest-api.exe` (REST server)
+- `sam3-tray.exe` (system tray launcher)
+- `download-weights.exe` (checkpoint downloader)
+
+Build from repo root:
+
+```powershell
+installer\build.bat
+```
+
+Installer output:
+
+- `installer\Output\CuvisAI-SAM3-Server-<version>-Setup.exe`
+
 ## Installation
 
 ### Prerequisites

@@ -8,7 +8,7 @@ tracks them through all frames, and writes:
 
 Example (50 frames):
     uv run python examples/object_tracking/sam3_video_tracker.py \
-        --video-path "D:\\data\\XMR_notarget_Busstation\\20260226\\Auto_013+01-trustimulus.mp4" \
+        --video-path "D:\\data\\XMR_notarget_Busstation\\20260226\\Auto_013+01.mp4" \
         --end-frame 49
 """
 

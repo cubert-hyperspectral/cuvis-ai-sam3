@@ -2,9 +2,14 @@
 
 ## [Unreleased]
 
+- Added Windows installer packaging scaffold under `installer/` for SAM3 REST server, tray launcher, and weight downloader executables
+- Added `configs/sam3-server.env` runtime config template for packaged installs (`SAM3_HOST`, `SAM3_PORT`, `SAM3_CHECKPOINT_PATH`, `SAM3_DEVICE`)
+- Added mandatory checkpoint download step in the Inno Setup installer flow; setup aborts when weight download fails
+- Fixed `SAM3TrackerInference`, `SAM3StreamingPropagation`, and `SAM3ObjectTracker` nodes producing empty outputs for propagation windows ≥ 8 frames by setting `hotstart_unmatch_thresh = inf` on the SAM3 model at load time (ALL-5389 bbox propagation bug)
 - Added `disable_hotstart_retro_suppression` to REST `PropagateRequest` to let clients opt out of retroactive hotstart output suppression during interactive propagation
 - Added end-to-end forwarding of `disable_hotstart_retro_suppression` from REST route/service through `Sam3VideoPredictor` into model `propagate_in_video` calls
 - Fixed propagation output suppression behavior by using per-frame removed-object snapshots when the new flag is enabled, preventing earlier yielded frames from being retroactively emptied
+- Fixed hotstart-removal behavior when `disable_hotstart_retro_suppression=True`: hotstart suppression/removal heuristics are now bypassed in tracker update planning so tracks are not physically dropped after unmatched-threshold windows
 - Added REST tests for the new propagate request field default/override and route forwarding behavior
 - Added cuvis_ai_sam3 wrapper package with plugin scaffolding and node stubs
 - Added UV/CUDA-ready pyproject.toml with optional torch+cu126 dependency group
