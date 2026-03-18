@@ -1,4 +1,4 @@
-"""Tests for SAM3StreamingPropagation node with mocked SAM3 model."""
+"""Tests for SAM3 streaming propagation nodes with mocked SAM3 model."""
 
 from __future__ import annotations
 
@@ -11,7 +11,11 @@ import pytest
 import torch
 
 from cuvis_ai_sam3.node.sam3_streaming_propagation import (
-    SAM3StreamingPropagation,
+    SAM3BboxPropagation,
+    SAM3MaskPropagation,
+    SAM3PointPropagation,
+    SAM3StreamingPropagationBase,
+    SAM3TextPropagation,
     _FrameBuffer,
 )
 
@@ -107,55 +111,61 @@ def _make_propagation_generator(
         }
 
 
+def _run_streaming(
+    node: SAM3StreamingPropagationBase,
+    num_frames: int = 5,
+    h: int = 10,
+    w: int = 12,
+    frame_ids: list[int] | None = None,
+) -> list[dict[str, torch.Tensor]]:
+    """Run the node through num_frames with a mocked model."""
+    mock_model = node._model if node._model is not None else _make_mock_model()
+    if mock_model.propagate_in_video.side_effect is None:
+        def _propagate_from_state(inference_state, **kwargs):  # noqa: ANN001
+            start_frame_idx = int(kwargs.get("start_frame_idx", 0))
+            return _make_propagation_generator(
+                inference_state["num_frames"], start_frame_idx, h, w
+            )
+
+        mock_model.propagate_in_video.side_effect = _propagate_from_state
+
+    node._model = mock_model
+    node._ensure_model = MagicMock()
+
+    results = []
+    if frame_ids is not None and len(frame_ids) != num_frames:
+        raise ValueError("frame_ids length must match num_frames.")
+    for i in range(num_frames):
+        rgb = torch.rand(1, h, w, 3, dtype=torch.float32)
+        frame_id_t = (
+            torch.tensor([int(frame_ids[i])], dtype=torch.int64)
+            if frame_ids is not None
+            else None
+        )
+        result = node.forward(rgb, frame_id=frame_id_t)
+        results.append(result)
+    return results
+
+
 # ---------------------------------------------------------------------------
-# SAM3StreamingPropagation tests
+# SAM3TextPropagation tests
 # ---------------------------------------------------------------------------
 
 
-class TestSAM3StreamingPropagation:
+class TestSAM3TextPropagation:
     @pytest.fixture()
-    def node_text(self) -> SAM3StreamingPropagation:
-        return SAM3StreamingPropagation(
+    def node_text(self) -> SAM3TextPropagation:
+        return SAM3TextPropagation(
             num_frames=5,
-            prompt_type="text",
             prompt_text="person",
             name="test_streaming",
         )
 
-    def _run_streaming(
-        self,
-        node: SAM3StreamingPropagation,
-        num_frames: int = 5,
-        h: int = 10,
-        w: int = 12,
-    ) -> list[dict[str, torch.Tensor]]:
-        """Run the node through num_frames with a mocked model."""
-        mock_model = node._model if node._model is not None else _make_mock_model()
-        if mock_model.propagate_in_video.side_effect is None:
-            def _propagate_from_state(inference_state, **kwargs):  # noqa: ANN001
-                start_frame_idx = int(kwargs.get("start_frame_idx", 0))
-                return _make_propagation_generator(
-                    inference_state["num_frames"], start_frame_idx, h, w
-                )
-
-            mock_model.propagate_in_video.side_effect = _propagate_from_state
-
-        node._model = mock_model
-        node._ensure_model = MagicMock()
-
-        results = []
-        for i in range(num_frames):
-            rgb = torch.rand(1, h, w, 3, dtype=torch.float32)
-            result = node.forward(rgb)
-            results.append(result)
-        return results
-
-    def test_text_prompt_streaming(self, node_text: SAM3StreamingPropagation) -> None:
-        results = self._run_streaming(node_text, num_frames=5, h=10, w=12)
+    def test_text_prompt_streaming(self, node_text: SAM3TextPropagation) -> None:
+        results = _run_streaming(node_text, num_frames=5, h=10, w=12)
 
         assert len(results) == 5
-        for i, r in enumerate(results):
-            assert r["frame_id"].item() == i
+        for r in results:
             assert r["mask"].shape == (1, 10, 12)
             assert r["mask"].dtype == torch.int32
             assert r["object_ids"].shape == (1, 2)
@@ -172,26 +182,24 @@ class TestSAM3StreamingPropagation:
         )
 
     def test_text_prompt_runs_n_forwards_without_exhaustion(self) -> None:
-        node = SAM3StreamingPropagation(
+        node = SAM3TextPropagation(
             num_frames=4,
-            prompt_type="text",
             prompt_text="person",
             name="test_text_no_exhaustion",
         )
-        results = self._run_streaming(node, num_frames=4, h=9, w=11)
-        assert [int(r["frame_id"].item()) for r in results] == [0, 1, 2, 3]
+        results = _run_streaming(node, num_frames=4, h=9, w=11)
+        assert len(results) == 4
 
     def test_non_zero_prompt_frame_idx(self) -> None:
-        node = SAM3StreamingPropagation(
+        node = SAM3TextPropagation(
             num_frames=5,
             prompt_frame_idx=2,
-            prompt_type="text",
             prompt_text="person",
             name="test_prompt_frame_2",
         )
-        results = self._run_streaming(node, num_frames=5, h=10, w=12)
+        results = _run_streaming(node, num_frames=5, h=10, w=12)
 
-        assert [int(r["frame_id"].item()) for r in results] == [0, 1, 2, 3, 4]
+        assert len(results) == 5
         assert results[0]["object_ids"].shape == (1, 0)
         assert results[1]["object_ids"].shape == (1, 0)
         assert results[2]["object_ids"].shape == (1, 2)
@@ -199,14 +207,108 @@ class TestSAM3StreamingPropagation:
         assert call_kwargs["start_frame_idx"] == 2
         assert call_kwargs["max_frame_num_to_track"] == 2
 
+    def test_prompt_frame_id_uses_input_frame_ids(self) -> None:
+        node = SAM3TextPropagation(
+            num_frames=5,
+            prompt_frame_id=102,
+            prompt_text="person",
+            name="test_prompt_frame_id_mapping",
+        )
+        frame_ids = [100, 101, 102, 103, 104]
+        results = _run_streaming(node, num_frames=5, h=10, w=12, frame_ids=frame_ids)
+
+        assert node._source_frame_ids == frame_ids
+        assert results[0]["object_ids"].shape == (1, 0)
+        assert results[1]["object_ids"].shape == (1, 0)
+        assert results[2]["object_ids"].shape == (1, 2)
+        call_kwargs = node._model.propagate_in_video.call_args.kwargs
+        assert call_kwargs["start_frame_idx"] == 2
+
+    def test_prompt_frame_id_with_input_offset(self) -> None:
+        """Offset applies to fallback path (no explicit frame_id input)."""
+        node = SAM3TextPropagation(
+            num_frames=5,
+            prompt_frame_id=102,
+            input_frame_id_offset=100,
+            prompt_text="person",
+            name="test_prompt_frame_id_with_offset",
+        )
+        # No explicit frame_ids → fallback uses stream_idx + offset
+        results = _run_streaming(node, num_frames=5, h=10, w=12, frame_ids=None)
+
+        assert node._source_frame_ids == [100, 101, 102, 103, 104]
+        assert results[0]["object_ids"].shape == (1, 0)
+        assert results[1]["object_ids"].shape == (1, 0)
+        assert results[2]["object_ids"].shape == (1, 2)
+        call_kwargs = node._model.propagate_in_video.call_args.kwargs
+        assert call_kwargs["start_frame_idx"] == 2
+
+    def test_explicit_frame_id_ignores_offset(self) -> None:
+        """Offset must NOT be applied when frame_id is explicitly provided via the input port."""
+        node = SAM3TextPropagation(
+            num_frames=5,
+            prompt_frame_id=102,
+            input_frame_id_offset=100,  # should be ignored for explicit frame_ids
+            prompt_text="person",
+            name="test_explicit_frame_id_no_offset",
+        )
+        # Absolute frame_ids (as from VideoFrameDataset + Subset)
+        frame_ids = [100, 101, 102, 103, 104]
+        results = _run_streaming(node, num_frames=5, h=10, w=12, frame_ids=frame_ids)
+
+        # Frame IDs used as-is without offset
+        assert node._source_frame_ids == [100, 101, 102, 103, 104]
+        assert results[0]["object_ids"].shape == (1, 0)
+        assert results[1]["object_ids"].shape == (1, 0)
+        assert results[2]["object_ids"].shape == (1, 2)
+
+    def test_empty_detections(self) -> None:
+        node = SAM3TextPropagation(
+            num_frames=2,
+            prompt_text="person",
+            name="test_empty",
+        )
+
+        def _empty_gen(num_frames: int):
+            for i in range(num_frames):
+                yield i, {
+                    "out_obj_ids": np.array([], dtype=np.int64),
+                    "out_probs": np.array([], dtype=np.float32),
+                    "out_binary_masks": np.zeros((0, 10, 12), dtype=bool),
+                }
+
+        mock_model = _make_mock_model()
+        mock_model.propagate_in_video.side_effect = (
+            lambda inference_state, **kwargs: _empty_gen(inference_state["num_frames"])
+        )
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        for _ in range(2):
+            rgb = torch.rand(1, 10, 12, 3)
+            result = node.forward(rgb)
+            assert result["object_ids"].shape[1] == 0
+            assert result["detection_scores"].shape[1] == 0
+
+    def test_single_generator_called_once(self, node_text: SAM3TextPropagation) -> None:
+        """Verify propagate_in_video is called exactly once (single generator)."""
+        _run_streaming(node_text, num_frames=5)
+        assert node_text._model.propagate_in_video.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# SAM3BboxPropagation tests
+# ---------------------------------------------------------------------------
+
+
+class TestSAM3BboxPropagation:
     def test_bbox_prompt_streaming(self) -> None:
-        node = SAM3StreamingPropagation(
+        node = SAM3BboxPropagation(
             num_frames=3,
-            prompt_type="bbox",
             prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
             name="test_bbox",
         )
-        results = self._run_streaming(node, num_frames=3)
+        results = _run_streaming(node, num_frames=3)
         assert len(results) == 3
         for r in results:
             assert r["object_ids"].shape == (1, 1)
@@ -214,9 +316,8 @@ class TestSAM3StreamingPropagation:
         node._model.add_prompt.assert_called_once()
 
     def test_bbox_prompt_uses_provided_output_id(self) -> None:
-        node = SAM3StreamingPropagation(
+        node = SAM3BboxPropagation(
             num_frames=3,
-            prompt_type="bbox",
             prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
             prompt_obj_id=14,
             name="test_bbox_obj_id_override",
@@ -265,7 +366,7 @@ class TestSAM3StreamingPropagation:
         node._model = mock_model
         node._ensure_model = MagicMock()
 
-        results = self._run_streaming(node, num_frames=3)
+        results = _run_streaming(node, num_frames=3)
         assert node._selected_internal_bbox_obj_id == 3
         assert node._effective_output_bbox_obj_id == 14
         for r in results:
@@ -277,9 +378,8 @@ class TestSAM3StreamingPropagation:
             assert mask_vals.issubset({0, 14})
 
     def test_bbox_prompt_without_obj_id_uses_selected_sam_id(self) -> None:
-        node = SAM3StreamingPropagation(
+        node = SAM3BboxPropagation(
             num_frames=2,
-            prompt_type="bbox",
             prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
             prompt_obj_id=None,
             name="test_bbox_obj_id_from_sam",
@@ -325,7 +425,7 @@ class TestSAM3StreamingPropagation:
         node._model = mock_model
         node._ensure_model = MagicMock()
 
-        results = self._run_streaming(node, num_frames=2)
+        results = _run_streaming(node, num_frames=2)
         assert node._selected_internal_bbox_obj_id == 3
         assert node._effective_output_bbox_obj_id == 3
         for r in results:
@@ -334,17 +434,22 @@ class TestSAM3StreamingPropagation:
 
     def test_bbox_multiple_initial_boxes_rejected(self) -> None:
         with pytest.raises(ValueError, match="exactly one initial bbox prompt"):
-            SAM3StreamingPropagation(
+            SAM3BboxPropagation(
                 num_frames=3,
-                prompt_type="bbox",
                 prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.1, 0.2]],
                 name="test_bbox_multi",
             )
 
+
+# ---------------------------------------------------------------------------
+# SAM3PointPropagation tests
+# ---------------------------------------------------------------------------
+
+
+class TestSAM3PointPropagation:
     def test_point_prompt_streaming(self) -> None:
-        node = SAM3StreamingPropagation(
+        node = SAM3PointPropagation(
             num_frames=3,
-            prompt_type="point",
             prompt_points=[[0.5, 0.5]],
             prompt_point_labels=[1],
             prompt_obj_id=1,
@@ -366,19 +471,25 @@ class TestSAM3StreamingPropagation:
         node._model = mock_model
         node._ensure_model = MagicMock()
 
-        results = self._run_streaming(node, num_frames=3)
+        results = _run_streaming(node, num_frames=3)
         assert len(results) == 3
         node._model.add_prompt.assert_called_once()
 
+
+# ---------------------------------------------------------------------------
+# SAM3MaskPropagation tests
+# ---------------------------------------------------------------------------
+
+
+class TestSAM3MaskPropagation:
     def test_mask_prompt_streaming(self, tmp_path: Path) -> None:
         mask_img = np.zeros((10, 12), dtype=np.uint8)
         mask_img[2:8, 3:9] = 255
         mask_path = tmp_path / "mask.png"
         cv2.imwrite(str(mask_path), mask_img)
 
-        node = SAM3StreamingPropagation(
+        node = SAM3MaskPropagation(
             num_frames=3,
-            prompt_type="mask",
             prompt_mask_path=str(mask_path),
             prompt_obj_id=1,
             name="test_mask",
@@ -399,82 +510,47 @@ class TestSAM3StreamingPropagation:
         node._model = mock_model
         node._ensure_model = MagicMock()
 
-        results = self._run_streaming(node, num_frames=3)
+        results = _run_streaming(node, num_frames=3)
         assert len(results) == 3
         node._model.add_mask.assert_called_once()
 
-    def test_output_specs_compatible(self, node_text: SAM3StreamingPropagation) -> None:
-        """Output specs should match TrackingOverlayNode / TrackingCocoJsonNode inputs."""
-        specs = SAM3StreamingPropagation.OUTPUT_SPECS
-        assert "frame_id" in specs
-        assert "mask" in specs
-        assert "object_ids" in specs
-        assert "detection_scores" in specs
-        assert specs["mask"].dtype == torch.int32
-        assert specs["object_ids"].dtype == torch.int64
 
-    def test_empty_detections(self) -> None:
-        node = SAM3StreamingPropagation(
-            num_frames=2,
-            prompt_type="text",
-            prompt_text="person",
-            name="test_empty",
-        )
+# ---------------------------------------------------------------------------
+# Validation & shared behavior tests
+# ---------------------------------------------------------------------------
 
-        def _empty_gen(num_frames: int):
-            for i in range(num_frames):
-                yield i, {
-                    "out_obj_ids": np.array([], dtype=np.int64),
-                    "out_probs": np.array([], dtype=np.float32),
-                    "out_binary_masks": np.zeros((0, 10, 12), dtype=bool),
-                }
 
-        mock_model = _make_mock_model()
-        mock_model.propagate_in_video.side_effect = (
-            lambda inference_state, **kwargs: _empty_gen(inference_state["num_frames"])
-        )
-        node._model = mock_model
-        node._ensure_model = MagicMock()
-
-        for _ in range(2):
-            rgb = torch.rand(1, 10, 12, 3)
-            result = node.forward(rgb)
-            assert result["object_ids"].shape[1] == 0
-            assert result["detection_scores"].shape[1] == 0
-
-    def test_single_generator_called_once(self, node_text: SAM3StreamingPropagation) -> None:
-        """Verify propagate_in_video is called exactly once (single generator)."""
-        self._run_streaming(node_text, num_frames=5)
-        assert node_text._model.propagate_in_video.call_count == 1
-
-    def test_invalid_prompt_type_raises(self) -> None:
-        with pytest.raises(ValueError, match="prompt_type"):
-            SAM3StreamingPropagation(
-                num_frames=5,
-                prompt_type="invalid",
-                name="test_invalid",
-            )
-
+class TestValidation:
     def test_num_frames_zero_raises(self) -> None:
         with pytest.raises(ValueError, match="num_frames"):
-            SAM3StreamingPropagation(
+            SAM3TextPropagation(
                 num_frames=0,
-                prompt_type="text",
+                prompt_text="person",
                 name="test_zero",
             )
 
     def test_prompt_frame_idx_out_of_range_raises(self) -> None:
         with pytest.raises(ValueError, match="prompt_frame_idx"):
-            SAM3StreamingPropagation(
+            SAM3TextPropagation(
                 num_frames=3,
                 prompt_frame_idx=3,
-                prompt_type="text",
+                prompt_text="person",
                 name="test_prompt_idx_invalid",
             )
 
+    def test_output_specs_compatible(self) -> None:
+        """Output specs should match TrackingOverlayNode / TrackingCocoJsonNode inputs."""
+        for cls in [SAM3TextPropagation, SAM3BboxPropagation, SAM3PointPropagation, SAM3MaskPropagation]:
+            specs = cls.OUTPUT_SPECS
+            assert "mask" in specs
+            assert "object_ids" in specs
+            assert "detection_scores" in specs
+            assert specs["mask"].dtype == torch.int32
+            assert specs["object_ids"].dtype == torch.int64
+
     def test_detector_guard_installed_on_ensure_model(self) -> None:
-        node = SAM3StreamingPropagation(
-            num_frames=3, prompt_type="text", prompt_text="person", name="test_guard"
+        node = SAM3TextPropagation(
+            num_frames=3, prompt_text="person", name="test_guard"
         )
         mock_model = _make_mock_model()
         mock_detector = MagicMock()

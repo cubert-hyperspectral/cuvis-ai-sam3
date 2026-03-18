@@ -1,7 +1,16 @@
-"""SAM3 streaming propagation node â€” one RGB frame per forward(), all prompt types."""
+"""SAM3 streaming propagation nodes — one RGB frame per forward(), specialized by prompt type.
+
+Hierarchy:
+    SAM3StreamingPropagationBase(Node)   — abstract base with shared infrastructure
+    ├── SAM3TextPropagation              — text/concept prompt
+    ├── SAM3BboxPropagation              — bounding-box prompt
+    ├── SAM3PointPropagation             — point prompt
+    └── SAM3MaskPropagation              — binary mask prompt
+"""
 
 from __future__ import annotations
 
+from abc import abstractmethod
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +28,7 @@ class _FrameBuffer:
     """Pre-allocated frame buffer that implements SAM3's ``img_batch`` protocol.
 
     Receives RGB frames from the pipeline one at a time.  SAM3's engine reads
-    ``img_batch[frame_idx]`` during propagation â€” this object returns the
+    ``img_batch[frame_idx]`` during propagation — this object returns the
     pre-processed tensor for the requested index.
     """
 
@@ -50,7 +59,7 @@ class _FrameBuffer:
             raise ValueError(
                 f"Expected frame shape [H, W, 3], got {tuple(frame_float_hwc.shape)}."
             )
-        # float [0,1] â†’ uint8 [0,255]
+        # float [0,1] → uint8 [0,255]
         frame_uint8 = np.clip(frame_float_hwc * 255.0, 0, 255).astype(np.uint8)
         # resize to model image_size
         frame_resized = cv2.resize(
@@ -58,7 +67,7 @@ class _FrameBuffer:
             (self.image_size, self.image_size),
             interpolation=cv2.INTER_CUBIC,
         )
-        # uint8 â†’ float32 CHW â†’ float16 â†’ normalize
+        # uint8 → float32 CHW → float16 → normalize
         frame_np = frame_resized.astype(np.float32)
         frame_tensor = torch.from_numpy(frame_np).permute(2, 0, 1)
         frame_tensor = frame_tensor.to(device=self.device, dtype=torch.float16)
@@ -119,28 +128,31 @@ class _FrameBuffer:
         return self
 
 
-class SAM3StreamingPropagation(Node):
-    """Streaming SAM3 propagation node â€” consumes one RGB frame per ``forward()``.
+# =============================================================================
+# Base class
+# =============================================================================
 
-    Accepts prompt configuration via constructor params. On the first frame it
-    initializes state/buffers. Once ``prompt_frame_idx`` is reached, it applies the
-    prompt and starts a single ``propagate_in_video`` generator. On subsequent
-    frames, it advances the generator with ``next()``. The generator preserves all
-    temporal memory across frames.
 
-    Bbox prompt ID semantics:
-    - if ``prompt_obj_id`` is provided, emitted outputs use that ID;
-    - otherwise outputs use the selected SAM object ID.
-    For point/mask prompts, ``prompt_obj_id`` targets the SAM object directly.
+class SAM3StreamingPropagationBase(Node):
+    """Abstract base for streaming SAM3 propagation nodes.
+
+    Consumes one RGB frame per ``forward()`` call, maintaining temporal state
+    across the entire video sequence. Subclasses implement ``_apply_prompt()``
+    for their specific prompt type.
 
     Compatible with ``TrackingOverlayNode`` and ``TrackingCocoJsonNode`` sinks.
     """
 
     INPUT_SPECS = {
         "rgb_frame": PortSpec(dtype=torch.float32, shape=(1, -1, -1, 3)),
+        "frame_id": PortSpec(
+            dtype=torch.int64,
+            shape=(1,),
+            description="Source frame index [1]. If omitted, local stream index is used.",
+            optional=True,
+        ),
     }
     OUTPUT_SPECS = {
-        "frame_id": PortSpec(dtype=torch.int64, shape=(1,)),
         "mask": PortSpec(dtype=torch.int32, shape=(1, -1, -1)),
         "object_ids": PortSpec(dtype=torch.int64, shape=(1, -1)),
         "detection_scores": PortSpec(dtype=torch.float32, shape=(1, -1)),
@@ -152,18 +164,8 @@ class SAM3StreamingPropagation(Node):
         checkpoint_path: str | None = None,
         compile_model: bool = False,
         prompt_frame_idx: int = 0,
-        # -- prompt configuration --
-        prompt_type: str = "text",
-        prompt_text: str = "person",
-        prompt_bboxes_xywh: list[list[float]] | None = None,
-        prompt_bbox_labels: list[int] | None = None,
-        prompt_points: list[list[float]] | None = None,
-        prompt_point_labels: list[int] | None = None,
-        # For bbox prompts, this is an output-ID override:
-        # if provided, outputs use this ID; otherwise the selected SAM ID is used.
-        # For point/mask prompts, this remains the SAM object ID to target.
-        prompt_obj_id: int | None = None,
-        prompt_mask_path: str | None = None,
+        prompt_frame_id: int | None = None,
+        input_frame_id_offset: int = 0,
         # -- SAM3 thresholds --
         score_threshold_detection: float = 0.5,
         new_det_thresh: float = 0.7,
@@ -175,31 +177,21 @@ class SAM3StreamingPropagation(Node):
     ) -> None:
         if num_frames < 1:
             raise ValueError(f"num_frames must be >= 1, got {num_frames}.")
-        if prompt_frame_idx < 0 or prompt_frame_idx >= num_frames:
-            raise ValueError(
-                f"prompt_frame_idx must be in [0, {num_frames - 1}], got {prompt_frame_idx}."
-            )
-        valid_types = ("text", "bbox", "point", "mask")
-        if prompt_type not in valid_types:
-            raise ValueError(f"prompt_type must be one of {valid_types}, got '{prompt_type}'.")
-        if prompt_type == "bbox" and prompt_bboxes_xywh and len(prompt_bboxes_xywh) > 1:
-            raise ValueError(
-                "SAM3StreamingPropagation currently supports exactly one initial bbox prompt. "
-                "Provide a single bbox prompt only."
-            )
+        if prompt_frame_id is None:
+            if prompt_frame_idx < 0 or prompt_frame_idx >= num_frames:
+                raise ValueError(
+                    f"prompt_frame_idx must be in [0, {num_frames - 1}], got {prompt_frame_idx}."
+                )
+        elif prompt_frame_id < 0:
+            raise ValueError(f"prompt_frame_id must be >= 0, got {prompt_frame_id}.")
 
         self._num_frames = int(num_frames)
         self._checkpoint_path = checkpoint_path
         self._compile_model = compile_model
         self._prompt_frame_idx = int(prompt_frame_idx)
-        self._prompt_type = prompt_type
-        self._prompt_text = prompt_text
-        self._prompt_bboxes_xywh = prompt_bboxes_xywh
-        self._prompt_bbox_labels = prompt_bbox_labels
-        self._prompt_points = prompt_points
-        self._prompt_point_labels = prompt_point_labels
-        self._prompt_obj_id = prompt_obj_id
-        self._prompt_mask_path = prompt_mask_path
+        self._prompt_frame_id = int(prompt_frame_id) if prompt_frame_id is not None else None
+        self._input_frame_id_offset = int(input_frame_id_offset)
+        self._resolved_prompt_frame_idx: int | None = None
         self._score_threshold_detection = score_threshold_detection
         self._new_det_thresh = new_det_thresh
         self._det_nms_thresh = det_nms_thresh
@@ -213,22 +205,16 @@ class SAM3StreamingPropagation(Node):
         self._inference_state: dict[str, Any] | None = None
         self._generator: Any = None
         self._frame_idx: int = 0
-        self._selected_internal_bbox_obj_id: int | None = None
-        self._effective_output_bbox_obj_id: int | None = None
+        self._source_frame_ids: list[int] = []
+        self._frame_id_to_stream_idx: dict[int, int] = {}
 
         super().__init__(
             num_frames=num_frames,
             checkpoint_path=checkpoint_path,
             compile_model=compile_model,
             prompt_frame_idx=prompt_frame_idx,
-            prompt_type=prompt_type,
-            prompt_text=prompt_text,
-            prompt_bboxes_xywh=prompt_bboxes_xywh,
-            prompt_bbox_labels=prompt_bbox_labels,
-            prompt_points=prompt_points,
-            prompt_point_labels=prompt_point_labels,
-            prompt_obj_id=prompt_obj_id,
-            prompt_mask_path=prompt_mask_path,
+            prompt_frame_id=prompt_frame_id,
+            input_frame_id_offset=input_frame_id_offset,
             score_threshold_detection=score_threshold_detection,
             new_det_thresh=new_det_thresh,
             det_nms_thresh=det_nms_thresh,
@@ -407,18 +393,295 @@ class SAM3StreamingPropagation(Node):
             return next(self._generator)
         except StopIteration as exc:
             raise RuntimeError(
-                "SAM3StreamingPropagation generator exhausted early at frame "
+                f"{self.__class__.__name__} generator exhausted early at frame "
                 f"{requested_frame_idx} (configured num_frames={self._num_frames})."
             ) from exc
 
+    def _resolve_source_frame_id(
+        self,
+        frame_id: torch.Tensor | None,
+        fallback_stream_idx: int,
+    ) -> int:
+        if frame_id is None or frame_id.numel() == 0:
+            return int(fallback_stream_idx + self._input_frame_id_offset)
+        return int(frame_id.reshape(-1)[0].item())
+
+    def _register_frame_id_mapping(self, stream_idx: int, source_frame_id: int) -> None:
+        if stream_idx == len(self._source_frame_ids):
+            self._source_frame_ids.append(int(source_frame_id))
+        elif stream_idx < len(self._source_frame_ids):
+            prev = int(self._source_frame_ids[stream_idx])
+            if prev != int(source_frame_id):
+                logger.warning(
+                    "Frame ID mismatch at local index {}: previous={}, current={}",
+                    stream_idx,
+                    prev,
+                    source_frame_id,
+                )
+                self._source_frame_ids[stream_idx] = int(source_frame_id)
+        else:
+            while len(self._source_frame_ids) < stream_idx:
+                self._source_frame_ids.append(int(len(self._source_frame_ids)))
+            self._source_frame_ids.append(int(source_frame_id))
+
+        existing = self._frame_id_to_stream_idx.get(int(source_frame_id))
+        if existing is None:
+            self._frame_id_to_stream_idx[int(source_frame_id)] = int(stream_idx)
+        elif existing != int(stream_idx):
+            logger.warning(
+                "Duplicate source frame_id {} seen at local indices {} and {}. Using first mapping.",
+                source_frame_id,
+                existing,
+                stream_idx,
+            )
+
+    def _source_frame_id_for_stream_idx(self, stream_idx: int) -> int:
+        if 0 <= stream_idx < len(self._source_frame_ids):
+            return int(self._source_frame_ids[stream_idx])
+        return int(stream_idx)
+
+    def _maybe_resolve_prompt_frame_idx_from_source_id(self) -> int | None:
+        if self._prompt_frame_id is None:
+            if self._resolved_prompt_frame_idx is None:
+                self._resolved_prompt_frame_idx = int(self._prompt_frame_idx)
+            return self._resolved_prompt_frame_idx
+
+        if self._resolved_prompt_frame_idx is not None:
+            return self._resolved_prompt_frame_idx
+
+        resolved = self._frame_id_to_stream_idx.get(int(self._prompt_frame_id))
+        if resolved is None:
+            return None
+
+        self._resolved_prompt_frame_idx = int(resolved)
+        logger.info(
+            "{}: resolved prompt_frame_id {} -> local prompt index {}",
+            self.__class__.__name__,
+            self._prompt_frame_id,
+            self._resolved_prompt_frame_idx,
+        )
+        return self._resolved_prompt_frame_idx
+
+    def _prompt_idx_for_model(self) -> int:
+        prompt_idx = self._maybe_resolve_prompt_frame_idx_from_source_id()
+        if prompt_idx is None:
+            raise RuntimeError(
+                "Prompt frame has not been observed yet. "
+                f"Expected source prompt_frame_id={self._prompt_frame_id}."
+            )
+        return int(prompt_idx)
+
     @staticmethod
-    def _empty_output(frame_idx: int) -> dict[str, torch.Tensor]:
+    def _empty_output() -> dict[str, torch.Tensor]:
         return {
-            "frame_id": torch.tensor([frame_idx], dtype=torch.int64),
             "mask": torch.zeros(1, 1, 1, dtype=torch.int32),
             "object_ids": torch.zeros(1, 0, dtype=torch.int64),
             "detection_scores": torch.zeros(1, 0, dtype=torch.float32),
         }
+
+    # -- Prompt application (subclass responsibility) -------------------------
+
+    @abstractmethod
+    def _apply_prompt(self) -> None:
+        """Apply the configured prompt to ``prompt_frame_idx`` of the inference state."""
+
+    # -- Output conversion ----------------------------------------------------
+
+    @property
+    def _requires_cached_frame_outputs_on_prompt_frame(self) -> bool:
+        """Whether cached_frame_outputs must be pre-seeded on the prompt frame.
+
+        Point and mask prompts require this; text and bbox do not.
+        Override in subclasses that need it.
+        """
+        return False
+
+    def _filter_objects(
+        self,
+        obj_ids: np.ndarray,
+        binary_masks: np.ndarray,
+        probs: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Hook for subclasses to filter/remap detected objects. Default: pass-through."""
+        return obj_ids, binary_masks, probs
+
+    def _pack_output(
+        self,
+        postprocessed: dict | None,
+    ) -> dict[str, torch.Tensor]:
+        """Convert SAM3 per-object output to per-frame label map format."""
+        if postprocessed is None or len(postprocessed.get("out_obj_ids", [])) == 0:
+            return self._empty_output()
+
+        obj_ids = np.asarray(postprocessed["out_obj_ids"], dtype=np.int64)
+        binary_masks = np.asarray(postprocessed["out_binary_masks"], dtype=bool)
+        probs = np.asarray(postprocessed["out_probs"], dtype=np.float32)
+
+        obj_ids, binary_masks, probs = self._filter_objects(obj_ids, binary_masks, probs)
+        if obj_ids.shape[0] == 0:
+            return self._empty_output()
+
+        h, w = binary_masks.shape[1], binary_masks.shape[2]
+        label_map = np.zeros((h, w), dtype=np.int32)
+        for oid, m in zip(obj_ids, binary_masks):
+            label_map[m] = int(oid)
+
+        return {
+            "mask": torch.from_numpy(label_map).unsqueeze(0),
+            "object_ids": torch.from_numpy(np.array(obj_ids, dtype=np.int64)).unsqueeze(0),
+            "detection_scores": torch.from_numpy(np.array(probs, dtype=np.float32)).unsqueeze(0),
+        }
+
+    # -- Forward --------------------------------------------------------------
+
+    def forward(
+        self,
+        rgb_frame: torch.Tensor,
+        frame_id: torch.Tensor | None = None,
+        context: Context | None = None,  # noqa: ARG002
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Process one RGB frame and return tracking outputs.
+
+        Parameters
+        ----------
+        rgb_frame : torch.Tensor
+            Shape ``[1, H, W, 3]``, float32, values in ``[0, 1]``.
+
+        Returns
+        -------
+        dict with keys: ``mask``, ``object_ids``, ``detection_scores``.
+        """
+        self._ensure_model()
+
+        frame_np = rgb_frame[0].detach().cpu().numpy()  # [H, W, 3] float32
+        stream_idx = self._frame_idx
+        source_frame_id = self._resolve_source_frame_id(frame_id, fallback_stream_idx=stream_idx)
+        self._register_frame_id_mapping(stream_idx, source_frame_id)
+        prompt_frame_idx = self._maybe_resolve_prompt_frame_idx_from_source_id()
+
+        if stream_idx == 0:
+            # -- First frame: initialize state and buffer --
+            orig_h, orig_w = frame_np.shape[0], frame_np.shape[1]
+            device = self._model_device()
+
+            self._frame_buffer = _FrameBuffer(
+                num_frames=self._num_frames,
+                image_size=int(self._model.image_size),
+                device=device,
+            )
+            self._frame_buffer.add(frame_np)
+
+            self._inference_state = self._build_state(orig_h, orig_w)
+            self._extend_state_for_frame(0)
+        else:
+            # -- Subsequent frames: buffer + extend state --
+            self._frame_buffer.add(frame_np)
+            self._extend_state_for_frame(stream_idx)
+
+        if self._generator is None and prompt_frame_idx is not None and stream_idx >= prompt_frame_idx:
+            self._prepare_state_for_full_sequence()
+            if self._requires_cached_frame_outputs_on_prompt_frame:
+                # Interactivity prompt paths require cached outputs on the prompted frame.
+                self._inference_state["cached_frame_outputs"].setdefault(prompt_frame_idx, {})
+            self._apply_prompt()
+
+            # Start one generator, potentially beginning at a non-zero prompt frame.
+            self._generator = self._model.propagate_in_video(
+                self._inference_state,
+                start_frame_idx=prompt_frame_idx,
+                max_frame_num_to_track=self._num_frames - prompt_frame_idx - 1,
+                reverse=False,
+            )
+            _yield_frame_idx, postprocessed = self._next_generator_output(stream_idx)
+            result = self._pack_output(postprocessed)
+        else:
+            if self._generator is None:
+                # Frames before the prompt frame: keep outputs empty.
+                result = self._pack_output(None)
+            else:
+                # Frames after prompt: advance the running generator.
+                _yield_frame_idx, postprocessed = self._next_generator_output(stream_idx)
+                result = self._pack_output(postprocessed)
+
+        self._frame_idx += 1
+
+        if self._progress_log_interval > 0 and stream_idx % self._progress_log_interval == 0:
+            n_objs = result["object_ids"].shape[1]
+            logger.info(
+                "{}: local frame {}/{}, source frame {}, {} objects",
+                self.__class__.__name__,
+                stream_idx,
+                self._num_frames,
+                source_frame_id,
+                n_objs,
+            )
+
+        return result
+
+
+# =============================================================================
+# Concrete subclasses
+# =============================================================================
+
+
+class SAM3TextPropagation(SAM3StreamingPropagationBase):
+    """SAM3 streaming propagation with a text/concept prompt.
+
+    Detects and tracks all objects matching ``prompt_text`` (e.g. "person").
+    """
+
+    def __init__(
+        self,
+        num_frames: int,
+        prompt_text: str = "person",
+        **kwargs: Any,
+    ) -> None:
+        self._prompt_text = prompt_text
+        super().__init__(num_frames=num_frames, prompt_text=prompt_text, **kwargs)
+
+    def _apply_prompt(self) -> None:
+        prompt_idx = self._prompt_idx_for_model()
+        self._model.add_prompt(
+            self._inference_state,
+            frame_idx=prompt_idx,
+            text_str=self._prompt_text,
+        )
+
+
+class SAM3BboxPropagation(SAM3StreamingPropagationBase):
+    """SAM3 streaming propagation with a bounding-box prompt.
+
+    Tracks a single object initialized by a bounding box. The best-matching
+    SAM object is selected via IoU. If ``prompt_obj_id`` is provided, emitted
+    outputs use that ID; otherwise the selected SAM internal ID is used.
+    """
+
+    def __init__(
+        self,
+        num_frames: int,
+        prompt_bboxes_xywh: list[list[float]],
+        prompt_bbox_labels: list[int] | None = None,
+        prompt_obj_id: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if prompt_bboxes_xywh and len(prompt_bboxes_xywh) > 1:
+            raise ValueError(
+                "SAM3BboxPropagation currently supports exactly one initial bbox prompt. "
+                "Provide a single bbox prompt only."
+            )
+        self._prompt_bboxes_xywh = prompt_bboxes_xywh
+        self._prompt_bbox_labels = prompt_bbox_labels
+        self._prompt_obj_id = prompt_obj_id
+        self._selected_internal_bbox_obj_id: int | None = None
+        self._effective_output_bbox_obj_id: int | None = None
+        super().__init__(
+            num_frames=num_frames,
+            prompt_bboxes_xywh=prompt_bboxes_xywh,
+            prompt_bbox_labels=prompt_bbox_labels,
+            prompt_obj_id=prompt_obj_id,
+            **kwargs,
+        )
 
     @staticmethod
     def _bbox_iou_xywh(box_a: np.ndarray, box_b: np.ndarray) -> float:
@@ -473,218 +736,172 @@ class SAM3StreamingPropagation(Node):
                 best_idx = idx
         return int(obj_ids[best_idx])
 
-    # -- Prompt application ---------------------------------------------------
+    def _apply_prompt(self) -> None:
+        if not self._prompt_bboxes_xywh:
+            raise ValueError("prompt_bboxes_xywh required for SAM3BboxPropagation.")
+        prompt_idx = self._prompt_idx_for_model()
+        device = self._model_device()
+        boxes = np.array(self._prompt_bboxes_xywh, dtype=np.float32)
+        labels = (
+            torch.tensor(self._prompt_bbox_labels, dtype=torch.long, device=device)
+            if self._prompt_bbox_labels
+            else torch.ones(len(boxes), dtype=torch.long, device=device)
+        )
+        _, postprocessed = self._model.add_prompt(
+            self._inference_state,
+            frame_idx=prompt_idx,
+            boxes_xywh=boxes,
+            box_labels=labels,
+        )
+        selected_internal = self._select_bbox_object_id(
+            prompt_box_xywh=boxes[0],
+            postprocessed=postprocessed,
+        )
+        self._selected_internal_bbox_obj_id = selected_internal
+        if selected_internal is None:
+            self._effective_output_bbox_obj_id = None
+            logger.warning(
+                "bbox prompt produced no selectable object on frame {}",
+                prompt_idx,
+            )
+        else:
+            self._effective_output_bbox_obj_id = (
+                self._prompt_obj_id if self._prompt_obj_id is not None else selected_internal
+            )
+            logger.info(
+                "bbox selected internal SAM id {} -> output id {}",
+                selected_internal,
+                self._effective_output_bbox_obj_id,
+            )
+
+    def _filter_objects(
+        self,
+        obj_ids: np.ndarray,
+        binary_masks: np.ndarray,
+        probs: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self._selected_internal_bbox_obj_id is None:
+            return (
+                np.array([], dtype=np.int64),
+                np.zeros((0,) + binary_masks.shape[1:], dtype=bool),
+                np.array([], dtype=np.float32),
+            )
+        selected_matches = np.nonzero(obj_ids == int(self._selected_internal_bbox_obj_id))[0]
+        if selected_matches.size == 0:
+            return (
+                np.array([], dtype=np.int64),
+                np.zeros((0,) + binary_masks.shape[1:], dtype=bool),
+                np.array([], dtype=np.float32),
+            )
+        sel_idx = int(selected_matches[0])
+        out_id = (
+            int(self._effective_output_bbox_obj_id)
+            if self._effective_output_bbox_obj_id is not None
+            else int(obj_ids[sel_idx])
+        )
+        return (
+            np.array([out_id], dtype=np.int64),
+            binary_masks[sel_idx : sel_idx + 1],
+            probs[sel_idx : sel_idx + 1],
+        )
+
+
+class SAM3PointPropagation(SAM3StreamingPropagationBase):
+    """SAM3 streaming propagation with a point prompt.
+
+    Tracks a single object specified by click points and ``prompt_obj_id``.
+    """
+
+    def __init__(
+        self,
+        num_frames: int,
+        prompt_points: list[list[float]],
+        prompt_point_labels: list[int],
+        prompt_obj_id: int,
+        **kwargs: Any,
+    ) -> None:
+        self._prompt_points = prompt_points
+        self._prompt_point_labels = prompt_point_labels
+        self._prompt_obj_id = prompt_obj_id
+        super().__init__(
+            num_frames=num_frames,
+            prompt_points=prompt_points,
+            prompt_point_labels=prompt_point_labels,
+            prompt_obj_id=prompt_obj_id,
+            **kwargs,
+        )
+
+    @property
+    def _requires_cached_frame_outputs_on_prompt_frame(self) -> bool:
+        return True
 
     def _apply_prompt(self) -> None:
-        """Apply the configured prompt to ``prompt_frame_idx`` of the inference state."""
-        state = self._inference_state
+        prompt_idx = self._prompt_idx_for_model()
         device = self._model_device()
-        prompt_frame_idx = self._prompt_frame_idx
+        points = torch.tensor(self._prompt_points, dtype=torch.float32, device=device)
+        point_labels = torch.tensor(self._prompt_point_labels, dtype=torch.int64, device=device)
+        self._model.add_prompt(
+            self._inference_state,
+            frame_idx=prompt_idx,
+            points=points,
+            point_labels=point_labels,
+            obj_id=self._prompt_obj_id,
+        )
 
-        if self._prompt_type == "text":
-            self._model.add_prompt(state, frame_idx=prompt_frame_idx, text_str=self._prompt_text)
 
-        elif self._prompt_type == "bbox":
-            if not self._prompt_bboxes_xywh:
-                raise ValueError("prompt_bboxes_xywh required for bbox prompt_type.")
-            boxes = np.array(self._prompt_bboxes_xywh, dtype=np.float32)
-            labels = (
-                torch.tensor(self._prompt_bbox_labels, dtype=torch.long, device=device)
-                if self._prompt_bbox_labels
-                else torch.ones(len(boxes), dtype=torch.long, device=device)
-            )
-            _, postprocessed = self._model.add_prompt(
-                state,
-                frame_idx=prompt_frame_idx,
-                boxes_xywh=boxes,
-                box_labels=labels,
-            )
-            selected_internal = self._select_bbox_object_id(
-                prompt_box_xywh=boxes[0],
-                postprocessed=postprocessed,
-            )
-            self._selected_internal_bbox_obj_id = selected_internal
-            if selected_internal is None:
-                self._effective_output_bbox_obj_id = None
-                logger.warning(
-                    "bbox prompt produced no selectable object on frame {}",
-                    prompt_frame_idx,
-                )
-            else:
-                self._effective_output_bbox_obj_id = (
-                    self._prompt_obj_id if self._prompt_obj_id is not None else selected_internal
-                )
-                logger.info(
-                    "bbox selected internal SAM id {} -> output id {}",
-                    selected_internal,
-                    self._effective_output_bbox_obj_id,
-                )
+class SAM3MaskPropagation(SAM3StreamingPropagationBase):
+    """SAM3 streaming propagation with a binary mask prompt.
 
-        elif self._prompt_type == "point":
-            if not self._prompt_points:
-                raise ValueError("prompt_points required for point prompt_type.")
-            if not self._prompt_point_labels:
-                raise ValueError("prompt_point_labels required for point prompt_type.")
-            if self._prompt_obj_id is None:
-                raise ValueError("prompt_obj_id required for point prompt_type.")
-            points = torch.tensor(self._prompt_points, dtype=torch.float32, device=device)
-            point_labels = torch.tensor(self._prompt_point_labels, dtype=torch.int64, device=device)
-            self._model.add_prompt(
-                state,
-                frame_idx=prompt_frame_idx,
-                points=points,
-                point_labels=point_labels,
-                obj_id=self._prompt_obj_id,
-            )
+    Loads a mask from ``prompt_mask_path``, adds it with a centroid point
+    prompt, and tracks the object specified by ``prompt_obj_id``.
+    """
 
-        elif self._prompt_type == "mask":
-            if not self._prompt_mask_path:
-                raise ValueError("prompt_mask_path required for mask prompt_type.")
-            if self._prompt_obj_id is None:
-                raise ValueError("prompt_obj_id required for mask prompt_type.")
-            mask_gray = cv2.imread(self._prompt_mask_path, cv2.IMREAD_GRAYSCALE)
-            if mask_gray is None:
-                raise FileNotFoundError(f"Cannot load mask: {self._prompt_mask_path}")
-            mask_binary = (mask_gray > 127).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
-            self._model.add_mask(
-                state,
-                frame_idx=prompt_frame_idx,
-                obj_id=self._prompt_obj_id,
-                mask=mask_tensor,
-            )
-            ys, xs = np.where(mask_binary > 0)
-            if xs.size > 0 and ys.size > 0:
-                h_mask, w_mask = mask_binary.shape
-                point_x = float(xs.mean() / w_mask)
-                point_y = float(ys.mean() / h_mask)
-                self._model.add_prompt(
-                    state,
-                    frame_idx=prompt_frame_idx,
-                    points=torch.tensor([[point_x, point_y]], dtype=torch.float32, device=device),
-                    point_labels=torch.tensor([1], dtype=torch.int64, device=device),
-                    obj_id=self._prompt_obj_id,
-                )
-            # Force regular propagation after the initial mask add.
-            # Tracker partial propagation for mask-only prompts can require point inputs.
-            state["action_history"].clear()
-
-    # -- Output conversion ----------------------------------------------------
-
-    def _pack_output(self, frame_idx: int, postprocessed: dict | None) -> dict[str, torch.Tensor]:
-        """Convert SAM3 per-object output to per-frame label map format."""
-        if postprocessed is None or len(postprocessed.get("out_obj_ids", [])) == 0:
-            return self._empty_output(frame_idx)
-
-        obj_ids = np.asarray(postprocessed["out_obj_ids"], dtype=np.int64)
-        binary_masks = np.asarray(postprocessed["out_binary_masks"], dtype=bool)
-        probs = np.asarray(postprocessed["out_probs"], dtype=np.float32)
-
-        if self._prompt_type == "bbox":
-            if self._selected_internal_bbox_obj_id is None:
-                return self._empty_output(frame_idx)
-            selected_matches = np.nonzero(obj_ids == int(self._selected_internal_bbox_obj_id))[0]
-            if selected_matches.size == 0:
-                return self._empty_output(frame_idx)
-            sel_idx = int(selected_matches[0])
-            out_id = (
-                int(self._effective_output_bbox_obj_id)
-                if self._effective_output_bbox_obj_id is not None
-                else int(obj_ids[sel_idx])
-            )
-            obj_ids = np.array([out_id], dtype=np.int64)
-            binary_masks = binary_masks[sel_idx : sel_idx + 1]
-            probs = probs[sel_idx : sel_idx + 1]
-
-        h, w = binary_masks.shape[1], binary_masks.shape[2]
-        label_map = np.zeros((h, w), dtype=np.int32)
-        for oid, m in zip(obj_ids, binary_masks):
-            label_map[m] = int(oid)
-
-        return {
-            "frame_id": torch.tensor([frame_idx], dtype=torch.int64),
-            "mask": torch.from_numpy(label_map).unsqueeze(0),
-            "object_ids": torch.from_numpy(np.array(obj_ids, dtype=np.int64)).unsqueeze(0),
-            "detection_scores": torch.from_numpy(np.array(probs, dtype=np.float32)).unsqueeze(0),
-        }
-
-    # -- Forward --------------------------------------------------------------
-
-    def forward(
+    def __init__(
         self,
-        rgb_frame: torch.Tensor,
-        context: Context | None = None,  # noqa: ARG002
-        **_: Any,
-    ) -> dict[str, torch.Tensor]:
-        """Process one RGB frame and return tracking outputs.
+        num_frames: int,
+        prompt_mask_path: str,
+        prompt_obj_id: int,
+        **kwargs: Any,
+    ) -> None:
+        self._prompt_mask_path = prompt_mask_path
+        self._prompt_obj_id = prompt_obj_id
+        super().__init__(
+            num_frames=num_frames,
+            prompt_mask_path=prompt_mask_path,
+            prompt_obj_id=prompt_obj_id,
+            **kwargs,
+        )
 
-        Parameters
-        ----------
-        rgb_frame : torch.Tensor
-            Shape ``[1, H, W, 3]``, float32, values in ``[0, 1]``.
+    @property
+    def _requires_cached_frame_outputs_on_prompt_frame(self) -> bool:
+        return True
 
-        Returns
-        -------
-        dict with keys: ``frame_id``, ``mask``, ``object_ids``, ``detection_scores``.
-        """
-        self._ensure_model()
-
-        frame_np = rgb_frame[0].detach().cpu().numpy()  # [H, W, 3] float32
-        frame_idx = self._frame_idx
-
-        if frame_idx == 0:
-            # -- First frame: initialize state and buffer --
-            orig_h, orig_w = frame_np.shape[0], frame_np.shape[1]
-            device = self._model_device()
-
-            self._frame_buffer = _FrameBuffer(
-                num_frames=self._num_frames,
-                image_size=int(self._model.image_size),
-                device=device,
-            )
-            self._frame_buffer.add(frame_np)
-
-            self._inference_state = self._build_state(orig_h, orig_w)
-            self._extend_state_for_frame(0)
-            if self._prompt_type in {"point", "mask"}:
-                # Interactivity prompt paths require cached outputs on the prompted frame.
-                self._inference_state["cached_frame_outputs"].setdefault(self._prompt_frame_idx, {})
-        else:
-            # -- Subsequent frames: buffer + extend state --
-            self._frame_buffer.add(frame_np)
-            self._extend_state_for_frame(frame_idx)
-
-        if self._generator is None and frame_idx >= self._prompt_frame_idx:
-            self._prepare_state_for_full_sequence()
-            self._apply_prompt()
-
-            # Start one generator, potentially beginning at a non-zero prompt frame.
-            self._generator = self._model.propagate_in_video(
+    def _apply_prompt(self) -> None:
+        prompt_idx = self._prompt_idx_for_model()
+        device = self._model_device()
+        mask_gray = cv2.imread(self._prompt_mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask_gray is None:
+            raise FileNotFoundError(f"Cannot load mask: {self._prompt_mask_path}")
+        mask_binary = (mask_gray > 127).astype(np.float32)
+        mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
+        self._model.add_mask(
+            self._inference_state,
+            frame_idx=prompt_idx,
+            obj_id=self._prompt_obj_id,
+            mask=mask_tensor,
+        )
+        ys, xs = np.where(mask_binary > 0)
+        if xs.size > 0 and ys.size > 0:
+            h_mask, w_mask = mask_binary.shape
+            point_x = float(xs.mean() / w_mask)
+            point_y = float(ys.mean() / h_mask)
+            self._model.add_prompt(
                 self._inference_state,
-                start_frame_idx=self._prompt_frame_idx,
-                max_frame_num_to_track=self._num_frames - self._prompt_frame_idx - 1,
-                reverse=False,
+                frame_idx=prompt_idx,
+                points=torch.tensor([[point_x, point_y]], dtype=torch.float32, device=device),
+                point_labels=torch.tensor([1], dtype=torch.int64, device=device),
+                obj_id=self._prompt_obj_id,
             )
-            yield_frame_idx, postprocessed = self._next_generator_output(frame_idx)
-            result = self._pack_output(yield_frame_idx, postprocessed)
-        else:
-            if self._generator is None:
-                # Frames before the prompt frame: keep outputs empty.
-                result = self._pack_output(frame_idx, None)
-            else:
-                # Frames after prompt: advance the running generator.
-                yield_frame_idx, postprocessed = self._next_generator_output(frame_idx)
-                result = self._pack_output(yield_frame_idx, postprocessed)
-
-        self._frame_idx += 1
-
-        if self._progress_log_interval > 0 and frame_idx % self._progress_log_interval == 0:
-            n_objs = result["object_ids"].shape[1]
-            logger.info(
-                "SAM3StreamingPropagation: frame {}/{}, {} objects",
-                frame_idx,
-                self._num_frames,
-                n_objs,
-            )
-
-        return result
+        # Force regular propagation after the initial mask add.
+        # Tracker partial propagation for mask-only prompts can require point inputs.
+        self._inference_state["action_history"].clear()
