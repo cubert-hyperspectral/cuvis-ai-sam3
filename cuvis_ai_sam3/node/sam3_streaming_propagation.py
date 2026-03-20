@@ -832,16 +832,16 @@ class SAM3TrackerInference(Node):
 
         self._frame_idx += 1
 
-        if self._log_every_n_frames > 0 and stream_idx % self._log_every_n_frames == 0:
-            n_objs = result["object_ids"].shape[1]
-            logger.info(
-                "{}: local frame {}/{}, source frame {}, {} objects",
-                self.__class__.__name__,
-                stream_idx,
-                self._num_frames,
-                source_frame_id,
-                n_objs,
-            )
+        # if self._log_every_n_frames > 0 and stream_idx % self._log_every_n_frames == 0:
+        #     n_objs = result["object_ids"].shape[1]
+        #     logger.info(
+        #         "{}: local frame {}/{}, source frame {}, {} objects",
+        #         self.__class__.__name__,
+        #         stream_idx,
+        #         self._num_frames,
+        #         source_frame_id,
+        #         n_objs,
+        #     )
 
         return result
 
