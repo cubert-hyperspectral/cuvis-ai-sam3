@@ -1,7 +1,7 @@
 """SAM3 streaming propagation nodes — one RGB frame per forward(), specialized by prompt type.
 
 Hierarchy:
-    SAM3StreamingPropagationBase(Node)   — abstract base with shared infrastructure
+    SAM3TrackerInference(Node)           — abstract base with shared infrastructure
     ├── SAM3TextPropagation              — text/concept prompt
     ├── SAM3BboxPropagation              — bounding-box prompt
     ├── SAM3PointPropagation             — point prompt
@@ -133,7 +133,7 @@ class _FrameBuffer:
 # =============================================================================
 
 
-class SAM3StreamingPropagationBase(Node):
+class SAM3TrackerInference(Node):
     """Abstract base for streaming SAM3 propagation nodes.
 
     Consumes one RGB frame per ``forward()`` call, maintaining temporal state
@@ -172,7 +172,6 @@ class SAM3StreamingPropagationBase(Node):
         det_nms_thresh: float = 0.1,
         overlap_suppress_thresh: float = 0.7,
         max_tracker_states: int = 5,
-        progress_log_interval: int = 50,
         **kwargs: Any,
     ) -> None:
         if num_frames < 1:
@@ -197,7 +196,7 @@ class SAM3StreamingPropagationBase(Node):
         self._det_nms_thresh = det_nms_thresh
         self._overlap_suppress_thresh = overlap_suppress_thresh
         self._max_tracker_states = max_tracker_states
-        self._progress_log_interval = progress_log_interval
+        self._log_every_n_frames = 50
 
         # Runtime state (initialized on first forward)
         self._model: Any = None
@@ -207,6 +206,11 @@ class SAM3StreamingPropagationBase(Node):
         self._frame_idx: int = 0
         self._source_frame_ids: list[int] = []
         self._frame_id_to_stream_idx: dict[int, int] = {}
+        self._internal_to_export_obj_id: dict[int, int] = {}
+        self._next_export_obj_id: int = 1
+        self._evict_horizon: int = 64
+        # Keep a tiny recent frame window in memory for safety.
+        self._buffer_keep_recent: int = 2
 
         super().__init__(
             num_frames=num_frames,
@@ -220,7 +224,6 @@ class SAM3StreamingPropagationBase(Node):
             det_nms_thresh=det_nms_thresh,
             overlap_suppress_thresh=overlap_suppress_thresh,
             max_tracker_states=max_tracker_states,
-            progress_log_interval=progress_log_interval,
             **kwargs,
         )
 
@@ -258,6 +261,9 @@ class SAM3StreamingPropagationBase(Node):
             self._model.device,
             getattr(self._model, "hotstart_delay", "?"),
         )
+        tracker = getattr(self._model, "tracker", None)
+        max_obj_ptrs = int(getattr(tracker, "max_obj_ptrs_in_encoder", 16))
+        self._evict_horizon = 4 * max_obj_ptrs
         self._install_streaming_detector_guard()
 
     def _install_streaming_detector_guard(self) -> None:
@@ -389,6 +395,7 @@ class SAM3StreamingPropagationBase(Node):
         """Advance the SAM3 propagation generator with a clear error on early exhaustion."""
         if self._generator is None:
             raise RuntimeError("Propagation generator is not initialized.")
+        self._mark_cudagraph_step_begin()
         try:
             return next(self._generator)
         except StopIteration as exc:
@@ -434,6 +441,15 @@ class SAM3StreamingPropagationBase(Node):
                 existing,
                 stream_idx,
             )
+
+    def _mark_cudagraph_step_begin(self) -> None:
+        """Mark CUDAGraph step boundaries for compiled execution (if available)."""
+        if not self._compile_model:
+            return
+        compiler = getattr(torch, "compiler", None)
+        mark_step = getattr(compiler, "cudagraph_mark_step_begin", None)
+        if callable(mark_step):
+            mark_step()
 
     def _source_frame_id_for_stream_idx(self, stream_idx: int) -> int:
         if 0 <= stream_idx < len(self._source_frame_ids):
@@ -496,6 +512,11 @@ class SAM3StreamingPropagationBase(Node):
         """
         return False
 
+    @property
+    def _remap_internal_object_ids(self) -> bool:
+        """Whether internal SAM object IDs should be remapped to exported IDs >= 1."""
+        return False
+
     def _filter_objects(
         self,
         obj_ids: np.ndarray,
@@ -504,6 +525,27 @@ class SAM3StreamingPropagationBase(Node):
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Hook for subclasses to filter/remap detected objects. Default: pass-through."""
         return obj_ids, binary_masks, probs
+
+    def _remap_object_ids(self, obj_ids: np.ndarray) -> np.ndarray:
+        """Map internal SAM IDs to stable exported IDs when enabled.
+
+        The exported label-map representation reserves ``0`` for background, so
+        text-prompt tracking uses this mapping to guarantee object IDs are
+        strictly positive and stable across frames.
+        """
+        if not self._remap_internal_object_ids:
+            return obj_ids
+
+        remapped = np.empty_like(obj_ids, dtype=np.int64)
+        for idx, raw_obj_id in enumerate(obj_ids.tolist()):
+            internal_id = int(raw_obj_id)
+            export_id = self._internal_to_export_obj_id.get(internal_id)
+            if export_id is None:
+                export_id = self._next_export_obj_id
+                self._internal_to_export_obj_id[internal_id] = export_id
+                self._next_export_obj_id += 1
+            remapped[idx] = int(export_id)
+        return remapped
 
     def _pack_output(
         self,
@@ -520,6 +562,7 @@ class SAM3StreamingPropagationBase(Node):
         obj_ids, binary_masks, probs = self._filter_objects(obj_ids, binary_masks, probs)
         if obj_ids.shape[0] == 0:
             return self._empty_output()
+        obj_ids = self._remap_object_ids(obj_ids)
 
         h, w = binary_masks.shape[1], binary_masks.shape[2]
         label_map = np.zeros((h, w), dtype=np.int32)
@@ -531,6 +574,183 @@ class SAM3StreamingPropagationBase(Node):
             "object_ids": torch.from_numpy(np.array(obj_ids, dtype=np.int64)).unsqueeze(0),
             "detection_scores": torch.from_numpy(np.array(probs, dtype=np.float32)).unsqueeze(0),
         }
+
+    @staticmethod
+    def _prune_dict(container: Any, keep_from: int) -> None:
+        """Remove integer keys strictly less than ``keep_from`` from a dict."""
+        if not isinstance(container, dict):
+            return
+        stale = [k for k in container if isinstance(k, int) and k < keep_from]
+        for key in stale:
+            container.pop(key, None)
+
+    def _prune_state_for_frame(self, frame_idx: int) -> None:
+        """Free cached historical data to keep long runs bounded in memory."""
+        if self._inference_state is None:
+            return
+        state = self._inference_state
+
+        keep_from = max(0, frame_idx - self._buffer_keep_recent + 1)
+
+        cached = state.get("cached_frame_outputs")
+        if isinstance(cached, dict):
+            stale = [k for k in cached if isinstance(k, int) and k < keep_from]
+            for key in stale:
+                cached.pop(key, None)
+
+        tracker_md = state.get("tracker_metadata", {})
+        scores_fw = tracker_md.get("obj_id_to_tracker_score_frame_wise")
+        if isinstance(scores_fw, dict):
+            stale = [k for k in scores_fw if isinstance(k, int) and k < keep_from]
+            for key in stale:
+                scores_fw.pop(key, None)
+
+        rank0_md = tracker_md.get("rank0_metadata", {})
+        suppressed_map = rank0_md.get("suppressed_obj_ids", {})
+        if isinstance(suppressed_map, dict):
+            stale = [k for k in suppressed_map if isinstance(k, int) and k < keep_from]
+            for key in stale:
+                suppressed_map.pop(key, None)
+
+        evict_before = frame_idx - self._evict_horizon
+        if evict_before > 0:
+            unmatched = rank0_md.get("unmatched_frame_inds")
+            if isinstance(unmatched, dict):
+                for obj_id in list(unmatched.keys()):
+                    lst = unmatched[obj_id]
+                    if isinstance(lst, list):
+                        unmatched[obj_id] = [f for f in lst if f >= evict_before]
+
+            overlap = rank0_md.get("overlap_pair_to_frame_inds")
+            if isinstance(overlap, dict):
+                for pair in list(overlap.keys()):
+                    lst = overlap[pair]
+                    if isinstance(lst, list):
+                        overlap[pair] = [f for f in lst if f >= evict_before]
+
+            for tracker_state in state.get("tracker_inference_states", []):
+                if not isinstance(tracker_state, dict):
+                    continue
+                output_dict = tracker_state.get("output_dict", {})
+                non_cond = output_dict.get("non_cond_frame_outputs", {})
+                stale = [k for k in non_cond if isinstance(k, int) and k < evict_before]
+                for key in stale:
+                    del non_cond[key]
+                for obj_dict in tracker_state.get("output_dict_per_obj", {}).values():
+                    if not isinstance(obj_dict, dict):
+                        continue
+                    non_cond = obj_dict.get("non_cond_frame_outputs", {})
+                    stale = [k for k in non_cond if isinstance(k, int) and k < evict_before]
+                    for key in stale:
+                        del non_cond[key]
+                tracked = tracker_state.get("frames_already_tracked", {})
+                if isinstance(tracked, dict):
+                    stale = [k for k in tracked if isinstance(k, int) and k < evict_before]
+                    for key in stale:
+                        del tracked[key]
+
+        if self._frame_buffer is not None:
+            self._frame_buffer.prune_before(keep_from)
+
+        self._prune_dict(state.get("previous_stages_out"), keep_from)
+        self._prune_dict(state.get("per_frame_raw_point_input"), keep_from)
+        self._prune_dict(state.get("per_frame_raw_box_input"), keep_from)
+        self._prune_dict(state.get("per_frame_visual_prompt"), keep_from)
+        self._prune_dict(state.get("per_frame_geometric_prompt"), keep_from)
+        self._prune_dict(state.get("per_frame_cur_step"), keep_from)
+
+        input_batch = state.get("input_batch")
+        if input_batch is not None:
+            self._prune_dict(input_batch.find_inputs, keep_from)
+            self._prune_dict(input_batch.find_targets, keep_from)
+            self._prune_dict(input_batch.find_metadatas, keep_from)
+
+    def _evict_excess_tracker_states(self, frame_idx: int) -> None:
+        """Evict oldest non-primary tracker states when the count exceeds the cap."""
+        if self._inference_state is None or self._max_tracker_states <= 0:
+            return
+        states = self._inference_state.get("tracker_inference_states", [])
+        if len(states) <= self._max_tracker_states:
+            return
+
+        remove_fn = getattr(self._model, "_tracker_remove_objects", None)
+        if not callable(remove_fn):
+            return
+
+        n_to_evict = len(states) - self._max_tracker_states
+        obj_ids_to_remove: list[int] = []
+        for tracker_state in states[1 : 1 + n_to_evict]:
+            if not isinstance(tracker_state, dict):
+                continue
+            obj_ids_to_remove.extend(tracker_state.get("obj_ids", []))
+
+        if not obj_ids_to_remove:
+            return
+
+        logger.trace(
+            "Evicting {} tracker state(s) at frame {} ({} -> {}), obj_ids={}",
+            n_to_evict,
+            frame_idx,
+            len(states),
+            self._max_tracker_states,
+            obj_ids_to_remove,
+        )
+        remove_fn(states, obj_ids_to_remove)
+
+        removed_set = {int(v) for v in obj_ids_to_remove}
+        md = self._inference_state.get("tracker_metadata", {})
+        rank = int(getattr(self._model, "rank", 0))
+
+        ids_per_gpu = md.get("obj_ids_per_gpu")
+        if ids_per_gpu is not None and rank < len(ids_per_gpu):
+            old_ids = ids_per_gpu[rank]
+            keep = np.array([int(v) not in removed_set for v in old_ids], dtype=bool)
+            ids_per_gpu[rank] = old_ids[keep]
+
+        ids_all = md.get("obj_ids_all_gpu")
+        keep_all: np.ndarray | None = None
+        if ids_all is not None and hasattr(ids_all, "__len__") and len(ids_all) > 0:
+            keep_all = np.array([int(v) not in removed_set for v in ids_all], dtype=bool)
+            md["obj_ids_all_gpu"] = ids_all[keep_all]
+
+        num_per_gpu = md.get("num_obj_per_gpu")
+        if num_per_gpu is not None and ids_per_gpu is not None:
+            for idx in range(len(num_per_gpu)):
+                if idx < len(ids_per_gpu):
+                    num_per_gpu[idx] = len(ids_per_gpu[idx])
+
+        scores = md.get("obj_id_to_score")
+        if isinstance(scores, dict):
+            for obj_id in obj_ids_to_remove:
+                scores.pop(int(obj_id), None)
+
+        rank0_md = md.get("rank0_metadata", {})
+        for key in ("obj_first_frame_idx", "trk_keep_alive"):
+            container = rank0_md.get(key)
+            if isinstance(container, dict):
+                for obj_id in obj_ids_to_remove:
+                    container.pop(int(obj_id), None)
+        unmatched = rank0_md.get("unmatched_frame_inds")
+        if isinstance(unmatched, dict):
+            for obj_id in obj_ids_to_remove:
+                unmatched.pop(int(obj_id), None)
+
+        removed_obj_ids = rank0_md.get("removed_obj_ids")
+        if isinstance(removed_obj_ids, set):
+            removed_obj_ids.update(removed_set)
+
+        overlap = rank0_md.get("overlap_pair_to_frame_inds")
+        if isinstance(overlap, dict):
+            stale = [k for k in overlap if k[0] in removed_set or k[1] in removed_set]
+            for key in stale:
+                del overlap[key]
+
+        masklet_confirmation = rank0_md.get("masklet_confirmation")
+        if isinstance(masklet_confirmation, dict) and keep_all is not None:
+            for key in ("status", "consecutive_det_num"):
+                arr = masklet_confirmation.get(key)
+                if arr is not None and hasattr(arr, "__len__") and len(arr) == len(keep_all):
+                    masklet_confirmation[key] = arr[keep_all]
 
     # -- Forward --------------------------------------------------------------
 
@@ -584,6 +804,7 @@ class SAM3StreamingPropagationBase(Node):
             if self._requires_cached_frame_outputs_on_prompt_frame:
                 # Interactivity prompt paths require cached outputs on the prompted frame.
                 self._inference_state["cached_frame_outputs"].setdefault(prompt_frame_idx, {})
+            self._mark_cudagraph_step_begin()
             self._apply_prompt()
 
             # Start one generator, potentially beginning at a non-zero prompt frame.
@@ -604,9 +825,14 @@ class SAM3StreamingPropagationBase(Node):
                 _yield_frame_idx, postprocessed = self._next_generator_output(stream_idx)
                 result = self._pack_output(postprocessed)
 
+        self._evict_excess_tracker_states(stream_idx)
+        self._prune_state_for_frame(stream_idx)
+        if torch.cuda.is_available() and stream_idx > 0 and stream_idx % 50 == 0:
+            torch.cuda.empty_cache()
+
         self._frame_idx += 1
 
-        if self._progress_log_interval > 0 and stream_idx % self._progress_log_interval == 0:
+        if self._log_every_n_frames > 0 and stream_idx % self._log_every_n_frames == 0:
             n_objs = result["object_ids"].shape[1]
             logger.info(
                 "{}: local frame {}/{}, source frame {}, {} objects",
@@ -625,7 +851,7 @@ class SAM3StreamingPropagationBase(Node):
 # =============================================================================
 
 
-class SAM3TextPropagation(SAM3StreamingPropagationBase):
+class SAM3TextPropagation(SAM3TrackerInference):
     """SAM3 streaming propagation with a text/concept prompt.
 
     Detects and tracks all objects matching ``prompt_text`` (e.g. "person").
@@ -640,6 +866,12 @@ class SAM3TextPropagation(SAM3StreamingPropagationBase):
         self._prompt_text = prompt_text
         super().__init__(num_frames=num_frames, prompt_text=prompt_text, **kwargs)
 
+    @property
+    def _remap_internal_object_ids(self) -> bool:
+        # Text prompts can return SAM internal object IDs starting at 0.
+        # The pipeline label-map representation reserves 0 for background.
+        return True
+
     def _apply_prompt(self) -> None:
         prompt_idx = self._prompt_idx_for_model()
         self._model.add_prompt(
@@ -649,7 +881,7 @@ class SAM3TextPropagation(SAM3StreamingPropagationBase):
         )
 
 
-class SAM3BboxPropagation(SAM3StreamingPropagationBase):
+class SAM3BboxPropagation(SAM3TrackerInference):
     """SAM3 streaming propagation with a bounding-box prompt.
 
     Tracks a single object initialized by a bounding box. The best-matching
@@ -806,7 +1038,7 @@ class SAM3BboxPropagation(SAM3StreamingPropagationBase):
         )
 
 
-class SAM3PointPropagation(SAM3StreamingPropagationBase):
+class SAM3PointPropagation(SAM3TrackerInference):
     """SAM3 streaming propagation with a point prompt.
 
     Tracks a single object specified by click points and ``prompt_obj_id``.
@@ -849,7 +1081,7 @@ class SAM3PointPropagation(SAM3StreamingPropagationBase):
         )
 
 
-class SAM3MaskPropagation(SAM3StreamingPropagationBase):
+class SAM3MaskPropagation(SAM3TrackerInference):
     """SAM3 streaming propagation with a binary mask prompt.
 
     Loads a mask from ``prompt_mask_path``, adds it with a centroid point
@@ -905,3 +1137,12 @@ class SAM3MaskPropagation(SAM3StreamingPropagationBase):
         # Force regular propagation after the initial mask add.
         # Tracker partial propagation for mask-only prompts can require point inputs.
         self._inference_state["action_history"].clear()
+
+
+__all__ = [
+    "SAM3TrackerInference",
+    "SAM3TextPropagation",
+    "SAM3BboxPropagation",
+    "SAM3PointPropagation",
+    "SAM3MaskPropagation",
+]

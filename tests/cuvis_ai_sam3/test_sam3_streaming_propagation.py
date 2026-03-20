@@ -14,7 +14,7 @@ from cuvis_ai_sam3.node.sam3_streaming_propagation import (
     SAM3BboxPropagation,
     SAM3MaskPropagation,
     SAM3PointPropagation,
-    SAM3StreamingPropagationBase,
+    SAM3TrackerInference,
     SAM3TextPropagation,
     _FrameBuffer,
 )
@@ -112,7 +112,7 @@ def _make_propagation_generator(
 
 
 def _run_streaming(
-    node: SAM3StreamingPropagationBase,
+    node: SAM3TrackerInference,
     num_frames: int = 5,
     h: int = 10,
     w: int = 12,
@@ -180,6 +180,55 @@ class TestSAM3TextPropagation:
             if len(call_kwargs[0]) > 2
             else True
         )
+
+    def test_text_prompt_remaps_zero_internal_id(self) -> None:
+        node = SAM3TextPropagation(
+            num_frames=3,
+            prompt_text="person",
+            name="test_text_id_remap",
+        )
+        mock_model = _make_mock_model()
+
+        def _gen(inference_state, **kwargs):  # noqa: ANN001
+            del kwargs
+            h, w = 10, 12
+            for frame_idx in range(inference_state["num_frames"]):
+                masks = np.zeros((2, h, w), dtype=bool)
+                masks[0, 1:5, 1:5] = True
+                masks[1, 5:9, 6:10] = True
+                yield frame_idx, {
+                    "out_obj_ids": np.array([0, 1], dtype=np.int64),
+                    "out_probs": np.array([0.91, 0.83], dtype=np.float32),
+                    "out_binary_masks": masks,
+                    "out_boxes_xywh": np.array(
+                        [
+                            [0.08, 0.10, 0.30, 0.30],
+                            [0.50, 0.50, 0.30, 0.30],
+                        ],
+                        dtype=np.float32,
+                    ),
+                }
+
+        mock_model.propagate_in_video.side_effect = _gen
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        results = _run_streaming(node, num_frames=3, h=10, w=12)
+        first_ids: list[int] | None = None
+        for result in results:
+            obj_ids = [int(v) for v in result["object_ids"][0].cpu().tolist()]
+            assert len(obj_ids) == 2
+            assert all(v > 0 for v in obj_ids)
+            assert len(set(obj_ids)) == 2
+            if first_ids is None:
+                first_ids = obj_ids
+            else:
+                assert obj_ids == first_ids
+
+            mask_values = set(int(v) for v in torch.unique(result["mask"]).cpu().tolist())
+            assert 0 in mask_values
+            for obj_id in obj_ids:
+                assert obj_id in mask_values
 
     def test_text_prompt_runs_n_forwards_without_exhaustion(self) -> None:
         node = SAM3TextPropagation(

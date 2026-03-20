@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Fixed SAM3 text streaming output ID semantics by remapping internal tracker IDs to stable exported IDs >= 1, preventing valid object ID 0 from being treated as background in label-map pipelines.
+- Added regression coverage for text propagation to validate stable remapping behavior when SAM3 returns internal IDs starting at 0.
+- Refined SAM3 node/test surface and exports to align with current streaming propagation architecture.
+
 - Added Windows installer packaging scaffold under `installer/` for SAM3 REST server, tray launcher, and weight downloader executables
 - Added `configs/sam3-server.env` runtime config template for packaged installs (`SAM3_HOST`, `SAM3_PORT`, `SAM3_CHECKPOINT_PATH`, `SAM3_DEVICE`)
 - Added mandatory checkpoint download step in the Inno Setup installer flow; setup aborts when weight download fails

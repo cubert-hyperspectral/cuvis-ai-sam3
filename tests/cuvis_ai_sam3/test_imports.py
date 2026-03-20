@@ -32,8 +32,16 @@ def test_sam3_tracker_node_importable() -> None:
     assert SAM3TrackerInference.__name__ == "SAM3TrackerInference"
 
 
-def test_spectral_signature_node_importable() -> None:
-    """SpectralSignatureExtractor is exported from the node package."""
-    from cuvis_ai_sam3.node import SpectralSignatureExtractor
+def test_propagation_nodes_importable() -> None:
+    """Specialized propagation nodes are exported from the node package."""
+    from cuvis_ai_sam3.node import (
+        SAM3BboxPropagation,
+        SAM3MaskPropagation,
+        SAM3PointPropagation,
+        SAM3TextPropagation,
+    )
 
-    assert SpectralSignatureExtractor.__name__ == "SpectralSignatureExtractor"
+    assert SAM3TextPropagation.__name__ == "SAM3TextPropagation"
+    assert SAM3BboxPropagation.__name__ == "SAM3BboxPropagation"
+    assert SAM3PointPropagation.__name__ == "SAM3PointPropagation"
+    assert SAM3MaskPropagation.__name__ == "SAM3MaskPropagation"

@@ -128,5 +128,7 @@ class PositionEmbeddingSine(nn.Module):
         ).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
         if cache_key is not None:
-            self.cache[cache_key] = pos[0]
+            # Avoid holding a cudagraph-managed output tensor in the cache.
+            # Keep a detached clone so future reads are independent of graph replay buffers.
+            self.cache[cache_key] = pos[0].clone().detach()
         return pos

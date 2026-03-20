@@ -154,5 +154,7 @@ Thumbs.db
 *.vocab
 .history/
 .claude/
+.cursor/
+.ruff_cache/
 models/
 outputs/
