@@ -69,13 +69,15 @@ def compile_wrapper(
         with torch.autograd.profiler.record_function(
             f"compiled {fn}" if name is None else name
         ):
-            CUDAGRAPH_MODES = ["max-autotune", "reduce-overhead"]
-            args = recursive_contiguous(args)
-            kwargs = recursive_contiguous(kwargs)
-            result = compiled_fn(*args, **kwargs)
-            if mode in CUDAGRAPH_MODES:
-                result = recursive_clone(result)
-            return result
+            # Ensure each invocation starts a fresh CUDA graph step boundary.
+            # This avoids stale tensor output reuse between successive runs.
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+            cont_args = recursive_contiguous(args)
+            cont_kwargs = recursive_contiguous(kwargs)
+            result = compiled_fn(*cont_args, **cont_kwargs)
+            cloned_result = recursive_clone(result)
+            return cloned_result
 
     return compiled_fn_wrapper
 

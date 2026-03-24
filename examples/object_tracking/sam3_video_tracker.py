@@ -437,22 +437,6 @@ def run_tracking(
         initial_obj_ids = initial_outputs["out_obj_ids"]
         logger.info("Detected %d object(s) on frame %d", len(initial_obj_ids), start_frame)
 
-        if len(initial_obj_ids) == 0:
-            logger.warning("No objects detected with prompt '%s'.", prompt)
-            overlay_writer.write_frame(start_frame, {})
-            frames_data.append({"frame_idx": start_frame, "objects": []})
-            _write_results(
-                output_dir=resolved_output_dir,
-                video_path=video_path,
-                prompt=prompt,
-                start_frame=start_frame,
-                end_frame=start_frame,
-                video_width=video_width,
-                video_height=video_height,
-                frames_data=frames_data,
-            )
-            return
-
         max_frame_num = None
         if end_frame >= 0:
             max_frame_num = end_frame - start_frame
