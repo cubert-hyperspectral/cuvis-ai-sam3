@@ -26,11 +26,17 @@ class VideoIteratorWithSAM3Preparation(VideoIterator):
     ) -> None:
         super().__init__(source_path)
         self.image_size = image_size
-        self.device = torch.device(compute_device) if isinstance(compute_device, str) else compute_device
+        self.device = (
+            torch.device(compute_device) if isinstance(compute_device, str) else compute_device
+        )
 
         # SAM3 normalization constants — match sam3/model/io_utils.py
-        self._img_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.bfloat16).view(3, 1, 1).to(self.device)
-        self._img_std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.bfloat16).view(3, 1, 1).to(self.device)
+        self._img_mean = (
+            torch.tensor([0.5, 0.5, 0.5], dtype=torch.bfloat16).view(3, 1, 1).to(self.device)
+        )
+        self._img_std = (
+            torch.tensor([0.5, 0.5, 0.5], dtype=torch.bfloat16).view(3, 1, 1).to(self.device)
+        )
 
     # -- frame preprocessing ------------------------------------------------
 

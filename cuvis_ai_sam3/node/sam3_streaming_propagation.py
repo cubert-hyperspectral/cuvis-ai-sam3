@@ -11,17 +11,15 @@ Hierarchy:
 from __future__ import annotations
 
 from abc import abstractmethod
-from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 import torch
-from loguru import logger
-
 from cuvis_ai_core.node import Node
 from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
+from loguru import logger
 
 
 class _FrameBuffer:
@@ -56,9 +54,7 @@ class _FrameBuffer:
         Returns the frame index assigned to this frame.
         """
         if frame_float_hwc.ndim != 3 or frame_float_hwc.shape[2] != 3:
-            raise ValueError(
-                f"Expected frame shape [H, W, 3], got {tuple(frame_float_hwc.shape)}."
-            )
+            raise ValueError(f"Expected frame shape [H, W, 3], got {tuple(frame_float_hwc.shape)}.")
         # float [0,1] → uint8 [0,255]
         frame_uint8 = np.clip(frame_float_hwc * 255.0, 0, 255).astype(np.uint8)
         # resize to model image_size
@@ -277,7 +273,9 @@ class SAM3TrackerInference(Node):
         def _forward_video_grounding_multigpu_streaming(*args: Any, **kwargs: Any) -> Any:
             requested_num_frames = kwargs.get("num_frames")
             if requested_num_frames is not None and self._frame_buffer is not None:
-                buffered_frames = max(1, min(int(self._frame_buffer._next_idx), int(requested_num_frames)))
+                buffered_frames = max(
+                    1, min(int(self._frame_buffer._next_idx), int(requested_num_frames))
+                )
                 kwargs["num_frames"] = buffered_frames
             multigpu_buffer = kwargs.get("multigpu_buffer")
             if isinstance(multigpu_buffer, dict):
@@ -566,7 +564,7 @@ class SAM3TrackerInference(Node):
 
         h, w = binary_masks.shape[1], binary_masks.shape[2]
         label_map = np.zeros((h, w), dtype=np.int32)
-        for oid, m in zip(obj_ids, binary_masks):
+        for oid, m in zip(obj_ids, binary_masks, strict=False):
             label_map[m] = int(oid)
 
         return {
@@ -799,7 +797,11 @@ class SAM3TrackerInference(Node):
             self._frame_buffer.add(frame_np)
             self._extend_state_for_frame(stream_idx)
 
-        if self._generator is None and prompt_frame_idx is not None and stream_idx >= prompt_frame_idx:
+        if (
+            self._generator is None
+            and prompt_frame_idx is not None
+            and stream_idx >= prompt_frame_idx
+        ):
             self._prepare_state_for_full_sequence()
             if self._requires_cached_frame_outputs_on_prompt_frame:
                 # Interactivity prompt paths require cached outputs on the prompted frame.

@@ -57,7 +57,7 @@ class PredictorService:
         self._use_cuda_autocast = str(config.device).lower().startswith("cuda")
         logger.info("SAM3 model loaded on %s", config.device)
 
-    def _inference_autocast(self):  # noqa: ANN201
+    def _inference_autocast(self) -> Any:
         """Return per-call autocast context for inference.
 
         Torch autocast is thread-local, so entering it at startup does not affect

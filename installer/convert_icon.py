@@ -33,10 +33,11 @@ def main() -> None:
         img = img.convert("RGBA")
 
     icons = [img.resize((size, size), Image.Resampling.LANCZOS) for size in SIZES]
-    icons[0].save(dst, format="ICO", sizes=[(size, size) for size in SIZES], append_images=icons[1:])
+    icons[0].save(
+        dst, format="ICO", sizes=[(size, size) for size in SIZES], append_images=icons[1:]
+    )
     print(f"Created {dst} ({dst.stat().st_size:,} bytes) from {src.name}")
 
 
 if __name__ == "__main__":
     main()
-

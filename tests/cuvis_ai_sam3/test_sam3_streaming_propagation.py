@@ -14,11 +14,10 @@ from cuvis_ai_sam3.node.sam3_streaming_propagation import (
     SAM3BboxPropagation,
     SAM3MaskPropagation,
     SAM3PointPropagation,
-    SAM3TrackerInference,
     SAM3TextPropagation,
+    SAM3TrackerInference,
     _FrameBuffer,
 )
-
 
 # ---------------------------------------------------------------------------
 # _FrameBuffer tests
@@ -100,15 +99,22 @@ def _make_propagation_generator(
 ):
     """Generator that mimics propagate_in_video output for num_frames frames."""
     for frame_idx in range(start_frame_idx, num_frames):
-        yield frame_idx, {
-            "out_obj_ids": np.array([1, 2], dtype=np.int64),
-            "out_probs": np.array([0.9, 0.8], dtype=np.float32),
-            "out_binary_masks": np.stack([
-                np.ones((h, w), dtype=bool),
-                np.zeros((h, w), dtype=bool),
-            ]),
-            "out_boxes_xywh": np.array([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.1, 0.2]], dtype=np.float32),
-        }
+        yield (
+            frame_idx,
+            {
+                "out_obj_ids": np.array([1, 2], dtype=np.int64),
+                "out_probs": np.array([0.9, 0.8], dtype=np.float32),
+                "out_binary_masks": np.stack(
+                    [
+                        np.ones((h, w), dtype=bool),
+                        np.zeros((h, w), dtype=bool),
+                    ]
+                ),
+                "out_boxes_xywh": np.array(
+                    [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.1, 0.2]], dtype=np.float32
+                ),
+            },
+        )
 
 
 def _run_streaming(
@@ -121,11 +127,10 @@ def _run_streaming(
     """Run the node through num_frames with a mocked model."""
     mock_model = node._model if node._model is not None else _make_mock_model()
     if mock_model.propagate_in_video.side_effect is None:
+
         def _propagate_from_state(inference_state, **kwargs):  # noqa: ANN001
             start_frame_idx = int(kwargs.get("start_frame_idx", 0))
-            return _make_propagation_generator(
-                inference_state["num_frames"], start_frame_idx, h, w
-            )
+            return _make_propagation_generator(inference_state["num_frames"], start_frame_idx, h, w)
 
         mock_model.propagate_in_video.side_effect = _propagate_from_state
 
@@ -138,9 +143,7 @@ def _run_streaming(
     for i in range(num_frames):
         rgb = torch.rand(1, h, w, 3, dtype=torch.float32)
         frame_id_t = (
-            torch.tensor([int(frame_ids[i])], dtype=torch.int64)
-            if frame_ids is not None
-            else None
+            torch.tensor([int(frame_ids[i])], dtype=torch.int64) if frame_ids is not None else None
         )
         result = node.forward(rgb, frame_id=frame_id_t)
         results.append(result)
@@ -175,8 +178,7 @@ class TestSAM3TextPropagation:
         node_text._model.add_prompt.assert_called_once()
         call_kwargs = node_text._model.add_prompt.call_args
         assert (
-            call_kwargs[1].get("text_str") == "person"
-            or call_kwargs[0][2]
+            call_kwargs[1].get("text_str") == "person" or call_kwargs[0][2]
             if len(call_kwargs[0]) > 2
             else True
         )
@@ -196,18 +198,21 @@ class TestSAM3TextPropagation:
                 masks = np.zeros((2, h, w), dtype=bool)
                 masks[0, 1:5, 1:5] = True
                 masks[1, 5:9, 6:10] = True
-                yield frame_idx, {
-                    "out_obj_ids": np.array([0, 1], dtype=np.int64),
-                    "out_probs": np.array([0.91, 0.83], dtype=np.float32),
-                    "out_binary_masks": masks,
-                    "out_boxes_xywh": np.array(
-                        [
-                            [0.08, 0.10, 0.30, 0.30],
-                            [0.50, 0.50, 0.30, 0.30],
-                        ],
-                        dtype=np.float32,
-                    ),
-                }
+                yield (
+                    frame_idx,
+                    {
+                        "out_obj_ids": np.array([0, 1], dtype=np.int64),
+                        "out_probs": np.array([0.91, 0.83], dtype=np.float32),
+                        "out_binary_masks": masks,
+                        "out_boxes_xywh": np.array(
+                            [
+                                [0.08, 0.10, 0.30, 0.30],
+                                [0.50, 0.50, 0.30, 0.30],
+                            ],
+                            dtype=np.float32,
+                        ),
+                    },
+                )
 
         mock_model.propagate_in_video.side_effect = _gen
         node._model = mock_model
@@ -225,7 +230,7 @@ class TestSAM3TextPropagation:
             else:
                 assert obj_ids == first_ids
 
-            mask_values = set(int(v) for v in torch.unique(result["mask"]).cpu().tolist())
+            mask_values = {int(v) for v in torch.unique(result["mask"]).cpu().tolist()}
             assert 0 in mask_values
             for obj_id in obj_ids:
                 assert obj_id in mask_values
@@ -320,15 +325,18 @@ class TestSAM3TextPropagation:
 
         def _empty_gen(num_frames: int):
             for i in range(num_frames):
-                yield i, {
-                    "out_obj_ids": np.array([], dtype=np.int64),
-                    "out_probs": np.array([], dtype=np.float32),
-                    "out_binary_masks": np.zeros((0, 10, 12), dtype=bool),
-                }
+                yield (
+                    i,
+                    {
+                        "out_obj_ids": np.array([], dtype=np.int64),
+                        "out_probs": np.array([], dtype=np.float32),
+                        "out_binary_masks": np.zeros((0, 10, 12), dtype=bool),
+                    },
+                )
 
         mock_model = _make_mock_model()
-        mock_model.propagate_in_video.side_effect = (
-            lambda inference_state, **kwargs: _empty_gen(inference_state["num_frames"])
+        mock_model.propagate_in_video.side_effect = lambda inference_state, **kwargs: _empty_gen(
+            inference_state["num_frames"]
         )
         node._model = mock_model
         node._ensure_model = MagicMock()
@@ -397,19 +405,22 @@ class TestSAM3BboxPropagation:
                 masks[0, :2, :2] = True
                 masks[1, 2:8, 3:9] = True  # selected internal id 3
                 masks[2, 0:2, 8:10] = True
-                yield frame_idx, {
-                    "out_obj_ids": np.array([1, 3, 4], dtype=np.int64),
-                    "out_probs": np.array([0.4, 0.95, 0.3], dtype=np.float32),
-                    "out_binary_masks": masks,
-                    "out_boxes_xywh": np.array(
-                        [
-                            [0.6, 0.1, 0.1, 0.1],
-                            [0.1, 0.2, 0.3, 0.4],
-                            [0.2, 0.1, 0.1, 0.2],
-                        ],
-                        dtype=np.float32,
-                    ),
-                }
+                yield (
+                    frame_idx,
+                    {
+                        "out_obj_ids": np.array([1, 3, 4], dtype=np.int64),
+                        "out_probs": np.array([0.4, 0.95, 0.3], dtype=np.float32),
+                        "out_binary_masks": masks,
+                        "out_boxes_xywh": np.array(
+                            [
+                                [0.6, 0.1, 0.1, 0.1],
+                                [0.1, 0.2, 0.3, 0.4],
+                                [0.2, 0.1, 0.1, 0.2],
+                            ],
+                            dtype=np.float32,
+                        ),
+                    },
+                )
 
         mock_model.propagate_in_video.side_effect = _bbox_gen
         node._model = mock_model
@@ -457,18 +468,21 @@ class TestSAM3BboxPropagation:
                 masks = np.zeros((2, h, w), dtype=bool)
                 masks[0, :2, :2] = True
                 masks[1, 1:9, 2:8] = True
-                yield frame_idx, {
-                    "out_obj_ids": np.array([5, 3], dtype=np.int64),
-                    "out_probs": np.array([0.2, 0.9], dtype=np.float32),
-                    "out_binary_masks": masks,
-                    "out_boxes_xywh": np.array(
-                        [
-                            [0.7, 0.1, 0.1, 0.1],
-                            [0.1, 0.2, 0.3, 0.4],
-                        ],
-                        dtype=np.float32,
-                    ),
-                }
+                yield (
+                    frame_idx,
+                    {
+                        "out_obj_ids": np.array([5, 3], dtype=np.int64),
+                        "out_probs": np.array([0.2, 0.9], dtype=np.float32),
+                        "out_binary_masks": masks,
+                        "out_boxes_xywh": np.array(
+                            [
+                                [0.7, 0.1, 0.1, 0.1],
+                                [0.1, 0.2, 0.3, 0.4],
+                            ],
+                            dtype=np.float32,
+                        ),
+                    },
+                )
 
         mock_model.propagate_in_video.side_effect = _bbox_gen
         node._model = mock_model
@@ -589,7 +603,12 @@ class TestValidation:
 
     def test_output_specs_compatible(self) -> None:
         """Output specs should match TrackingOverlayNode / TrackingCocoJsonNode inputs."""
-        for cls in [SAM3TextPropagation, SAM3BboxPropagation, SAM3PointPropagation, SAM3MaskPropagation]:
+        for cls in [
+            SAM3TextPropagation,
+            SAM3BboxPropagation,
+            SAM3PointPropagation,
+            SAM3MaskPropagation,
+        ]:
             specs = cls.OUTPUT_SPECS
             assert "mask" in specs
             assert "object_ids" in specs
@@ -598,9 +617,7 @@ class TestValidation:
             assert specs["object_ids"].dtype == torch.int64
 
     def test_detector_guard_installed_on_ensure_model(self) -> None:
-        node = SAM3TextPropagation(
-            num_frames=3, prompt_text="person", name="test_guard"
-        )
+        node = SAM3TextPropagation(num_frames=3, prompt_text="person", name="test_guard")
         mock_model = _make_mock_model()
         mock_detector = MagicMock()
         mock_detector._streaming_guard_installed = False

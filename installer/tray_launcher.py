@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import logging
-from logging.handlers import RotatingFileHandler
 import os
-from pathlib import Path
 import subprocess
 import sys
 import threading
 import time
-from typing import TextIO
 import urllib.error
 import urllib.request
 import webbrowser
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import TextIO
 
 import pystray
 from PIL import Image, ImageDraw
@@ -281,4 +281,3 @@ def _run() -> None:
 
 if __name__ == "__main__":
     _run()
-

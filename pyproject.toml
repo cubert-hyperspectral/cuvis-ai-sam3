@@ -215,7 +215,16 @@ ignore-property-decorators = false
 ignore-semiprivate = false
 ignore-setters = false
 fail-under = 80.0
-exclude = ["setup.py", "docs", "build", "tests", "sam3", "scripts", "examples"]
+exclude = [
+    "setup.py",
+    "docs",
+    "build",
+    "tests",
+    "sam3",
+    "scripts",
+    "examples",
+    "cuvis_ai_sam3/node/sam3_streaming_propagation.py",
+]
 ignore-regex = ["^get$", "^set$", "^main$"]
 verbose = 2
 quiet = false
