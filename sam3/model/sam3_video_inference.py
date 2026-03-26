@@ -289,7 +289,7 @@ class Sam3VideoInference(Sam3VideoBase):
         unconfirmed_status_delay = self.masklet_confirmation_consecutive_det_thresh - 1
         unconfirmed_obj_ids_per_frame = {}  # frame_idx -> hidden_obj_ids
         for frame_idx in tqdm(
-            processing_order, desc="propagate_in_video", disable=self.rank > 0
+            iter(processing_order), desc="propagate_in_video", disable=self.rank > 0, total=None,
         ):
             out = self._run_single_frame_inference(
                 inference_state,

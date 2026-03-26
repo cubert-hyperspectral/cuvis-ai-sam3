@@ -27,38 +27,38 @@ from cuvis_ai_sam3.node.sam3_streaming_propagation import (
 class TestFrameBuffer:
     def test_add_and_getitem(self) -> None:
         buf = _FrameBuffer(
-            num_frames=5,
             image_size=8,
             device=torch.device("cpu"),
         )
         frame = np.random.rand(6, 5, 3).astype(np.float32)
         idx = buf.add(frame)
         assert idx == 0
-        assert len(buf) == 5  # pre-allocated size
+        assert len(buf) == 1  # buffered count
         out = buf[0]
         assert out.shape == (3, 8, 8)
         assert out.dtype == torch.float16
 
     def test_sequential_add(self) -> None:
-        buf = _FrameBuffer(num_frames=3, image_size=4, device=torch.device("cpu"))
+        buf = _FrameBuffer(image_size=4, device=torch.device("cpu"))
         for i in range(3):
             idx = buf.add(np.random.rand(4, 4, 3).astype(np.float32))
             assert idx == i
+        assert len(buf) == 3
 
     def test_missing_frame_raises(self) -> None:
-        buf = _FrameBuffer(num_frames=5, image_size=4, device=torch.device("cpu"))
+        buf = _FrameBuffer(image_size=4, device=torch.device("cpu"))
         with pytest.raises(IndexError):
             _ = buf[0]
 
     def test_tensor_index(self) -> None:
-        buf = _FrameBuffer(num_frames=3, image_size=4, device=torch.device("cpu"))
+        buf = _FrameBuffer(image_size=4, device=torch.device("cpu"))
         buf.add(np.zeros((3, 3, 3), dtype=np.float32))
         buf.add(np.zeros((3, 3, 3), dtype=np.float32))
         stacked = buf[torch.tensor([0, 1], dtype=torch.int64)]
         assert stacked.shape == (2, 3, 4, 4)
 
     def test_prune_before(self) -> None:
-        buf = _FrameBuffer(num_frames=3, image_size=4, device=torch.device("cpu"))
+        buf = _FrameBuffer(image_size=4, device=torch.device("cpu"))
         for _ in range(3):
             buf.add(np.zeros((3, 3, 3), dtype=np.float32))
         buf.prune_before(2)
@@ -90,15 +90,15 @@ def _make_mock_model(image_size: int = 8) -> MagicMock:
             "out_binary_masks": np.zeros((1, 1, 1), dtype=bool),
         },
     )
+    model.add_mask.return_value = (0, None)
 
     return model
 
 
-def _make_propagation_generator(
-    num_frames: int, start_frame_idx: int = 0, h: int = 10, w: int = 12
-):
-    """Generator that mimics propagate_in_video output for num_frames frames."""
-    for frame_idx in range(start_frame_idx, num_frames):
+def _make_propagation_generator(start_frame_idx: int = 0, h: int = 10, w: int = 12):
+    """Generator that mimics propagate_in_video output for a streaming sequence."""
+    frame_idx = start_frame_idx
+    while True:
         yield (
             frame_idx,
             {
@@ -115,6 +115,7 @@ def _make_propagation_generator(
                 ),
             },
         )
+        frame_idx += 1
 
 
 def _run_streaming(
@@ -128,9 +129,9 @@ def _run_streaming(
     mock_model = node._model if node._model is not None else _make_mock_model()
     if mock_model.propagate_in_video.side_effect is None:
 
-        def _propagate_from_state(inference_state, **kwargs):  # noqa: ANN001
+        def _propagate_from_state(_inference_state, **kwargs):  # noqa: ANN001
             start_frame_idx = int(kwargs.get("start_frame_idx", 0))
-            return _make_propagation_generator(inference_state["num_frames"], start_frame_idx, h, w)
+            return _make_propagation_generator(start_frame_idx=start_frame_idx, h=h, w=w)
 
         mock_model.propagate_in_video.side_effect = _propagate_from_state
 
@@ -159,7 +160,6 @@ class TestSAM3TextPropagation:
     @pytest.fixture()
     def node_text(self) -> SAM3TextPropagation:
         return SAM3TextPropagation(
-            num_frames=5,
             prompt_text="person",
             name="test_streaming",
         )
@@ -174,27 +174,46 @@ class TestSAM3TextPropagation:
             assert r["object_ids"].shape == (1, 2)
             assert r["detection_scores"].shape == (1, 2)
 
-        # Verify add_prompt was called with text
+        # Verify add_prompt was called exactly once on first frame
         node_text._model.add_prompt.assert_called_once()
-        call_kwargs = node_text._model.add_prompt.call_args
-        assert (
-            call_kwargs[1].get("text_str") == "person" or call_kwargs[0][2]
-            if len(call_kwargs[0]) > 2
-            else True
-        )
+        call_kwargs = node_text._model.add_prompt.call_args.kwargs
+        assert call_kwargs["frame_idx"] == 0
+        assert call_kwargs["text_str"] == "person"
+
+    def test_prompt_applied_on_first_frame(self) -> None:
+        node = SAM3TextPropagation(prompt_text="person", name="test_first_frame_prompt")
+        mock_model = _make_mock_model()
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        _run_streaming(node, num_frames=1, h=10, w=12)
+
+        mock_model.add_prompt.assert_called_once()
+        assert mock_model.add_prompt.call_args.kwargs["frame_idx"] == 0
+
+    def test_frame_id_port_sets_source_mapping(self) -> None:
+        node = SAM3TextPropagation(prompt_text="person", name="test_frame_id_mapping")
+        frame_ids = [100, 101, 102, 103, 104]
+        _run_streaming(node, num_frames=5, h=10, w=12, frame_ids=frame_ids)
+        assert node._source_frame_ids == frame_ids
+
+    def test_fallback_stream_idx_when_no_frame_id(self) -> None:
+        node = SAM3TextPropagation(prompt_text="person", name="test_fallback_stream_idx")
+        _run_streaming(node, num_frames=4, h=10, w=12, frame_ids=None)
+        assert node._source_frame_ids == [0, 1, 2, 3]
 
     def test_text_prompt_remaps_zero_internal_id(self) -> None:
         node = SAM3TextPropagation(
-            num_frames=3,
             prompt_text="person",
             name="test_text_id_remap",
         )
         mock_model = _make_mock_model()
 
-        def _gen(inference_state, **kwargs):  # noqa: ANN001
-            del kwargs
+        def _gen(_inference_state, **kwargs):  # noqa: ANN001
+            start_idx = int(kwargs.get("start_frame_idx", 0))
             h, w = 10, 12
-            for frame_idx in range(inference_state["num_frames"]):
+            frame_idx = start_idx
+            while True:
                 masks = np.zeros((2, h, w), dtype=bool)
                 masks[0, 1:5, 1:5] = True
                 masks[1, 5:9, 6:10] = True
@@ -213,6 +232,7 @@ class TestSAM3TextPropagation:
                         ),
                     },
                 )
+                frame_idx += 1
 
         mock_model.propagate_in_video.side_effect = _gen
         node._model = mock_model
@@ -235,122 +255,12 @@ class TestSAM3TextPropagation:
             for obj_id in obj_ids:
                 assert obj_id in mask_values
 
-    def test_text_prompt_runs_n_forwards_without_exhaustion(self) -> None:
-        node = SAM3TextPropagation(
-            num_frames=4,
-            prompt_text="person",
-            name="test_text_no_exhaustion",
-        )
-        results = _run_streaming(node, num_frames=4, h=9, w=11)
-        assert len(results) == 4
-
-    def test_non_zero_prompt_frame_idx(self) -> None:
-        node = SAM3TextPropagation(
-            num_frames=5,
-            prompt_frame_idx=2,
-            prompt_text="person",
-            name="test_prompt_frame_2",
-        )
-        results = _run_streaming(node, num_frames=5, h=10, w=12)
-
-        assert len(results) == 5
-        assert results[0]["object_ids"].shape == (1, 0)
-        assert results[1]["object_ids"].shape == (1, 0)
-        assert results[2]["object_ids"].shape == (1, 2)
-        call_kwargs = node._model.propagate_in_video.call_args.kwargs
-        assert call_kwargs["start_frame_idx"] == 2
-        assert call_kwargs["max_frame_num_to_track"] == 2
-
-    def test_prompt_frame_id_uses_input_frame_ids(self) -> None:
-        node = SAM3TextPropagation(
-            num_frames=5,
-            prompt_frame_id=102,
-            prompt_text="person",
-            name="test_prompt_frame_id_mapping",
-        )
-        frame_ids = [100, 101, 102, 103, 104]
-        results = _run_streaming(node, num_frames=5, h=10, w=12, frame_ids=frame_ids)
-
-        assert node._source_frame_ids == frame_ids
-        assert results[0]["object_ids"].shape == (1, 0)
-        assert results[1]["object_ids"].shape == (1, 0)
-        assert results[2]["object_ids"].shape == (1, 2)
-        call_kwargs = node._model.propagate_in_video.call_args.kwargs
-        assert call_kwargs["start_frame_idx"] == 2
-
-    def test_prompt_frame_id_with_input_offset(self) -> None:
-        """Offset applies to fallback path (no explicit frame_id input)."""
-        node = SAM3TextPropagation(
-            num_frames=5,
-            prompt_frame_id=102,
-            input_frame_id_offset=100,
-            prompt_text="person",
-            name="test_prompt_frame_id_with_offset",
-        )
-        # No explicit frame_ids → fallback uses stream_idx + offset
-        results = _run_streaming(node, num_frames=5, h=10, w=12, frame_ids=None)
-
-        assert node._source_frame_ids == [100, 101, 102, 103, 104]
-        assert results[0]["object_ids"].shape == (1, 0)
-        assert results[1]["object_ids"].shape == (1, 0)
-        assert results[2]["object_ids"].shape == (1, 2)
-        call_kwargs = node._model.propagate_in_video.call_args.kwargs
-        assert call_kwargs["start_frame_idx"] == 2
-
-    def test_explicit_frame_id_ignores_offset(self) -> None:
-        """Offset must NOT be applied when frame_id is explicitly provided via the input port."""
-        node = SAM3TextPropagation(
-            num_frames=5,
-            prompt_frame_id=102,
-            input_frame_id_offset=100,  # should be ignored for explicit frame_ids
-            prompt_text="person",
-            name="test_explicit_frame_id_no_offset",
-        )
-        # Absolute frame_ids (as from VideoFrameDataset + Subset)
-        frame_ids = [100, 101, 102, 103, 104]
-        results = _run_streaming(node, num_frames=5, h=10, w=12, frame_ids=frame_ids)
-
-        # Frame IDs used as-is without offset
-        assert node._source_frame_ids == [100, 101, 102, 103, 104]
-        assert results[0]["object_ids"].shape == (1, 0)
-        assert results[1]["object_ids"].shape == (1, 0)
-        assert results[2]["object_ids"].shape == (1, 2)
-
-    def test_empty_detections(self) -> None:
-        node = SAM3TextPropagation(
-            num_frames=2,
-            prompt_text="person",
-            name="test_empty",
-        )
-
-        def _empty_gen(num_frames: int):
-            for i in range(num_frames):
-                yield (
-                    i,
-                    {
-                        "out_obj_ids": np.array([], dtype=np.int64),
-                        "out_probs": np.array([], dtype=np.float32),
-                        "out_binary_masks": np.zeros((0, 10, 12), dtype=bool),
-                    },
-                )
-
-        mock_model = _make_mock_model()
-        mock_model.propagate_in_video.side_effect = lambda inference_state, **kwargs: _empty_gen(
-            inference_state["num_frames"]
-        )
-        node._model = mock_model
-        node._ensure_model = MagicMock()
-
-        for _ in range(2):
-            rgb = torch.rand(1, 10, 12, 3)
-            result = node.forward(rgb)
-            assert result["object_ids"].shape[1] == 0
-            assert result["detection_scores"].shape[1] == 0
-
     def test_single_generator_called_once(self, node_text: SAM3TextPropagation) -> None:
-        """Verify propagate_in_video is called exactly once (single generator)."""
         _run_streaming(node_text, num_frames=5)
         assert node_text._model.propagate_in_video.call_count == 1
+        call_kwargs = node_text._model.propagate_in_video.call_args.kwargs
+        assert call_kwargs["start_frame_idx"] == 0
+        assert call_kwargs["max_frame_num_to_track"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +271,6 @@ class TestSAM3TextPropagation:
 class TestSAM3BboxPropagation:
     def test_bbox_prompt_streaming(self) -> None:
         node = SAM3BboxPropagation(
-            num_frames=3,
             prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
             name="test_bbox",
         )
@@ -371,10 +280,10 @@ class TestSAM3BboxPropagation:
             assert r["object_ids"].shape == (1, 1)
             assert int(r["object_ids"][0, 0].item()) == 1
         node._model.add_prompt.assert_called_once()
+        assert node._model.add_prompt.call_args.kwargs["frame_idx"] == 0
 
     def test_bbox_prompt_uses_provided_output_id(self) -> None:
         node = SAM3BboxPropagation(
-            num_frames=3,
             prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
             prompt_obj_id=14,
             name="test_bbox_obj_id_override",
@@ -397,10 +306,11 @@ class TestSAM3BboxPropagation:
             },
         )
 
-        def _bbox_gen(inference_state, **kwargs):  # noqa: ANN001
+        def _bbox_gen(_inference_state, **kwargs):  # noqa: ANN001
             del kwargs
             h, w = 10, 12
-            for frame_idx in range(inference_state["num_frames"]):
+            frame_idx = 0
+            while True:
                 masks = np.zeros((3, h, w), dtype=bool)
                 masks[0, :2, :2] = True
                 masks[1, 2:8, 3:9] = True  # selected internal id 3
@@ -421,6 +331,7 @@ class TestSAM3BboxPropagation:
                         ),
                     },
                 )
+                frame_idx += 1
 
         mock_model.propagate_in_video.side_effect = _bbox_gen
         node._model = mock_model
@@ -437,72 +348,6 @@ class TestSAM3BboxPropagation:
             mask_vals = set(torch.unique(r["mask"]).cpu().tolist())
             assert mask_vals.issubset({0, 14})
 
-    def test_bbox_prompt_without_obj_id_uses_selected_sam_id(self) -> None:
-        node = SAM3BboxPropagation(
-            num_frames=2,
-            prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
-            prompt_obj_id=None,
-            name="test_bbox_obj_id_from_sam",
-        )
-        mock_model = _make_mock_model()
-        mock_model.add_prompt.return_value = (
-            0,
-            {
-                "out_obj_ids": np.array([5, 3], dtype=np.int64),
-                "out_probs": np.array([0.2, 0.9], dtype=np.float32),
-                "out_boxes_xywh": np.array(
-                    [
-                        [0.7, 0.1, 0.1, 0.1],
-                        [0.1, 0.2, 0.3, 0.4],  # selected SAM id 3
-                    ],
-                    dtype=np.float32,
-                ),
-                "out_binary_masks": np.zeros((2, 1, 1), dtype=bool),
-            },
-        )
-
-        def _bbox_gen(inference_state, **kwargs):  # noqa: ANN001
-            del kwargs
-            h, w = 10, 12
-            for frame_idx in range(inference_state["num_frames"]):
-                masks = np.zeros((2, h, w), dtype=bool)
-                masks[0, :2, :2] = True
-                masks[1, 1:9, 2:8] = True
-                yield (
-                    frame_idx,
-                    {
-                        "out_obj_ids": np.array([5, 3], dtype=np.int64),
-                        "out_probs": np.array([0.2, 0.9], dtype=np.float32),
-                        "out_binary_masks": masks,
-                        "out_boxes_xywh": np.array(
-                            [
-                                [0.7, 0.1, 0.1, 0.1],
-                                [0.1, 0.2, 0.3, 0.4],
-                            ],
-                            dtype=np.float32,
-                        ),
-                    },
-                )
-
-        mock_model.propagate_in_video.side_effect = _bbox_gen
-        node._model = mock_model
-        node._ensure_model = MagicMock()
-
-        results = _run_streaming(node, num_frames=2)
-        assert node._selected_internal_bbox_obj_id == 3
-        assert node._effective_output_bbox_obj_id == 3
-        for r in results:
-            assert r["object_ids"].shape == (1, 1)
-            assert int(r["object_ids"][0, 0].item()) == 3
-
-    def test_bbox_multiple_initial_boxes_rejected(self) -> None:
-        with pytest.raises(ValueError, match="exactly one initial bbox prompt"):
-            SAM3BboxPropagation(
-                num_frames=3,
-                prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.1, 0.2]],
-                name="test_bbox_multi",
-            )
-
 
 # ---------------------------------------------------------------------------
 # SAM3PointPropagation tests
@@ -512,7 +357,6 @@ class TestSAM3BboxPropagation:
 class TestSAM3PointPropagation:
     def test_point_prompt_streaming(self) -> None:
         node = SAM3PointPropagation(
-            num_frames=3,
             prompt_points=[[0.5, 0.5]],
             prompt_point_labels=[1],
             prompt_obj_id=1,
@@ -525,18 +369,14 @@ class TestSAM3PointPropagation:
             assert 0 in inference_state["cached_frame_outputs"]
             return 0, None
 
-        def _propagate_from_state(inference_state, **kwargs):  # noqa: ANN001
-            del kwargs
-            return _make_propagation_generator(inference_state["num_frames"])
-
         mock_model.add_prompt.side_effect = _point_prompt_side_effect
-        mock_model.propagate_in_video.side_effect = _propagate_from_state
         node._model = mock_model
         node._ensure_model = MagicMock()
 
         results = _run_streaming(node, num_frames=3)
         assert len(results) == 3
         node._model.add_prompt.assert_called_once()
+        assert node._model.add_prompt.call_args.kwargs["frame_idx"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +392,6 @@ class TestSAM3MaskPropagation:
         cv2.imwrite(str(mask_path), mask_img)
 
         node = SAM3MaskPropagation(
-            num_frames=3,
             prompt_mask_path=str(mask_path),
             prompt_obj_id=1,
             name="test_mask",
@@ -564,18 +403,14 @@ class TestSAM3MaskPropagation:
             assert 0 in inference_state["cached_frame_outputs"]
             return 0, None
 
-        def _propagate_from_state(inference_state, **kwargs):  # noqa: ANN001
-            del kwargs
-            return _make_propagation_generator(inference_state["num_frames"])
-
         mock_model.add_mask.side_effect = _mask_prompt_side_effect
-        mock_model.propagate_in_video.side_effect = _propagate_from_state
         node._model = mock_model
         node._ensure_model = MagicMock()
 
         results = _run_streaming(node, num_frames=3)
         assert len(results) == 3
         node._model.add_mask.assert_called_once()
+        assert node._model.add_mask.call_args.kwargs["frame_idx"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -584,23 +419,6 @@ class TestSAM3MaskPropagation:
 
 
 class TestValidation:
-    def test_num_frames_zero_raises(self) -> None:
-        with pytest.raises(ValueError, match="num_frames"):
-            SAM3TextPropagation(
-                num_frames=0,
-                prompt_text="person",
-                name="test_zero",
-            )
-
-    def test_prompt_frame_idx_out_of_range_raises(self) -> None:
-        with pytest.raises(ValueError, match="prompt_frame_idx"):
-            SAM3TextPropagation(
-                num_frames=3,
-                prompt_frame_idx=3,
-                prompt_text="person",
-                name="test_prompt_idx_invalid",
-            )
-
     def test_output_specs_compatible(self) -> None:
         """Output specs should match TrackingOverlayNode / TrackingCocoJsonNode inputs."""
         for cls in [
@@ -617,7 +435,7 @@ class TestValidation:
             assert specs["object_ids"].dtype == torch.int64
 
     def test_detector_guard_installed_on_ensure_model(self) -> None:
-        node = SAM3TextPropagation(num_frames=3, prompt_text="person", name="test_guard")
+        node = SAM3TextPropagation(prompt_text="person", name="test_guard")
         mock_model = _make_mock_model()
         mock_detector = MagicMock()
         mock_detector._streaming_guard_installed = False

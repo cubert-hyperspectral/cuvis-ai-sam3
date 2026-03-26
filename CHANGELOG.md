@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Refactored SAM3 streaming propagation nodes to run in open-ended streaming mode without fixed `num_frames`/prompt-index configuration.
+- Changed prompt application flow so text/box/point/mask prompts are consistently seeded on stream frame `0`, with dynamic inference-state frame growth.
+- Updated streaming propagation tests and `sam3_video_inference` iteration handling to align with generator-based streaming behavior.
+
 - Fixed SAM3 text streaming output ID semantics by remapping internal tracker IDs to stable exported IDs >= 1, preventing valid object ID 0 from being treated as background in label-map pipelines.
 - Added regression coverage for text propagation to validate stable remapping behavior when SAM3 returns internal IDs starting at 0.
 - Refined SAM3 node/test surface and exports to align with current streaming propagation architecture.

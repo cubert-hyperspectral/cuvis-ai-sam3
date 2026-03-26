@@ -21,6 +21,8 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from loguru import logger
 
+_STREAMING_SENTINEL = 10**7
+
 
 class _FrameBuffer:
     """Pre-allocated frame buffer that implements SAM3's ``img_batch`` protocol.
@@ -32,13 +34,11 @@ class _FrameBuffer:
 
     def __init__(
         self,
-        num_frames: int,
         image_size: int,
         device: torch.device,
         image_mean: tuple[float, float, float] = (0.5, 0.5, 0.5),
         image_std: tuple[float, float, float] = (0.5, 0.5, 0.5),
     ) -> None:
-        self._num_frames = int(num_frames)
         self.image_size = int(image_size)
         self.device = torch.device(device)
         self._img_mean = torch.tensor(image_mean, dtype=torch.float16).view(3, 1, 1).to(self.device)
@@ -106,7 +106,7 @@ class _FrameBuffer:
         raise TypeError(f"Index must be int or Tensor, got {type(index)}.")
 
     def __len__(self) -> int:
-        return self._num_frames
+        return self._next_idx
 
     # -- memory management ----------------------------------------------------
 
@@ -156,12 +156,8 @@ class SAM3TrackerInference(Node):
 
     def __init__(
         self,
-        num_frames: int,
         checkpoint_path: str | None = None,
         compile_model: bool = False,
-        prompt_frame_idx: int = 0,
-        prompt_frame_id: int | None = None,
-        input_frame_id_offset: int = 0,
         # -- SAM3 thresholds --
         score_threshold_detection: float = 0.5,
         new_det_thresh: float = 0.7,
@@ -170,23 +166,8 @@ class SAM3TrackerInference(Node):
         max_tracker_states: int = 5,
         **kwargs: Any,
     ) -> None:
-        if num_frames < 1:
-            raise ValueError(f"num_frames must be >= 1, got {num_frames}.")
-        if prompt_frame_id is None:
-            if prompt_frame_idx < 0 or prompt_frame_idx >= num_frames:
-                raise ValueError(
-                    f"prompt_frame_idx must be in [0, {num_frames - 1}], got {prompt_frame_idx}."
-                )
-        elif prompt_frame_id < 0:
-            raise ValueError(f"prompt_frame_id must be >= 0, got {prompt_frame_id}.")
-
-        self._num_frames = int(num_frames)
         self._checkpoint_path = checkpoint_path
         self._compile_model = compile_model
-        self._prompt_frame_idx = int(prompt_frame_idx)
-        self._prompt_frame_id = int(prompt_frame_id) if prompt_frame_id is not None else None
-        self._input_frame_id_offset = int(input_frame_id_offset)
-        self._resolved_prompt_frame_idx: int | None = None
         self._score_threshold_detection = score_threshold_detection
         self._new_det_thresh = new_det_thresh
         self._det_nms_thresh = det_nms_thresh
@@ -201,7 +182,6 @@ class SAM3TrackerInference(Node):
         self._generator: Any = None
         self._frame_idx: int = 0
         self._source_frame_ids: list[int] = []
-        self._frame_id_to_stream_idx: dict[int, int] = {}
         self._internal_to_export_obj_id: dict[int, int] = {}
         self._next_export_obj_id: int = 1
         self._evict_horizon: int = 64
@@ -209,12 +189,8 @@ class SAM3TrackerInference(Node):
         self._buffer_keep_recent: int = 2
 
         super().__init__(
-            num_frames=num_frames,
             checkpoint_path=checkpoint_path,
             compile_model=compile_model,
-            prompt_frame_idx=prompt_frame_idx,
-            prompt_frame_id=prompt_frame_id,
-            input_frame_id_offset=input_frame_id_offset,
             score_threshold_detection=score_threshold_detection,
             new_det_thresh=new_det_thresh,
             det_nms_thresh=det_nms_thresh,
@@ -377,17 +353,12 @@ class SAM3TrackerInference(Node):
         state["per_frame_visual_prompt"][frame_idx] = None
         state["per_frame_geometric_prompt"][frame_idx] = None
         state["per_frame_cur_step"][frame_idx] = 0
-        state["num_frames"] = frame_idx + 1
+        if int(state.get("num_frames", 0)) < frame_idx + 1:
+            state["num_frames"] = frame_idx + 1
         for tracker_state in state.get("tracker_inference_states", []):
             if isinstance(tracker_state, dict):
-                tracker_state["num_frames"] = frame_idx + 1
-
-    def _prepare_state_for_full_sequence(self) -> None:
-        """Register all frames so propagation sees the full sequence length."""
-        state = self._inference_state
-        for frame_idx in range(self._num_frames):
-            self._extend_state_for_frame(frame_idx)
-            state["cached_frame_outputs"].setdefault(frame_idx, {})
+                if int(tracker_state.get("num_frames", 0)) < frame_idx + 1:
+                    tracker_state["num_frames"] = frame_idx + 1
 
     def _next_generator_output(self, requested_frame_idx: int) -> tuple[int, dict | None]:
         """Advance the SAM3 propagation generator with a clear error on early exhaustion."""
@@ -398,8 +369,7 @@ class SAM3TrackerInference(Node):
             return next(self._generator)
         except StopIteration as exc:
             raise RuntimeError(
-                f"{self.__class__.__name__} generator exhausted early at frame "
-                f"{requested_frame_idx} (configured num_frames={self._num_frames})."
+                f"{self.__class__.__name__} generator exhausted early at frame {requested_frame_idx}."
             ) from exc
 
     def _resolve_source_frame_id(
@@ -408,10 +378,10 @@ class SAM3TrackerInference(Node):
         fallback_stream_idx: int,
     ) -> int:
         if frame_id is None or frame_id.numel() == 0:
-            return int(fallback_stream_idx + self._input_frame_id_offset)
+            return int(fallback_stream_idx)
         return int(frame_id.reshape(-1)[0].item())
 
-    def _register_frame_id_mapping(self, stream_idx: int, source_frame_id: int) -> None:
+    def _register_source_frame_id(self, stream_idx: int, source_frame_id: int) -> None:
         if stream_idx == len(self._source_frame_ids):
             self._source_frame_ids.append(int(source_frame_id))
         elif stream_idx < len(self._source_frame_ids):
@@ -429,17 +399,6 @@ class SAM3TrackerInference(Node):
                 self._source_frame_ids.append(int(len(self._source_frame_ids)))
             self._source_frame_ids.append(int(source_frame_id))
 
-        existing = self._frame_id_to_stream_idx.get(int(source_frame_id))
-        if existing is None:
-            self._frame_id_to_stream_idx[int(source_frame_id)] = int(stream_idx)
-        elif existing != int(stream_idx):
-            logger.warning(
-                "Duplicate source frame_id {} seen at local indices {} and {}. Using first mapping.",
-                source_frame_id,
-                existing,
-                stream_idx,
-            )
-
     def _mark_cudagraph_step_begin(self) -> None:
         """Mark CUDAGraph step boundaries for compiled execution (if available)."""
         if not self._compile_model:
@@ -454,37 +413,6 @@ class SAM3TrackerInference(Node):
             return int(self._source_frame_ids[stream_idx])
         return int(stream_idx)
 
-    def _maybe_resolve_prompt_frame_idx_from_source_id(self) -> int | None:
-        if self._prompt_frame_id is None:
-            if self._resolved_prompt_frame_idx is None:
-                self._resolved_prompt_frame_idx = int(self._prompt_frame_idx)
-            return self._resolved_prompt_frame_idx
-
-        if self._resolved_prompt_frame_idx is not None:
-            return self._resolved_prompt_frame_idx
-
-        resolved = self._frame_id_to_stream_idx.get(int(self._prompt_frame_id))
-        if resolved is None:
-            return None
-
-        self._resolved_prompt_frame_idx = int(resolved)
-        logger.info(
-            "{}: resolved prompt_frame_id {} -> local prompt index {}",
-            self.__class__.__name__,
-            self._prompt_frame_id,
-            self._resolved_prompt_frame_idx,
-        )
-        return self._resolved_prompt_frame_idx
-
-    def _prompt_idx_for_model(self) -> int:
-        prompt_idx = self._maybe_resolve_prompt_frame_idx_from_source_id()
-        if prompt_idx is None:
-            raise RuntimeError(
-                "Prompt frame has not been observed yet. "
-                f"Expected source prompt_frame_id={self._prompt_frame_id}."
-            )
-        return int(prompt_idx)
-
     @staticmethod
     def _empty_output() -> dict[str, torch.Tensor]:
         return {
@@ -497,7 +425,7 @@ class SAM3TrackerInference(Node):
 
     @abstractmethod
     def _apply_prompt(self) -> None:
-        """Apply the configured prompt to ``prompt_frame_idx`` of the inference state."""
+        """Apply the configured prompt to stream frame 0 of the inference state."""
 
     # -- Output conversion ----------------------------------------------------
 
@@ -775,8 +703,7 @@ class SAM3TrackerInference(Node):
         frame_np = rgb_frame[0].detach().cpu().numpy()  # [H, W, 3] float32
         stream_idx = self._frame_idx
         source_frame_id = self._resolve_source_frame_id(frame_id, fallback_stream_idx=stream_idx)
-        self._register_frame_id_mapping(stream_idx, source_frame_id)
-        prompt_frame_idx = self._maybe_resolve_prompt_frame_idx_from_source_id()
+        self._register_source_frame_id(stream_idx, source_frame_id)
 
         if stream_idx == 0:
             # -- First frame: initialize state and buffer --
@@ -784,7 +711,6 @@ class SAM3TrackerInference(Node):
             device = self._model_device()
 
             self._frame_buffer = _FrameBuffer(
-                num_frames=self._num_frames,
                 image_size=int(self._model.image_size),
                 device=device,
             )
@@ -792,40 +718,33 @@ class SAM3TrackerInference(Node):
 
             self._inference_state = self._build_state(orig_h, orig_w)
             self._extend_state_for_frame(0)
-        else:
-            # -- Subsequent frames: buffer + extend state --
-            self._frame_buffer.add(frame_np)
-            self._extend_state_for_frame(stream_idx)
 
-        if (
-            self._generator is None
-            and prompt_frame_idx is not None
-            and stream_idx >= prompt_frame_idx
-        ):
-            self._prepare_state_for_full_sequence()
             if self._requires_cached_frame_outputs_on_prompt_frame:
-                # Interactivity prompt paths require cached outputs on the prompted frame.
-                self._inference_state["cached_frame_outputs"].setdefault(prompt_frame_idx, {})
+                # Interactivity prompt paths require cached outputs on the prompt frame.
+                self._inference_state["cached_frame_outputs"].setdefault(0, {})
             self._mark_cudagraph_step_begin()
             self._apply_prompt()
 
-            # Start one generator, potentially beginning at a non-zero prompt frame.
+            # Seed a large frame budget so SAM3's static processing order can run in streaming mode.
+            self._inference_state["num_frames"] = _STREAMING_SENTINEL
+            for tracker_state in self._inference_state.get("tracker_inference_states", []):
+                if isinstance(tracker_state, dict):
+                    tracker_state["num_frames"] = _STREAMING_SENTINEL
+
             self._generator = self._model.propagate_in_video(
                 self._inference_state,
-                start_frame_idx=prompt_frame_idx,
-                max_frame_num_to_track=self._num_frames - prompt_frame_idx - 1,
+                start_frame_idx=0,
+                max_frame_num_to_track=None,
                 reverse=False,
             )
             _yield_frame_idx, postprocessed = self._next_generator_output(stream_idx)
             result = self._pack_output(postprocessed)
         else:
-            if self._generator is None:
-                # Frames before the prompt frame: keep outputs empty.
-                result = self._pack_output(None)
-            else:
-                # Frames after prompt: advance the running generator.
-                _yield_frame_idx, postprocessed = self._next_generator_output(stream_idx)
-                result = self._pack_output(postprocessed)
+            # -- Subsequent frames: buffer + extend state + advance generator --
+            self._frame_buffer.add(frame_np)
+            self._extend_state_for_frame(stream_idx)
+            _yield_frame_idx, postprocessed = self._next_generator_output(stream_idx)
+            result = self._pack_output(postprocessed)
 
         self._evict_excess_tracker_states(stream_idx)
         self._prune_state_for_frame(stream_idx)
@@ -837,10 +756,9 @@ class SAM3TrackerInference(Node):
         # if self._log_every_n_frames > 0 and stream_idx % self._log_every_n_frames == 0:
         #     n_objs = result["object_ids"].shape[1]
         #     logger.info(
-        #         "{}: local frame {}/{}, source frame {}, {} objects",
+        #         "{}: local frame {}, source frame {}, {} objects",
         #         self.__class__.__name__,
         #         stream_idx,
-        #         self._num_frames,
         #         source_frame_id,
         #         n_objs,
         #     )
@@ -861,12 +779,11 @@ class SAM3TextPropagation(SAM3TrackerInference):
 
     def __init__(
         self,
-        num_frames: int,
         prompt_text: str = "person",
         **kwargs: Any,
     ) -> None:
         self._prompt_text = prompt_text
-        super().__init__(num_frames=num_frames, prompt_text=prompt_text, **kwargs)
+        super().__init__(prompt_text=prompt_text, **kwargs)
 
     @property
     def _remap_internal_object_ids(self) -> bool:
@@ -875,10 +792,9 @@ class SAM3TextPropagation(SAM3TrackerInference):
         return True
 
     def _apply_prompt(self) -> None:
-        prompt_idx = self._prompt_idx_for_model()
         self._model.add_prompt(
             self._inference_state,
-            frame_idx=prompt_idx,
+            frame_idx=0,
             text_str=self._prompt_text,
         )
 
@@ -893,7 +809,6 @@ class SAM3BboxPropagation(SAM3TrackerInference):
 
     def __init__(
         self,
-        num_frames: int,
         prompt_bboxes_xywh: list[list[float]],
         prompt_bbox_labels: list[int] | None = None,
         prompt_obj_id: int | None = None,
@@ -910,7 +825,6 @@ class SAM3BboxPropagation(SAM3TrackerInference):
         self._selected_internal_bbox_obj_id: int | None = None
         self._effective_output_bbox_obj_id: int | None = None
         super().__init__(
-            num_frames=num_frames,
             prompt_bboxes_xywh=prompt_bboxes_xywh,
             prompt_bbox_labels=prompt_bbox_labels,
             prompt_obj_id=prompt_obj_id,
@@ -973,7 +887,6 @@ class SAM3BboxPropagation(SAM3TrackerInference):
     def _apply_prompt(self) -> None:
         if not self._prompt_bboxes_xywh:
             raise ValueError("prompt_bboxes_xywh required for SAM3BboxPropagation.")
-        prompt_idx = self._prompt_idx_for_model()
         device = self._model_device()
         boxes = np.array(self._prompt_bboxes_xywh, dtype=np.float32)
         labels = (
@@ -983,7 +896,7 @@ class SAM3BboxPropagation(SAM3TrackerInference):
         )
         _, postprocessed = self._model.add_prompt(
             self._inference_state,
-            frame_idx=prompt_idx,
+            frame_idx=0,
             boxes_xywh=boxes,
             box_labels=labels,
         )
@@ -996,7 +909,7 @@ class SAM3BboxPropagation(SAM3TrackerInference):
             self._effective_output_bbox_obj_id = None
             logger.warning(
                 "bbox prompt produced no selectable object on frame {}",
-                prompt_idx,
+                0,
             )
         else:
             self._effective_output_bbox_obj_id = (
@@ -1048,7 +961,6 @@ class SAM3PointPropagation(SAM3TrackerInference):
 
     def __init__(
         self,
-        num_frames: int,
         prompt_points: list[list[float]],
         prompt_point_labels: list[int],
         prompt_obj_id: int,
@@ -1058,7 +970,6 @@ class SAM3PointPropagation(SAM3TrackerInference):
         self._prompt_point_labels = prompt_point_labels
         self._prompt_obj_id = prompt_obj_id
         super().__init__(
-            num_frames=num_frames,
             prompt_points=prompt_points,
             prompt_point_labels=prompt_point_labels,
             prompt_obj_id=prompt_obj_id,
@@ -1070,13 +981,12 @@ class SAM3PointPropagation(SAM3TrackerInference):
         return True
 
     def _apply_prompt(self) -> None:
-        prompt_idx = self._prompt_idx_for_model()
         device = self._model_device()
         points = torch.tensor(self._prompt_points, dtype=torch.float32, device=device)
         point_labels = torch.tensor(self._prompt_point_labels, dtype=torch.int64, device=device)
         self._model.add_prompt(
             self._inference_state,
-            frame_idx=prompt_idx,
+            frame_idx=0,
             points=points,
             point_labels=point_labels,
             obj_id=self._prompt_obj_id,
@@ -1092,7 +1002,6 @@ class SAM3MaskPropagation(SAM3TrackerInference):
 
     def __init__(
         self,
-        num_frames: int,
         prompt_mask_path: str,
         prompt_obj_id: int,
         **kwargs: Any,
@@ -1100,7 +1009,6 @@ class SAM3MaskPropagation(SAM3TrackerInference):
         self._prompt_mask_path = prompt_mask_path
         self._prompt_obj_id = prompt_obj_id
         super().__init__(
-            num_frames=num_frames,
             prompt_mask_path=prompt_mask_path,
             prompt_obj_id=prompt_obj_id,
             **kwargs,
@@ -1111,7 +1019,6 @@ class SAM3MaskPropagation(SAM3TrackerInference):
         return True
 
     def _apply_prompt(self) -> None:
-        prompt_idx = self._prompt_idx_for_model()
         device = self._model_device()
         mask_gray = cv2.imread(self._prompt_mask_path, cv2.IMREAD_GRAYSCALE)
         if mask_gray is None:
@@ -1120,7 +1027,7 @@ class SAM3MaskPropagation(SAM3TrackerInference):
         mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
         self._model.add_mask(
             self._inference_state,
-            frame_idx=prompt_idx,
+            frame_idx=0,
             obj_id=self._prompt_obj_id,
             mask=mask_tensor,
         )
@@ -1131,7 +1038,7 @@ class SAM3MaskPropagation(SAM3TrackerInference):
             point_y = float(ys.mean() / h_mask)
             self._model.add_prompt(
                 self._inference_state,
-                frame_idx=prompt_idx,
+                frame_idx=0,
                 points=torch.tensor([[point_x, point_y]], dtype=torch.float32, device=device),
                 point_labels=torch.tensor([1], dtype=torch.int64, device=device),
                 obj_id=self._prompt_obj_id,
