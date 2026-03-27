@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
-import cv2
 import numpy as np
 import pytest
 import torch
@@ -92,6 +90,12 @@ def _make_mock_model(image_size: int = 8) -> MagicMock:
     )
     model.add_mask.return_value = (0, None)
 
+    def _propagate_from_state(_inference_state, **kwargs):  # noqa: ANN001
+        start_frame_idx = int(kwargs.get("start_frame_idx", 0))
+        return _make_propagation_generator(start_frame_idx=start_frame_idx, h=10, w=12)
+
+    model.propagate_in_video.side_effect = _propagate_from_state
+
     return model
 
 
@@ -124,6 +128,7 @@ def _run_streaming(
     h: int = 10,
     w: int = 12,
     frame_ids: list[int] | None = None,
+    masks: list[torch.Tensor | None] | None = None,
 ) -> list[dict[str, torch.Tensor]]:
     """Run the node through num_frames with a mocked model."""
     mock_model = node._model if node._model is not None else _make_mock_model()
@@ -141,12 +146,15 @@ def _run_streaming(
     results = []
     if frame_ids is not None and len(frame_ids) != num_frames:
         raise ValueError("frame_ids length must match num_frames.")
+    if masks is not None and len(masks) != num_frames:
+        raise ValueError("masks length must match num_frames.")
     for i in range(num_frames):
         rgb = torch.rand(1, h, w, 3, dtype=torch.float32)
         frame_id_t = (
             torch.tensor([int(frame_ids[i])], dtype=torch.int64) if frame_ids is not None else None
         )
-        result = node.forward(rgb, frame_id=frame_id_t)
+        mask_t = masks[i] if masks is not None else None
+        result = node.forward(rgb, frame_id=frame_id_t, mask=mask_t)
         results.append(result)
     return results
 
@@ -385,17 +393,15 @@ class TestSAM3PointPropagation:
 
 
 class TestSAM3MaskPropagation:
-    def test_mask_prompt_streaming(self, tmp_path: Path) -> None:
-        mask_img = np.zeros((10, 12), dtype=np.uint8)
-        mask_img[2:8, 3:9] = 255
-        mask_path = tmp_path / "mask.png"
-        cv2.imwrite(str(mask_path), mask_img)
+    @staticmethod
+    def _mask_from_labels(label_map: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(np.asarray(label_map, dtype=np.int32)).unsqueeze(0)
 
-        node = SAM3MaskPropagation(
-            prompt_mask_path=str(mask_path),
-            prompt_obj_id=1,
-            name="test_mask",
-        )
+    def test_mask_prompt_streaming(self) -> None:
+        mask = np.zeros((10, 12), dtype=np.int32)
+        mask[2:8, 3:9] = 1
+
+        node = SAM3MaskPropagation(name="test_mask")
         mock_model = _make_mock_model()
 
         def _mask_prompt_side_effect(inference_state, **kwargs):  # noqa: ANN001
@@ -407,10 +413,114 @@ class TestSAM3MaskPropagation:
         node._model = mock_model
         node._ensure_model = MagicMock()
 
-        results = _run_streaming(node, num_frames=3)
+        results = _run_streaming(
+            node,
+            num_frames=3,
+            masks=[self._mask_from_labels(mask), None, None],
+        )
         assert len(results) == 3
         node._model.add_mask.assert_called_once()
         assert node._model.add_mask.call_args.kwargs["frame_idx"] == 0
+        assert node._model.add_mask.call_args.kwargs["obj_id"] == 1
+        node._model.add_prompt.assert_called_once()
+        assert node._model.add_prompt.call_args.kwargs["frame_idx"] == 0
+        assert node._model.add_prompt.call_args.kwargs["obj_id"] == 1
+
+    def test_no_mask_returns_full_frame_empty_output_and_skips_model_init(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_no_seed")
+        node._ensure_model = MagicMock()
+
+        result = node.forward(torch.rand(1, 10, 12, 3, dtype=torch.float32), mask=None)
+
+        assert result["mask"].shape == (1, 10, 12)
+        assert torch.count_nonzero(result["mask"]).item() == 0
+        assert result["object_ids"].shape == (1, 0)
+        assert result["detection_scores"].shape == (1, 0)
+        node._ensure_model.assert_not_called()
+
+    def test_first_mask_lazily_initializes_model(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_lazy_init")
+        mock_model = _make_mock_model()
+
+        def _ensure_model() -> None:
+            node._model = mock_model
+
+        node._ensure_model = MagicMock(side_effect=_ensure_model)
+        empty_rgb = torch.rand(1, 10, 12, 3, dtype=torch.float32)
+        prompt_mask = torch.zeros(1, 10, 12, dtype=torch.int32)
+        prompt_mask[:, 2:8, 3:9] = 4
+
+        first = node.forward(empty_rgb, mask=None, frame_id=torch.tensor([65], dtype=torch.int64))
+        second = node.forward(empty_rgb, mask=None, frame_id=torch.tensor([66], dtype=torch.int64))
+        seeded = node.forward(
+            empty_rgb,
+            mask=prompt_mask,
+            frame_id=torch.tensor([67], dtype=torch.int64),
+        )
+
+        assert node._ensure_model.call_count == 1
+        assert first["mask"].shape == (1, 10, 12)
+        assert second["mask"].shape == (1, 10, 12)
+        assert seeded["mask"].shape == (1, 10, 12)
+        assert node._seed_source_stream_idx == 2
+        assert node._source_frame_ids == [65, 66, 67]
+        assert mock_model.add_mask.call_count == 1
+        assert mock_model.add_mask.call_args.kwargs["frame_idx"] == 0
+        assert mock_model.add_mask.call_args.kwargs["obj_id"] == 4
+
+    def test_later_mask_updates_use_current_internal_frame(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_update_frame_idx")
+        mock_model = _make_mock_model()
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        first_mask = torch.zeros(1, 10, 12, dtype=torch.int32)
+        first_mask[:, 1:4, 2:6] = 2
+        later_mask = torch.zeros(1, 10, 12, dtype=torch.int32)
+        later_mask[:, 5:9, 7:10] = 7
+
+        _run_streaming(
+            node,
+            num_frames=4,
+            h=10,
+            w=12,
+            frame_ids=[10, 11, 12, 13],
+            masks=[None, first_mask, None, later_mask],
+        )
+
+        add_mask_calls = mock_model.add_mask.call_args_list
+        assert len(add_mask_calls) == 2
+        assert add_mask_calls[0].kwargs["frame_idx"] == 0
+        assert add_mask_calls[0].kwargs["obj_id"] == 2
+        assert add_mask_calls[1].kwargs["frame_idx"] == 2
+        assert add_mask_calls[1].kwargs["obj_id"] == 7
+
+    def test_multi_label_mask_uses_raw_object_ids(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_multi_label")
+        mock_model = _make_mock_model()
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        prompt_mask = torch.zeros(1, 10, 12, dtype=torch.int32)
+        prompt_mask[:, 1:4, 1:4] = 5
+        prompt_mask[:, 5:8, 6:10] = 9
+
+        node.forward(torch.rand(1, 10, 12, 3, dtype=torch.float32), mask=prompt_mask)
+
+        add_mask_calls = mock_model.add_mask.call_args_list
+        add_prompt_calls = mock_model.add_prompt.call_args_list
+        assert [call.kwargs["obj_id"] for call in add_mask_calls] == [5, 9]
+        assert [call.kwargs["frame_idx"] for call in add_mask_calls] == [0, 0]
+        assert [call.kwargs["obj_id"] for call in add_prompt_calls] == [5, 9]
+        assert [call.kwargs["frame_idx"] for call in add_prompt_calls] == [0, 0]
+
+    def test_mask_input_spec_is_optional_and_constructor_is_runtime_only(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_specs")
+
+        assert "mask" in SAM3MaskPropagation.INPUT_SPECS
+        assert SAM3MaskPropagation.INPUT_SPECS["mask"].optional is True
+        assert "prompt_mask_path" not in node.hparams
+        assert "prompt_obj_id" not in node.hparams
 
 
 # ---------------------------------------------------------------------------

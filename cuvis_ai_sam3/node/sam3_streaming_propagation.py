@@ -414,12 +414,40 @@ class SAM3TrackerInference(Node):
         return int(stream_idx)
 
     @staticmethod
-    def _empty_output() -> dict[str, torch.Tensor]:
+    def _empty_output(height: int = 1, width: int = 1) -> dict[str, torch.Tensor]:
         return {
-            "mask": torch.zeros(1, 1, 1, dtype=torch.int32),
+            "mask": torch.zeros(1, int(height), int(width), dtype=torch.int32),
             "object_ids": torch.zeros(1, 0, dtype=torch.int64),
             "detection_scores": torch.zeros(1, 0, dtype=torch.float32),
         }
+
+    def _initialize_stream_state(self, frame_np: np.ndarray) -> None:
+        """Initialize frame buffer and SAM3 state from the current RGB frame."""
+        orig_h, orig_w = int(frame_np.shape[0]), int(frame_np.shape[1])
+        device = self._model_device()
+
+        self._frame_buffer = _FrameBuffer(
+            image_size=int(self._model.image_size),
+            device=device,
+        )
+        self._frame_buffer.add(frame_np)
+
+        self._inference_state = self._build_state(orig_h, orig_w)
+        self._extend_state_for_frame(0)
+
+    def _start_generator(self, start_frame_idx: int = 0) -> None:
+        """Start the open-ended propagation generator from the given internal frame."""
+        self._inference_state["num_frames"] = _STREAMING_SENTINEL
+        for tracker_state in self._inference_state.get("tracker_inference_states", []):
+            if isinstance(tracker_state, dict):
+                tracker_state["num_frames"] = _STREAMING_SENTINEL
+
+        self._generator = self._model.propagate_in_video(
+            self._inference_state,
+            start_frame_idx=int(start_frame_idx),
+            max_frame_num_to_track=None,
+            reverse=False,
+        )
 
     # -- Prompt application (subclass responsibility) -------------------------
 
@@ -476,10 +504,15 @@ class SAM3TrackerInference(Node):
     def _pack_output(
         self,
         postprocessed: dict | None,
+        frame_shape: tuple[int, int] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Convert SAM3 per-object output to per-frame label map format."""
+        if frame_shape is None:
+            empty_h, empty_w = 1, 1
+        else:
+            empty_h, empty_w = int(frame_shape[0]), int(frame_shape[1])
         if postprocessed is None or len(postprocessed.get("out_obj_ids", [])) == 0:
-            return self._empty_output()
+            return self._empty_output(empty_h, empty_w)
 
         obj_ids = np.asarray(postprocessed["out_obj_ids"], dtype=np.int64)
         binary_masks = np.asarray(postprocessed["out_binary_masks"], dtype=bool)
@@ -487,7 +520,7 @@ class SAM3TrackerInference(Node):
 
         obj_ids, binary_masks, probs = self._filter_objects(obj_ids, binary_masks, probs)
         if obj_ids.shape[0] == 0:
-            return self._empty_output()
+            return self._empty_output(empty_h, empty_w)
         obj_ids = self._remap_object_ids(obj_ids)
 
         h, w = binary_masks.shape[1], binary_masks.shape[2]
@@ -701,23 +734,15 @@ class SAM3TrackerInference(Node):
         self._ensure_model()
 
         frame_np = rgb_frame[0].detach().cpu().numpy()  # [H, W, 3] float32
+        frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
         stream_idx = self._frame_idx
         source_frame_id = self._resolve_source_frame_id(frame_id, fallback_stream_idx=stream_idx)
         self._register_source_frame_id(stream_idx, source_frame_id)
 
         if stream_idx == 0:
             # -- First frame: initialize state and buffer --
-            orig_h, orig_w = frame_np.shape[0], frame_np.shape[1]
-            device = self._model_device()
-
-            self._frame_buffer = _FrameBuffer(
-                image_size=int(self._model.image_size),
-                device=device,
-            )
-            self._frame_buffer.add(frame_np)
-
-            self._inference_state = self._build_state(orig_h, orig_w)
-            self._extend_state_for_frame(0)
+            internal_frame_idx = 0
+            self._initialize_stream_state(frame_np)
 
             if self._requires_cached_frame_outputs_on_prompt_frame:
                 # Interactivity prompt paths require cached outputs on the prompt frame.
@@ -725,30 +750,19 @@ class SAM3TrackerInference(Node):
             self._mark_cudagraph_step_begin()
             self._apply_prompt()
 
-            # Seed a large frame budget so SAM3's static processing order can run in streaming mode.
-            self._inference_state["num_frames"] = _STREAMING_SENTINEL
-            for tracker_state in self._inference_state.get("tracker_inference_states", []):
-                if isinstance(tracker_state, dict):
-                    tracker_state["num_frames"] = _STREAMING_SENTINEL
-
-            self._generator = self._model.propagate_in_video(
-                self._inference_state,
-                start_frame_idx=0,
-                max_frame_num_to_track=None,
-                reverse=False,
-            )
-            _yield_frame_idx, postprocessed = self._next_generator_output(stream_idx)
-            result = self._pack_output(postprocessed)
+            self._start_generator(start_frame_idx=0)
+            _yield_frame_idx, postprocessed = self._next_generator_output(internal_frame_idx)
+            result = self._pack_output(postprocessed, frame_shape=frame_shape)
         else:
             # -- Subsequent frames: buffer + extend state + advance generator --
-            self._frame_buffer.add(frame_np)
-            self._extend_state_for_frame(stream_idx)
-            _yield_frame_idx, postprocessed = self._next_generator_output(stream_idx)
-            result = self._pack_output(postprocessed)
+            internal_frame_idx = self._frame_buffer.add(frame_np)
+            self._extend_state_for_frame(internal_frame_idx)
+            _yield_frame_idx, postprocessed = self._next_generator_output(internal_frame_idx)
+            result = self._pack_output(postprocessed, frame_shape=frame_shape)
 
-        self._evict_excess_tracker_states(stream_idx)
-        self._prune_state_for_frame(stream_idx)
-        if torch.cuda.is_available() and stream_idx > 0 and stream_idx % 50 == 0:
+        self._evict_excess_tracker_states(internal_frame_idx)
+        self._prune_state_for_frame(internal_frame_idx)
+        if torch.cuda.is_available() and internal_frame_idx > 0 and internal_frame_idx % 50 == 0:
             torch.cuda.empty_cache()
 
         self._frame_idx += 1
@@ -994,58 +1008,144 @@ class SAM3PointPropagation(SAM3TrackerInference):
 
 
 class SAM3MaskPropagation(SAM3TrackerInference):
-    """SAM3 streaming propagation with a binary mask prompt.
+    """SAM3 streaming propagation with runtime label-map prompts.
 
-    Loads a mask from ``prompt_mask_path``, adds it with a centroid point
-    prompt, and tracks the object specified by ``prompt_obj_id``.
+    The optional ``mask`` input is an int32 label map shaped ``[1, H, W]``:
+    ``0`` is background and each positive label value is treated as an object ID.
+    Propagation starts on the first frame where a non-empty prompt mask arrives.
     """
 
-    def __init__(
-        self,
-        prompt_mask_path: str,
-        prompt_obj_id: int,
-        **kwargs: Any,
-    ) -> None:
-        self._prompt_mask_path = prompt_mask_path
-        self._prompt_obj_id = prompt_obj_id
-        super().__init__(
-            prompt_mask_path=prompt_mask_path,
-            prompt_obj_id=prompt_obj_id,
-            **kwargs,
-        )
+    INPUT_SPECS = {
+        **SAM3TrackerInference.INPUT_SPECS,
+        "mask": PortSpec(
+            dtype=torch.int32,
+            shape=(1, -1, -1),
+            description=(
+                "Optional int32 label map [1,H,W]. 0=background, each positive "
+                "label is treated as an object ID prompt on that frame."
+            ),
+            optional=True,
+        ),
+    }
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._seed_source_stream_idx: int | None = None
+        super().__init__(**kwargs)
 
     @property
     def _requires_cached_frame_outputs_on_prompt_frame(self) -> bool:
         return True
 
     def _apply_prompt(self) -> None:
-        device = self._model_device()
-        mask_gray = cv2.imread(self._prompt_mask_path, cv2.IMREAD_GRAYSCALE)
-        if mask_gray is None:
-            raise FileNotFoundError(f"Cannot load mask: {self._prompt_mask_path}")
-        mask_binary = (mask_gray > 127).astype(np.float32)
-        mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
-        self._model.add_mask(
-            self._inference_state,
-            frame_idx=0,
-            obj_id=self._prompt_obj_id,
-            mask=mask_tensor,
-        )
-        ys, xs = np.where(mask_binary > 0)
-        if xs.size > 0 and ys.size > 0:
-            h_mask, w_mask = mask_binary.shape
-            point_x = float(xs.mean() / w_mask)
-            point_y = float(ys.mean() / h_mask)
-            self._model.add_prompt(
-                self._inference_state,
-                frame_idx=0,
-                points=torch.tensor([[point_x, point_y]], dtype=torch.float32, device=device),
-                point_labels=torch.tensor([1], dtype=torch.int64, device=device),
-                obj_id=self._prompt_obj_id,
+        raise RuntimeError("SAM3MaskPropagation applies prompts from the runtime 'mask' input.")
+
+    @staticmethod
+    def _normalize_runtime_mask(
+        mask: torch.Tensor | None,
+        expected_hw: tuple[int, int],
+    ) -> np.ndarray | None:
+        if mask is None:
+            return None
+        if mask.ndim != 3 or int(mask.shape[0]) != 1:
+            raise ValueError(
+                f"Expected runtime mask shape [1,H,W], got {tuple(int(v) for v in mask.shape)}."
             )
+        expected_h, expected_w = int(expected_hw[0]), int(expected_hw[1])
+        actual_h, actual_w = int(mask.shape[1]), int(mask.shape[2])
+        if (actual_h, actual_w) != (expected_h, expected_w):
+            raise ValueError(
+                "Runtime mask shape does not match current RGB frame: "
+                f"mask={(actual_h, actual_w)}, rgb={(expected_h, expected_w)}."
+            )
+        return np.asarray(mask[0].detach().cpu().numpy(), dtype=np.int64)
+
+    def _apply_runtime_mask(self, label_map: np.ndarray, frame_idx: int) -> None:
+        device = self._model_device()
+        self._inference_state["cached_frame_outputs"].setdefault(int(frame_idx), {})
+
+        point_labels = torch.tensor([1], dtype=torch.int64, device=device)
+        positive_labels = [
+            int(label)
+            for label in np.unique(label_map).tolist()
+            if int(label) > 0
+        ]
+        for obj_id in positive_labels:
+            mask_binary = (label_map == obj_id).astype(np.float32)
+            mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
+            self._model.add_mask(
+                self._inference_state,
+                frame_idx=int(frame_idx),
+                obj_id=int(obj_id),
+                mask=mask_tensor,
+            )
+            ys, xs = np.where(mask_binary > 0)
+            if xs.size > 0 and ys.size > 0:
+                h_mask, w_mask = mask_binary.shape
+                point_x = float(xs.mean() / w_mask)
+                point_y = float(ys.mean() / h_mask)
+                self._model.add_prompt(
+                    self._inference_state,
+                    frame_idx=int(frame_idx),
+                    points=torch.tensor([[point_x, point_y]], dtype=torch.float32, device=device),
+                    point_labels=point_labels,
+                    obj_id=int(obj_id),
+                )
         # Force regular propagation after the initial mask add.
         # Tracker partial propagation for mask-only prompts can require point inputs.
         self._inference_state["action_history"].clear()
+
+    def forward(
+        self,
+        rgb_frame: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        frame_id: torch.Tensor | None = None,
+        context: Context | None = None,  # noqa: ARG002
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Process one RGB frame with optional runtime mask prompts."""
+        frame_np = rgb_frame[0].detach().cpu().numpy()
+        frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
+
+        stream_idx = self._frame_idx
+        source_frame_id = self._resolve_source_frame_id(frame_id, fallback_stream_idx=stream_idx)
+        self._register_source_frame_id(stream_idx, source_frame_id)
+
+        label_map = self._normalize_runtime_mask(mask, expected_hw=frame_shape)
+        has_prompt = label_map is not None and bool(np.any(label_map > 0))
+        internal_frame_idx: int | None = None
+
+        if self._inference_state is None:
+            if not has_prompt:
+                self._frame_idx += 1
+                return self._empty_output(*frame_shape)
+
+            self._ensure_model()
+            self._initialize_stream_state(frame_np)
+            self._seed_source_stream_idx = stream_idx
+            internal_frame_idx = 0
+            self._mark_cudagraph_step_begin()
+            self._apply_runtime_mask(label_map, frame_idx=internal_frame_idx)
+            self._start_generator(start_frame_idx=internal_frame_idx)
+        else:
+            internal_frame_idx = self._frame_buffer.add(frame_np)
+            self._extend_state_for_frame(internal_frame_idx)
+            if has_prompt:
+                self._mark_cudagraph_step_begin()
+                self._apply_runtime_mask(label_map, frame_idx=internal_frame_idx)
+
+        if internal_frame_idx is None:
+            raise RuntimeError("Internal frame index was not initialized for mask propagation.")
+
+        _yield_frame_idx, postprocessed = self._next_generator_output(internal_frame_idx)
+        result = self._pack_output(postprocessed, frame_shape=frame_shape)
+
+        self._evict_excess_tracker_states(internal_frame_idx)
+        self._prune_state_for_frame(internal_frame_idx)
+        if torch.cuda.is_available() and internal_frame_idx > 0 and internal_frame_idx % 50 == 0:
+            torch.cuda.empty_cache()
+
+        self._frame_idx += 1
+        return result
 
 
 __all__ = [
