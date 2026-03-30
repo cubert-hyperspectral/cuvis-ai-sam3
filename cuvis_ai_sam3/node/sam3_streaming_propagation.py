@@ -21,6 +21,8 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from loguru import logger
 
+from .utils import _bbox_iou_xyxy, _binary_mask_from_xyxy, _centroid_point_from_binary_mask
+
 _STREAMING_SENTINEL = 10**7
 
 
@@ -319,12 +321,19 @@ class SAM3TrackerInference(Node):
         )
         return state
 
-    def _extend_state_for_frame(self, frame_idx: int) -> None:
+    def _extend_state_for_frame(
+        self,
+        frame_idx: int,
+        state: dict[str, Any] | None = None,
+    ) -> None:
         """Register a new frame index in the inference state (dict-based, like v1)."""
         from sam3.model.data_misc import FindStage, convert_my_tensors
         from sam3.model.utils.misc import copy_data_to_device
 
-        state = self._inference_state
+        if state is None:
+            state = self._inference_state
+        if state is None:
+            raise RuntimeError("Inference state is not initialized.")
         input_batch = state["input_batch"]
 
         if frame_idx in input_batch.find_inputs:
@@ -624,6 +633,38 @@ class SAM3TrackerInference(Node):
             self._prune_dict(input_batch.find_targets, keep_from)
             self._prune_dict(input_batch.find_metadatas, keep_from)
 
+    def _inject_mask_prompt_for_object(
+        self,
+        binary_mask: np.ndarray,
+        *,
+        frame_idx: int,
+        obj_id: int,
+    ) -> None:
+        """Inject one object update into tracker state using mask + centroid point."""
+        device = self._model_device()
+        self._inference_state["cached_frame_outputs"].setdefault(int(frame_idx), {})
+
+        mask_binary = np.asarray(binary_mask > 0, dtype=np.float32)
+        mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
+        self._model.add_mask(
+            self._inference_state,
+            frame_idx=int(frame_idx),
+            obj_id=int(obj_id),
+            mask=mask_tensor,
+        )
+
+        point_xy = _centroid_point_from_binary_mask(mask_binary)
+        if point_xy is None:
+            return
+
+        self._model.add_prompt(
+            self._inference_state,
+            frame_idx=int(frame_idx),
+            points=torch.tensor([list(point_xy)], dtype=torch.float32, device=device),
+            point_labels=torch.tensor([1], dtype=torch.int64, device=device),
+            obj_id=int(obj_id),
+        )
+
     def _evict_excess_tracker_states(self, frame_idx: int) -> None:
         """Evict oldest non-primary tracker states when the count exceeds the cap."""
         if self._inference_state is None or self._max_tracker_states <= 0:
@@ -814,157 +855,329 @@ class SAM3TextPropagation(SAM3TrackerInference):
 
 
 class SAM3BboxPropagation(SAM3TrackerInference):
-    """SAM3 streaming propagation with a bounding-box prompt.
+    """SAM3 streaming propagation with runtime bbox prompts.
 
-    Tracks a single object initialized by a bounding box. The best-matching
-    SAM object is selected via IoU. If ``prompt_obj_id`` is provided, emitted
-    outputs use that ID; otherwise the selected SAM internal ID is used.
+    The optional ``bboxes`` input carries a per-frame list of prompt dicts with
+    ``element_id``, ``object_id``, ``x_min``, ``y_min``, ``x_max``, and ``y_max``.
+    Frames before the first prompt emit empty outputs. On prompted frames, SAM3
+    uses a temporary bbox-grounding pass to obtain prompt-frame masks, matches
+    them back to the requested boxes by one-to-one highest-IoU assignment, and
+    injects the resulting masks into the tracker under the requested
+    ``object_id`` values.
     """
 
-    def __init__(
-        self,
-        prompt_bboxes_xywh: list[list[float]],
-        prompt_bbox_labels: list[int] | None = None,
-        prompt_obj_id: int | None = None,
-        **kwargs: Any,
-    ) -> None:
-        if prompt_bboxes_xywh and len(prompt_bboxes_xywh) > 1:
+    INPUT_SPECS = {
+        **SAM3TrackerInference.INPUT_SPECS,
+        "bboxes": PortSpec(
+            dtype=list,
+            shape=(),
+            description=(
+                "Optional per-frame list of bbox prompt dicts with keys "
+                "element_id, object_id, x_min, y_min, x_max, y_max."
+            ),
+            optional=True,
+        ),
+    }
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._seed_source_stream_idx: int | None = None
+        super().__init__(**kwargs)
+
+    def _apply_prompt(self) -> None:
+        raise RuntimeError("SAM3BboxPropagation applies prompts from the runtime 'bboxes' input.")
+
+    @staticmethod
+    def _normalize_runtime_bboxes(
+        bboxes: list[dict[str, Any]] | None,
+        expected_hw: tuple[int, int],
+    ) -> list[dict[str, float | int]]:
+        if bboxes is None:
+            return []
+        if not isinstance(bboxes, list):
             raise ValueError(
-                "SAM3BboxPropagation currently supports exactly one initial bbox prompt. "
-                "Provide a single bbox prompt only."
+                f"Expected runtime bboxes to be a list of dicts, got {type(bboxes).__name__}."
             )
-        self._prompt_bboxes_xywh = prompt_bboxes_xywh
-        self._prompt_bbox_labels = prompt_bbox_labels
-        self._prompt_obj_id = prompt_obj_id
-        self._selected_internal_bbox_obj_id: int | None = None
-        self._effective_output_bbox_obj_id: int | None = None
-        super().__init__(
-            prompt_bboxes_xywh=prompt_bboxes_xywh,
-            prompt_bbox_labels=prompt_bbox_labels,
-            prompt_obj_id=prompt_obj_id,
-            **kwargs,
+
+        height, width = int(expected_hw[0]), int(expected_hw[1])
+        deduped_by_object_id: dict[int, dict[str, float | int]] = {}
+        for idx, raw_box in enumerate(bboxes):
+            if not isinstance(raw_box, dict):
+                raise ValueError(
+                    f"Expected bbox prompt at index {idx} to be a dict, got {type(raw_box).__name__}."
+                )
+
+            element_id = int(raw_box.get("element_id", 0))
+            if element_id != 0:
+                raise ValueError(
+                    f"Runtime bbox prompt at index {idx} has element_id={element_id}; "
+                    "single-frame SAM3 propagation expects element_id=0."
+                )
+
+            if "object_id" not in raw_box:
+                raise ValueError(f"Runtime bbox prompt at index {idx} is missing 'object_id'.")
+            object_id = int(raw_box["object_id"])
+            if object_id <= 0:
+                raise ValueError(
+                    f"Runtime bbox prompt at index {idx} has invalid object_id={object_id}; "
+                    "object_id must be > 0."
+                )
+
+            missing = [key for key in ("x_min", "y_min", "x_max", "y_max") if key not in raw_box]
+            if missing:
+                raise ValueError(
+                    f"Runtime bbox prompt at index {idx} is missing required keys: {missing}."
+                )
+
+            x_min = float(raw_box["x_min"])
+            y_min = float(raw_box["y_min"])
+            x_max = float(raw_box["x_max"])
+            y_max = float(raw_box["y_max"])
+            if not (0.0 <= x_min < x_max <= float(width)):
+                raise ValueError(
+                    "Runtime bbox x-range is invalid for the current RGB frame: "
+                    f"(x_min={x_min}, x_max={x_max}, width={width})."
+                )
+            if not (0.0 <= y_min < y_max <= float(height)):
+                raise ValueError(
+                    "Runtime bbox y-range is invalid for the current RGB frame: "
+                    f"(y_min={y_min}, y_max={y_max}, height={height})."
+                )
+
+            deduped_by_object_id[object_id] = {
+                "element_id": element_id,
+                "object_id": object_id,
+                "x_min": x_min,
+                "y_min": y_min,
+                "x_max": x_max,
+                "y_max": y_max,
+            }
+
+        return list(deduped_by_object_id.values())
+
+    @staticmethod
+    def _prompt_box_xyxy(prompt_box: dict[str, float | int]) -> np.ndarray:
+        return np.asarray(
+            [
+                float(prompt_box["x_min"]),
+                float(prompt_box["y_min"]),
+                float(prompt_box["x_max"]),
+                float(prompt_box["y_max"]),
+            ],
+            dtype=np.float32,
+        )
+
+    @classmethod
+    def _prompt_box_xywh_normalized(
+        cls,
+        prompt_box: dict[str, float | int],
+        frame_shape: tuple[int, int],
+    ) -> np.ndarray:
+        height, width = int(frame_shape[0]), int(frame_shape[1])
+        box_xyxy = cls._prompt_box_xyxy(prompt_box)
+        x_min, y_min, x_max, y_max = [float(v) for v in box_xyxy.tolist()]
+        return np.asarray(
+            [
+                x_min / width,
+                y_min / height,
+                (x_max - x_min) / width,
+                (y_max - y_min) / height,
+            ],
+            dtype=np.float32,
         )
 
     @staticmethod
-    def _bbox_iou_xywh(box_a: np.ndarray, box_b: np.ndarray) -> float:
-        ax1, ay1, aw, ah = [float(v) for v in box_a.tolist()]
-        bx1, by1, bw, bh = [float(v) for v in box_b.tolist()]
-        if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
-            return 0.0
-        ax2, ay2 = ax1 + aw, ay1 + ah
-        bx2, by2 = bx1 + bw, by1 + bh
+    def _postprocessed_boxes_xyxy(
+        postprocessed: dict | None, frame_shape: tuple[int, int]
+    ) -> np.ndarray:
+        if postprocessed is None:
+            return np.zeros((0, 4), dtype=np.float32)
+        boxes_xywh = np.asarray(postprocessed.get("out_boxes_xywh", []), dtype=np.float32)
+        if boxes_xywh.ndim != 2 or boxes_xywh.shape[-1] != 4:
+            return np.zeros((0, 4), dtype=np.float32)
+        height, width = int(frame_shape[0]), int(frame_shape[1])
+        boxes_xyxy = np.array(boxes_xywh, copy=True, dtype=np.float32)
+        boxes_xyxy[:, 0] *= width
+        boxes_xyxy[:, 1] *= height
+        boxes_xyxy[:, 2] = (boxes_xywh[:, 0] + boxes_xywh[:, 2]) * width
+        boxes_xyxy[:, 3] = (boxes_xywh[:, 1] + boxes_xywh[:, 3]) * height
+        return boxes_xyxy
 
-        inter_x1 = max(ax1, bx1)
-        inter_y1 = max(ay1, by1)
-        inter_x2 = min(ax2, bx2)
-        inter_y2 = min(ay2, by2)
-        inter_w = max(0.0, inter_x2 - inter_x1)
-        inter_h = max(0.0, inter_y2 - inter_y1)
-        inter = inter_w * inter_h
-
-        area_a = aw * ah
-        area_b = bw * bh
-        union = area_a + area_b - inter
-        if union <= 0:
-            return 0.0
-        return inter / union
-
-    def _select_bbox_object_id(
+    def _probe_prompt_frame(
         self,
         *,
-        prompt_box_xywh: np.ndarray,
-        postprocessed: dict | None,
-    ) -> int | None:
-        if postprocessed is None:
-            return None
-        raw_obj_ids = postprocessed.get("out_obj_ids")
-        if raw_obj_ids is None or len(raw_obj_ids) == 0:
-            return None
-
-        obj_ids = np.asarray(raw_obj_ids, dtype=np.int64)
-        raw_boxes = postprocessed.get("out_boxes_xywh")
-        if raw_boxes is None:
-            return int(obj_ids[0])
-        boxes = np.asarray(raw_boxes, dtype=np.float32)
-        if boxes.ndim != 2 or boxes.shape[0] != obj_ids.shape[0] or boxes.shape[1] != 4:
-            return int(obj_ids[0])
-
-        best_idx = 0
-        best_iou = -1.0
-        for idx in range(obj_ids.shape[0]):
-            iou = self._bbox_iou_xywh(prompt_box_xywh, boxes[idx])
-            if iou > best_iou:
-                best_iou = iou
-                best_idx = idx
-        return int(obj_ids[best_idx])
-
-    def _apply_prompt(self) -> None:
-        if not self._prompt_bboxes_xywh:
-            raise ValueError("prompt_bboxes_xywh required for SAM3BboxPropagation.")
+        frame_np: np.ndarray,
+        prompt_boxes: list[dict[str, float | int]],
+        frame_shape: tuple[int, int],
+    ) -> dict | None:
         device = self._model_device()
-        boxes = np.array(self._prompt_bboxes_xywh, dtype=np.float32)
-        labels = (
-            torch.tensor(self._prompt_bbox_labels, dtype=torch.long, device=device)
-            if self._prompt_bbox_labels
-            else torch.ones(len(boxes), dtype=torch.long, device=device)
+        probe_buffer = _FrameBuffer(
+            image_size=int(self._model.image_size),
+            device=device,
         )
+        probe_buffer.add(frame_np)
+
+        original_buffer = self._frame_buffer
+        try:
+            self._frame_buffer = probe_buffer
+            probe_state = self._build_state(int(frame_shape[0]), int(frame_shape[1]))
+            self._extend_state_for_frame(0, state=probe_state)
+        finally:
+            self._frame_buffer = original_buffer
+
+        boxes_xywh = np.stack(
+            [self._prompt_box_xywh_normalized(prompt, frame_shape) for prompt in prompt_boxes],
+            axis=0,
+        )
+        labels = torch.ones(len(prompt_boxes), dtype=torch.long, device=device)
         _, postprocessed = self._model.add_prompt(
-            self._inference_state,
+            probe_state,
             frame_idx=0,
-            boxes_xywh=boxes,
+            boxes_xywh=boxes_xywh,
             box_labels=labels,
         )
-        selected_internal = self._select_bbox_object_id(
-            prompt_box_xywh=boxes[0],
-            postprocessed=postprocessed,
+        return postprocessed
+
+    @classmethod
+    def _match_prompt_masks(
+        cls,
+        *,
+        prompt_boxes: list[dict[str, float | int]],
+        postprocessed: dict | None,
+        frame_shape: tuple[int, int],
+    ) -> list[np.ndarray | None]:
+        matches: list[np.ndarray | None] = [None] * len(prompt_boxes)
+        if postprocessed is None:
+            return matches
+
+        candidate_masks = np.asarray(postprocessed.get("out_binary_masks", []), dtype=bool)
+        if candidate_masks.ndim != 3 or candidate_masks.shape[0] == 0:
+            return matches
+
+        candidate_boxes = cls._postprocessed_boxes_xyxy(postprocessed, frame_shape)
+        if candidate_boxes.shape[0] != candidate_masks.shape[0]:
+            return matches
+
+        scores: list[tuple[float, int, int]] = []
+        for prompt_idx, prompt_box in enumerate(prompt_boxes):
+            prompt_xyxy = cls._prompt_box_xyxy(prompt_box)
+            for candidate_idx, candidate_xyxy in enumerate(candidate_boxes):
+                scores.append(
+                    (
+                        _bbox_iou_xyxy(prompt_xyxy, candidate_xyxy),
+                        prompt_idx,
+                        candidate_idx,
+                    )
+                )
+
+        assigned_prompts: set[int] = set()
+        assigned_candidates: set[int] = set()
+        for _iou, prompt_idx, candidate_idx in sorted(scores, reverse=True):
+            if prompt_idx in assigned_prompts or candidate_idx in assigned_candidates:
+                continue
+            assigned_prompts.add(prompt_idx)
+            assigned_candidates.add(candidate_idx)
+            matches[prompt_idx] = np.asarray(candidate_masks[candidate_idx], dtype=np.uint8)
+
+        return matches
+
+    def _apply_runtime_bboxes(
+        self,
+        *,
+        frame_np: np.ndarray,
+        prompt_boxes: list[dict[str, float | int]],
+        frame_shape: tuple[int, int],
+        frame_idx: int,
+    ) -> None:
+        postprocessed = self._probe_prompt_frame(
+            frame_np=frame_np,
+            prompt_boxes=prompt_boxes,
+            frame_shape=frame_shape,
         )
-        self._selected_internal_bbox_obj_id = selected_internal
-        if selected_internal is None:
-            self._effective_output_bbox_obj_id = None
-            logger.warning(
-                "bbox prompt produced no selectable object on frame {}",
-                0,
-            )
-        else:
-            self._effective_output_bbox_obj_id = (
-                self._prompt_obj_id if self._prompt_obj_id is not None else selected_internal
-            )
-            logger.info(
-                "bbox selected internal SAM id {} -> output id {}",
-                selected_internal,
-                self._effective_output_bbox_obj_id,
+        matched_masks = self._match_prompt_masks(
+            prompt_boxes=prompt_boxes,
+            postprocessed=postprocessed,
+            frame_shape=frame_shape,
+        )
+
+        for prompt_box, matched_mask in zip(prompt_boxes, matched_masks, strict=False):
+            if matched_mask is None or int(np.count_nonzero(matched_mask)) == 0:
+                matched_mask = _binary_mask_from_xyxy(
+                    x_min=float(prompt_box["x_min"]),
+                    y_min=float(prompt_box["y_min"]),
+                    x_max=float(prompt_box["x_max"]),
+                    y_max=float(prompt_box["y_max"]),
+                    frame_shape=frame_shape,
+                )
+            self._inject_mask_prompt_for_object(
+                np.asarray(matched_mask, dtype=np.uint8),
+                frame_idx=frame_idx,
+                obj_id=int(prompt_box["object_id"]),
             )
 
-    def _filter_objects(
+        self._inference_state["action_history"].clear()
+
+    def forward(
         self,
-        obj_ids: np.ndarray,
-        binary_masks: np.ndarray,
-        probs: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self._selected_internal_bbox_obj_id is None:
-            return (
-                np.array([], dtype=np.int64),
-                np.zeros((0,) + binary_masks.shape[1:], dtype=bool),
-                np.array([], dtype=np.float32),
+        rgb_frame: torch.Tensor,
+        bboxes: list[dict[str, Any]] | None = None,
+        frame_id: torch.Tensor | None = None,
+        context: Context | None = None,  # noqa: ARG002
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Process one RGB frame with optional runtime bbox prompts."""
+        frame_np = rgb_frame[0].detach().cpu().numpy()
+        frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
+
+        stream_idx = self._frame_idx
+        source_frame_id = self._resolve_source_frame_id(frame_id, fallback_stream_idx=stream_idx)
+        self._register_source_frame_id(stream_idx, source_frame_id)
+
+        prompt_boxes = self._normalize_runtime_bboxes(bboxes, expected_hw=frame_shape)
+        has_prompt = len(prompt_boxes) > 0
+        internal_frame_idx: int | None = None
+
+        if self._inference_state is None:
+            if not has_prompt:
+                self._frame_idx += 1
+                return self._empty_output(*frame_shape)
+
+            self._ensure_model()
+            self._initialize_stream_state(frame_np)
+            self._seed_source_stream_idx = stream_idx
+            internal_frame_idx = 0
+            self._mark_cudagraph_step_begin()
+            self._apply_runtime_bboxes(
+                frame_np=frame_np,
+                prompt_boxes=prompt_boxes,
+                frame_shape=frame_shape,
+                frame_idx=internal_frame_idx,
             )
-        selected_matches = np.nonzero(obj_ids == int(self._selected_internal_bbox_obj_id))[0]
-        if selected_matches.size == 0:
-            return (
-                np.array([], dtype=np.int64),
-                np.zeros((0,) + binary_masks.shape[1:], dtype=bool),
-                np.array([], dtype=np.float32),
-            )
-        sel_idx = int(selected_matches[0])
-        out_id = (
-            int(self._effective_output_bbox_obj_id)
-            if self._effective_output_bbox_obj_id is not None
-            else int(obj_ids[sel_idx])
-        )
-        return (
-            np.array([out_id], dtype=np.int64),
-            binary_masks[sel_idx : sel_idx + 1],
-            probs[sel_idx : sel_idx + 1],
-        )
+            self._start_generator(start_frame_idx=internal_frame_idx)
+        else:
+            internal_frame_idx = self._frame_buffer.add(frame_np)
+            self._extend_state_for_frame(internal_frame_idx)
+            if has_prompt:
+                self._mark_cudagraph_step_begin()
+                self._apply_runtime_bboxes(
+                    frame_np=frame_np,
+                    prompt_boxes=prompt_boxes,
+                    frame_shape=frame_shape,
+                    frame_idx=internal_frame_idx,
+                )
+
+        if internal_frame_idx is None:
+            raise RuntimeError("Internal frame index was not initialized for bbox propagation.")
+
+        _yield_frame_idx, postprocessed = self._next_generator_output(internal_frame_idx)
+        result = self._pack_output(postprocessed, frame_shape=frame_shape)
+
+        self._evict_excess_tracker_states(internal_frame_idx)
+        self._prune_state_for_frame(internal_frame_idx)
+        if torch.cuda.is_available() and internal_frame_idx > 0 and internal_frame_idx % 50 == 0:
+            torch.cuda.empty_cache()
+
+        self._frame_idx += 1
+        return result
 
 
 class SAM3PointPropagation(SAM3TrackerInference):
@@ -1060,36 +1273,13 @@ class SAM3MaskPropagation(SAM3TrackerInference):
         return np.asarray(mask[0].detach().cpu().numpy(), dtype=np.int64)
 
     def _apply_runtime_mask(self, label_map: np.ndarray, frame_idx: int) -> None:
-        device = self._model_device()
-        self._inference_state["cached_frame_outputs"].setdefault(int(frame_idx), {})
-
-        point_labels = torch.tensor([1], dtype=torch.int64, device=device)
-        positive_labels = [
-            int(label)
-            for label in np.unique(label_map).tolist()
-            if int(label) > 0
-        ]
+        positive_labels = [int(label) for label in np.unique(label_map).tolist() if int(label) > 0]
         for obj_id in positive_labels:
-            mask_binary = (label_map == obj_id).astype(np.float32)
-            mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
-            self._model.add_mask(
-                self._inference_state,
+            self._inject_mask_prompt_for_object(
+                label_map == obj_id,
                 frame_idx=int(frame_idx),
                 obj_id=int(obj_id),
-                mask=mask_tensor,
             )
-            ys, xs = np.where(mask_binary > 0)
-            if xs.size > 0 and ys.size > 0:
-                h_mask, w_mask = mask_binary.shape
-                point_x = float(xs.mean() / w_mask)
-                point_y = float(ys.mean() / h_mask)
-                self._model.add_prompt(
-                    self._inference_state,
-                    frame_idx=int(frame_idx),
-                    points=torch.tensor([[point_x, point_y]], dtype=torch.float32, device=device),
-                    point_labels=point_labels,
-                    obj_id=int(obj_id),
-                )
         # Force regular propagation after the initial mask add.
         # Tracker partial propagation for mask-only prompts can require point inputs.
         self._inference_state["action_history"].clear()

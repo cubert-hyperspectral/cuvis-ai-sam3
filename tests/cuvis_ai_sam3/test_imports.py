@@ -38,6 +38,7 @@ def test_propagation_nodes_importable() -> None:
         SAM3BboxPropagation,
         SAM3MaskPropagation,
         SAM3PointPropagation,
+        SAM3SegmentEverything,
         SAM3TextPropagation,
     )
 
@@ -45,3 +46,4 @@ def test_propagation_nodes_importable() -> None:
     assert SAM3BboxPropagation.__name__ == "SAM3BboxPropagation"
     assert SAM3PointPropagation.__name__ == "SAM3PointPropagation"
     assert SAM3MaskPropagation.__name__ == "SAM3MaskPropagation"
+    assert SAM3SegmentEverything.__name__ == "SAM3SegmentEverything"

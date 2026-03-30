@@ -10,6 +10,7 @@ from .sam3_streaming_propagation import (
     SAM3TextPropagation,
     SAM3TrackerInference,
 )
+from .sam3_segment_everything import SAM3SegmentEverything
 
 __all__ = [
     "SAM3TrackerInference",
@@ -17,4 +18,5 @@ __all__ = [
     "SAM3BboxPropagation",
     "SAM3PointPropagation",
     "SAM3MaskPropagation",
+    "SAM3SegmentEverything",
 ]

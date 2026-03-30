@@ -122,6 +122,54 @@ def _make_propagation_generator(start_frame_idx: int = 0, h: int = 10, w: int = 
         frame_idx += 1
 
 
+def _bbox_prompt(
+    object_id: int,
+    x_min: float,
+    y_min: float,
+    x_max: float,
+    y_max: float,
+    *,
+    element_id: int = 0,
+) -> dict[str, float | int]:
+    return {
+        "element_id": int(element_id),
+        "object_id": int(object_id),
+        "x_min": float(x_min),
+        "y_min": float(y_min),
+        "x_max": float(x_max),
+        "y_max": float(y_max),
+    }
+
+
+def _postprocessed_for_prompt_boxes(
+    boxes_xywh: np.ndarray,
+    *,
+    h: int = 10,
+    w: int = 12,
+    obj_ids: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    boxes_xywh = np.asarray(boxes_xywh, dtype=np.float32)
+    masks = np.zeros((boxes_xywh.shape[0], h, w), dtype=bool)
+    for idx, (x, y, bw, bh) in enumerate(boxes_xywh):
+        x0 = max(0, min(w - 1, int(np.floor(float(x) * w))))
+        y0 = max(0, min(h - 1, int(np.floor(float(y) * h))))
+        x1 = max(x0 + 1, min(w, int(np.ceil(float(x + bw) * w))))
+        y1 = max(y0 + 1, min(h, int(np.ceil(float(y + bh) * h))))
+        masks[idx, y0:y1, x0:x1] = True
+    return {
+        "out_obj_ids": (
+            np.arange(1, boxes_xywh.shape[0] + 1, dtype=np.int64)
+            if obj_ids is None
+            else np.asarray(obj_ids, dtype=np.int64)
+        ),
+        "out_probs": np.linspace(0.95, 0.75, num=max(1, boxes_xywh.shape[0]), dtype=np.float32)[
+            : boxes_xywh.shape[0]
+        ],
+        "out_boxes_xywh": boxes_xywh.astype(np.float32),
+        "out_binary_masks": masks,
+    }
+
+
 def _run_streaming(
     node: SAM3TrackerInference,
     num_frames: int = 5,
@@ -129,6 +177,7 @@ def _run_streaming(
     w: int = 12,
     frame_ids: list[int] | None = None,
     masks: list[torch.Tensor | None] | None = None,
+    bbox_prompts: list[list[dict[str, float | int]] | None] | None = None,
 ) -> list[dict[str, torch.Tensor]]:
     """Run the node through num_frames with a mocked model."""
     mock_model = node._model if node._model is not None else _make_mock_model()
@@ -148,13 +197,16 @@ def _run_streaming(
         raise ValueError("frame_ids length must match num_frames.")
     if masks is not None and len(masks) != num_frames:
         raise ValueError("masks length must match num_frames.")
+    if bbox_prompts is not None and len(bbox_prompts) != num_frames:
+        raise ValueError("bbox_prompts length must match num_frames.")
     for i in range(num_frames):
         rgb = torch.rand(1, h, w, 3, dtype=torch.float32)
         frame_id_t = (
             torch.tensor([int(frame_ids[i])], dtype=torch.int64) if frame_ids is not None else None
         )
         mask_t = masks[i] if masks is not None else None
-        result = node.forward(rgb, frame_id=frame_id_t, mask=mask_t)
+        bboxes_t = bbox_prompts[i] if bbox_prompts is not None else None
+        result = node.forward(rgb, frame_id=frame_id_t, mask=mask_t, bboxes=bboxes_t)
         results.append(result)
     return results
 
@@ -277,84 +329,202 @@ class TestSAM3TextPropagation:
 
 
 class TestSAM3BboxPropagation:
-    def test_bbox_prompt_streaming(self) -> None:
-        node = SAM3BboxPropagation(
-            prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
-            name="test_bbox",
-        )
-        results = _run_streaming(node, num_frames=3)
-        assert len(results) == 3
-        for r in results:
-            assert r["object_ids"].shape == (1, 1)
-            assert int(r["object_ids"][0, 0].item()) == 1
-        node._model.add_prompt.assert_called_once()
-        assert node._model.add_prompt.call_args.kwargs["frame_idx"] == 0
+    def test_no_bbox_returns_full_frame_empty_output_and_skips_model_init(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_no_seed")
+        node._ensure_model = MagicMock()
 
-    def test_bbox_prompt_uses_provided_output_id(self) -> None:
-        node = SAM3BboxPropagation(
-            prompt_bboxes_xywh=[[0.1, 0.2, 0.3, 0.4]],
-            prompt_obj_id=14,
-            name="test_bbox_obj_id_override",
-        )
+        result = node.forward(torch.rand(1, 10, 12, 3, dtype=torch.float32), bboxes=None)
+
+        assert result["mask"].shape == (1, 10, 12)
+        assert torch.count_nonzero(result["mask"]).item() == 0
+        assert result["object_ids"].shape == (1, 0)
+        assert result["detection_scores"].shape == (1, 0)
+        node._ensure_model.assert_not_called()
+
+    def test_first_bbox_lazily_initializes_model_and_exports_prompt_object_id(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_lazy_init")
         mock_model = _make_mock_model()
-        mock_model.add_prompt.return_value = (
-            0,
-            {
-                "out_obj_ids": np.array([1, 3, 4], dtype=np.int64),
-                "out_probs": np.array([0.4, 0.95, 0.3], dtype=np.float32),
-                "out_boxes_xywh": np.array(
-                    [
-                        [0.6, 0.1, 0.1, 0.1],
-                        [0.1, 0.2, 0.3, 0.4],  # exact prompt match -> selected internal id 3
-                        [0.2, 0.1, 0.1, 0.2],
-                    ],
-                    dtype=np.float32,
-                ),
-                "out_binary_masks": np.zeros((3, 1, 1), dtype=bool),
-            },
-        )
 
-        def _bbox_gen(_inference_state, **kwargs):  # noqa: ANN001
-            del kwargs
-            h, w = 10, 12
-            frame_idx = 0
+        def _bbox_prompt_side_effect(inference_state, **kwargs):  # noqa: ANN001
+            if "boxes_xywh" in kwargs:
+                assert kwargs["frame_idx"] == 0
+                return (
+                    0,
+                    _postprocessed_for_prompt_boxes(
+                        np.array(
+                            [[0.60, 0.10, 0.10, 0.10], [0.25, 0.20, 0.25, 0.50]], dtype=np.float32
+                        ),
+                        h=10,
+                        w=12,
+                        obj_ids=np.array([3, 8], dtype=np.int64),
+                    ),
+                )
+            assert kwargs["obj_id"] == 14
+            return kwargs["frame_idx"], None
+
+        def _propagate_from_state(_inference_state, **kwargs):  # noqa: ANN001
+            start_frame_idx = int(kwargs.get("start_frame_idx", 0))
+            frame_idx = start_frame_idx
             while True:
-                masks = np.zeros((3, h, w), dtype=bool)
-                masks[0, :2, :2] = True
-                masks[1, 2:8, 3:9] = True  # selected internal id 3
-                masks[2, 0:2, 8:10] = True
+                masks = np.zeros((1, 10, 12), dtype=bool)
+                masks[0, 2:7, 3:6] = True
                 yield (
                     frame_idx,
                     {
-                        "out_obj_ids": np.array([1, 3, 4], dtype=np.int64),
-                        "out_probs": np.array([0.4, 0.95, 0.3], dtype=np.float32),
+                        "out_obj_ids": np.array([14], dtype=np.int64),
+                        "out_probs": np.array([0.95], dtype=np.float32),
                         "out_binary_masks": masks,
-                        "out_boxes_xywh": np.array(
-                            [
-                                [0.6, 0.1, 0.1, 0.1],
-                                [0.1, 0.2, 0.3, 0.4],
-                                [0.2, 0.1, 0.1, 0.2],
-                            ],
-                            dtype=np.float32,
-                        ),
+                        "out_boxes_xywh": np.array([[0.25, 0.20, 0.25, 0.50]], dtype=np.float32),
                     },
                 )
                 frame_idx += 1
 
-        mock_model.propagate_in_video.side_effect = _bbox_gen
+        mock_model.add_prompt.side_effect = _bbox_prompt_side_effect
+        mock_model.propagate_in_video.side_effect = _propagate_from_state
+
+        def _ensure_model() -> None:
+            node._model = mock_model
+
+        node._ensure_model = MagicMock(side_effect=_ensure_model)
+        empty_rgb = torch.rand(1, 10, 12, 3, dtype=torch.float32)
+
+        first = node.forward(empty_rgb, bboxes=None, frame_id=torch.tensor([65], dtype=torch.int64))
+        second = node.forward(
+            empty_rgb, bboxes=None, frame_id=torch.tensor([66], dtype=torch.int64)
+        )
+        seeded = node.forward(
+            empty_rgb,
+            bboxes=[_bbox_prompt(14, 3, 2, 6, 7)],
+            frame_id=torch.tensor([67], dtype=torch.int64),
+        )
+
+        assert node._ensure_model.call_count == 1
+        assert first["mask"].shape == (1, 10, 12)
+        assert second["mask"].shape == (1, 10, 12)
+        assert seeded["mask"].shape == (1, 10, 12)
+        assert node._seed_source_stream_idx == 2
+        assert node._source_frame_ids == [65, 66, 67]
+
+        box_probe_calls = [
+            call for call in mock_model.add_prompt.call_args_list if "boxes_xywh" in call.kwargs
+        ]
+        point_update_calls = [
+            call for call in mock_model.add_prompt.call_args_list if "points" in call.kwargs
+        ]
+        assert len(box_probe_calls) == 1
+        assert len(point_update_calls) == 1
+        assert box_probe_calls[0].kwargs["frame_idx"] == 0
+        assert mock_model.add_mask.call_count == 1
+        assert mock_model.add_mask.call_args.kwargs["frame_idx"] == 0
+        assert mock_model.add_mask.call_args.kwargs["obj_id"] == 14
+        assert point_update_calls[0].kwargs["frame_idx"] == 0
+        assert point_update_calls[0].kwargs["obj_id"] == 14
+        assert int(seeded["object_ids"][0, 0].item()) == 14
+
+    def test_later_bbox_updates_use_current_internal_frame_and_support_multiple_boxes(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_update_frame_idx")
+        mock_model = _make_mock_model()
         node._model = mock_model
         node._ensure_model = MagicMock()
 
-        results = _run_streaming(node, num_frames=3)
-        assert node._selected_internal_bbox_obj_id == 3
-        assert node._effective_output_bbox_obj_id == 14
-        for r in results:
-            assert r["object_ids"].shape == (1, 1)
-            assert int(r["object_ids"][0, 0].item()) == 14
-            assert r["detection_scores"].shape == (1, 1)
-            assert float(r["detection_scores"][0, 0].item()) == pytest.approx(0.95)
-            mask_vals = set(torch.unique(r["mask"]).cpu().tolist())
-            assert mask_vals.issubset({0, 14})
+        def _bbox_prompt_side_effect(inference_state, **kwargs):  # noqa: ANN001
+            if "boxes_xywh" in kwargs:
+                boxes = np.asarray(kwargs["boxes_xywh"], dtype=np.float32)
+                return 0, _postprocessed_for_prompt_boxes(boxes, h=10, w=12)
+            return kwargs["frame_idx"], None
+
+        mock_model.add_prompt.side_effect = _bbox_prompt_side_effect
+
+        _run_streaming(
+            node,
+            num_frames=4,
+            h=10,
+            w=12,
+            frame_ids=[10, 11, 12, 13],
+            bbox_prompts=[
+                None,
+                [_bbox_prompt(2, 2, 1, 6, 4)],
+                None,
+                [
+                    _bbox_prompt(4, 1, 5, 4, 9),
+                    _bbox_prompt(7, 7, 2, 10, 6),
+                ],
+            ],
+        )
+
+        add_mask_calls = mock_model.add_mask.call_args_list
+        point_calls = [
+            call for call in mock_model.add_prompt.call_args_list if "points" in call.kwargs
+        ]
+        probe_calls = [
+            call for call in mock_model.add_prompt.call_args_list if "boxes_xywh" in call.kwargs
+        ]
+
+        assert len(probe_calls) == 2
+        assert [call.kwargs["obj_id"] for call in add_mask_calls] == [2, 4, 7]
+        assert [call.kwargs["frame_idx"] for call in add_mask_calls] == [0, 2, 2]
+        assert [call.kwargs["obj_id"] for call in point_calls] == [2, 4, 7]
+        assert [call.kwargs["frame_idx"] for call in point_calls] == [0, 2, 2]
+
+    def test_reprompted_object_reuses_same_exported_id(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_reprompt")
+        mock_model = _make_mock_model()
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        def _bbox_prompt_side_effect(inference_state, **kwargs):  # noqa: ANN001
+            if "boxes_xywh" in kwargs:
+                boxes = np.asarray(kwargs["boxes_xywh"], dtype=np.float32)
+                return 0, _postprocessed_for_prompt_boxes(boxes, h=10, w=12)
+            return kwargs["frame_idx"], None
+
+        def _propagate_from_state(_inference_state, **kwargs):  # noqa: ANN001
+            start_frame_idx = int(kwargs.get("start_frame_idx", 0))
+            frame_idx = start_frame_idx
+            while True:
+                masks = np.zeros((1, 10, 12), dtype=bool)
+                masks[0, 2:8, 3:9] = True
+                yield (
+                    frame_idx,
+                    {
+                        "out_obj_ids": np.array([9], dtype=np.int64),
+                        "out_probs": np.array([0.91], dtype=np.float32),
+                        "out_binary_masks": masks,
+                        "out_boxes_xywh": np.array([[0.25, 0.20, 0.50, 0.60]], dtype=np.float32),
+                    },
+                )
+                frame_idx += 1
+
+        mock_model.add_prompt.side_effect = _bbox_prompt_side_effect
+        mock_model.propagate_in_video.side_effect = _propagate_from_state
+
+        results = _run_streaming(
+            node,
+            num_frames=4,
+            h=10,
+            w=12,
+            frame_ids=[20, 21, 22, 23],
+            bbox_prompts=[
+                None,
+                [_bbox_prompt(9, 3, 2, 9, 8)],
+                None,
+                [_bbox_prompt(9, 2, 1, 8, 7)],
+            ],
+        )
+
+        add_mask_calls = mock_model.add_mask.call_args_list
+        assert [call.kwargs["obj_id"] for call in add_mask_calls] == [9, 9]
+        assert [call.kwargs["frame_idx"] for call in add_mask_calls] == [0, 2]
+        assert int(results[-1]["object_ids"][0, 0].item()) == 9
+
+    def test_bbox_input_spec_is_optional_and_constructor_is_runtime_only(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_specs")
+
+        assert "bboxes" in SAM3BboxPropagation.INPUT_SPECS
+        assert SAM3BboxPropagation.INPUT_SPECS["bboxes"].optional is True
+        assert "prompt_bboxes_xywh" not in node.hparams
+        assert "prompt_bbox_labels" not in node.hparams
+        assert "prompt_obj_id" not in node.hparams
 
 
 # ---------------------------------------------------------------------------

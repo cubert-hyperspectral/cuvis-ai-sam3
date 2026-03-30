@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Added `SAM3SegmentEverything`, a prompt-free SAM2-style automatic mask generator node for per-frame RGB segmentation via point-grid prompting, filtering, and NMS deduplication.
+- Added optional runtime `bboxes` input support to `SAM3BboxPropagation`, including lazy initialization on the first prompted frame, later bbox updates without reset, and stable exported IDs from per-prompt `object_id` values.
+- Breaking: removed constructor-seeded bbox prompt arguments from the public `SAM3BboxPropagation` contract in favor of runtime bbox prompting via the `bboxes` input port.
 - Added optional runtime `mask` input support to `SAM3MaskPropagation`, including lazy initialization on the first non-empty label-map prompt and per-frame prompt updates without reset.
 - Changed empty streaming outputs to preserve the current frame spatial size, preventing mask-propagation pre-seed frames from collapsing to `1x1`.
 - Breaking: removed `prompt_mask_path` and mask-propagation `prompt_obj_id` from the public `SAM3MaskPropagation` constructor contract in favor of runtime label-map prompting via the `mask` input port.
