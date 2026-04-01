@@ -874,6 +874,7 @@ class Sam3VideoInference(Sam3VideoBase):
         text_str=None,
         boxes_xywh=None,
         box_labels=None,
+        reset_state: bool = True,
     ):
         """
         Add text, point or box prompts on a single frame. This method returns the inference
@@ -892,8 +893,10 @@ class Sam3VideoInference(Sam3VideoBase):
             f"{frame_idx=} is out of range for a total of {num_frames} frames"
         )
 
-        # since it's a semantic prompt, we start over
-        self.reset_state(inference_state)
+        # Since text prompts are semantic, the default behavior is to start over.
+        # Streaming integrations can opt out when experimenting with in-place prompt updates.
+        if reset_state:
+            self.reset_state(inference_state)
 
         # 1) add text prompt
         if text_str is not None and text_str != "visual":
@@ -904,8 +907,13 @@ class Sam3VideoInference(Sam3VideoBase):
             inference_state["text_prompt"] = None
             inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
             text_id = self.TEXT_ID_FOR_VISUAL
-        for t in range(inference_state["num_frames"]):
-            inference_state["input_batch"].find_inputs[t].text_ids[...] = text_id
+        frame_inputs = inference_state["input_batch"].find_inputs
+        if isinstance(frame_inputs, dict):
+            frame_indices = sorted(int(t) for t in frame_inputs.keys())
+        else:
+            frame_indices = range(inference_state["num_frames"])
+        for t in frame_indices:
+            frame_inputs[t].text_ids[...] = text_id
 
         # 2) handle box prompt
         assert (boxes_xywh is not None) == (box_labels is not None)
@@ -1400,6 +1408,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         point_labels=None,
         obj_id=None,
         rel_coordinates=True,
+        reset_state: bool = True,
     ):
         if points is not None:
             # Tracker instance prompts
@@ -1426,6 +1435,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 text_str=text_str,
                 boxes_xywh=boxes_xywh,
                 box_labels=box_labels,
+                reset_state=reset_state,
             )
 
     @torch.inference_mode()

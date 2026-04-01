@@ -10,6 +10,7 @@ Hierarchy:
 
 from __future__ import annotations
 
+import json
 from abc import abstractmethod
 from typing import Any
 
@@ -829,16 +830,45 @@ class SAM3TrackerInference(Node):
 class SAM3TextPropagation(SAM3TrackerInference):
     """SAM3 streaming propagation with a text/concept prompt.
 
-    Detects and tracks all objects matching ``prompt_text`` (e.g. "person").
+    Detects and tracks all objects matching runtime ``text_prompt`` inputs
+    (e.g. ``"person"`` or ``"car"``).
     """
 
-    def __init__(
-        self,
-        prompt_text: str = "person",
-        **kwargs: Any,
-    ) -> None:
-        self._prompt_text = prompt_text
-        super().__init__(prompt_text=prompt_text, **kwargs)
+    INPUT_SPECS = {
+        **SAM3TrackerInference.INPUT_SPECS,
+        "text_prompt": PortSpec(
+            dtype=str,
+            shape=(),
+            description="Optional text prompt applied on the current frame.",
+            optional=True,
+        ),
+    }
+    OUTPUT_SPECS = {
+        **SAM3TrackerInference.OUTPUT_SPECS,
+        "category_ids": PortSpec(
+            dtype=torch.int64,
+            shape=(1, -1),
+            description="Category IDs [1,N], aligned with object_ids.",
+        ),
+        "category_semantics": PortSpec(
+            dtype=torch.uint8,
+            shape=(-1,),
+            description=(
+                "UTF-8 JSON bytes of the cumulative category-id-to-text mapping, "
+                'for example {"1":"person","2":"car"}.'
+            ),
+        ),
+    }
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._seed_source_stream_idx: int | None = None
+        self._semantic_to_category_id: dict[str, int] = {}
+        self._category_id_to_semantic: dict[int, str] = {}
+        self._export_obj_id_to_category_id: dict[int, int] = {}
+        self._next_category_id: int = 1
+        self._current_prompt_category_id: int | None = None
+        self._last_successful_prompt_category_id: int | None = None
+        super().__init__(**kwargs)
 
     @property
     def _remap_internal_object_ids(self) -> bool:
@@ -847,11 +877,193 @@ class SAM3TextPropagation(SAM3TrackerInference):
         return True
 
     def _apply_prompt(self) -> None:
-        self._model.add_prompt(
-            self._inference_state,
-            frame_idx=0,
-            text_str=self._prompt_text,
-        )
+        raise RuntimeError("SAM3TextPropagation applies prompts from the runtime 'text_prompt' input.")
+
+    @staticmethod
+    def _normalize_runtime_text_prompt(text_prompt: str | None) -> str | None:
+        if text_prompt is None:
+            return None
+        if not isinstance(text_prompt, str):
+            raise ValueError(
+                f"Expected runtime text_prompt to be a string, got {type(text_prompt).__name__}."
+            )
+        normalized = text_prompt.strip()
+        return normalized or None
+
+    def _reserve_category_id(self, prompt_text: str) -> int:
+        category_id = self._semantic_to_category_id.get(prompt_text)
+        if category_id is not None:
+            return int(category_id)
+        category_id = self._next_category_id
+        self._semantic_to_category_id[prompt_text] = int(category_id)
+        self._category_id_to_semantic[int(category_id)] = prompt_text
+        self._next_category_id += 1
+        return int(category_id)
+
+    def _encode_category_semantics(self) -> torch.Tensor:
+        payload = json.dumps(
+            {
+                str(category_id): semantic
+                for category_id, semantic in sorted(self._category_id_to_semantic.items())
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return torch.tensor(list(payload), dtype=torch.uint8)
+
+    def _empty_output(
+        self,
+        height: int = 1,
+        width: int = 1,
+    ) -> dict[str, torch.Tensor]:
+        result = super()._empty_output(height, width)
+        result["category_ids"] = torch.zeros(1, 0, dtype=torch.int64)
+        result["category_semantics"] = self._encode_category_semantics()
+        return result
+
+    def _apply_runtime_text_prompt(
+        self,
+        *,
+        prompt_text: str,
+        frame_idx: int,
+        reset_state: bool,
+    ) -> dict | None:
+        if self._inference_state is None:
+            raise RuntimeError("Inference state must be initialized before applying a text prompt.")
+
+        state = self._inference_state
+        clamped_num_frames = int(frame_idx) + 1
+        original_num_frames = int(state.get("num_frames", clamped_num_frames))
+        original_tracker_num_frames: list[tuple[dict[str, Any], int]] = []
+
+        state["num_frames"] = int(clamped_num_frames)
+        for tracker_state in state.get("tracker_inference_states", []):
+            if isinstance(tracker_state, dict):
+                original_tracker_num_frames.append(
+                    (tracker_state, int(tracker_state.get("num_frames", clamped_num_frames)))
+                )
+                tracker_state["num_frames"] = int(clamped_num_frames)
+
+        try:
+            _, postprocessed = self._model.add_prompt(
+                state,
+                frame_idx=int(frame_idx),
+                text_str=prompt_text,
+                reset_state=bool(reset_state),
+            )
+        finally:
+            state["num_frames"] = int(original_num_frames)
+            for tracker_state, original_tracker_num_frames_value in original_tracker_num_frames:
+                tracker_state["num_frames"] = int(original_tracker_num_frames_value)
+
+        state["action_history"].clear()
+        return postprocessed
+
+    def _category_id_for_new_export_track(self) -> int:
+        category_id = self._current_prompt_category_id
+        if category_id is None:
+            category_id = self._last_successful_prompt_category_id
+        if category_id is None:
+            raise RuntimeError(
+                "SAM3TextPropagation encountered a new exported track without any successful text "
+                "prompt category in state."
+            )
+        return int(category_id)
+
+    def _pack_output(
+        self,
+        postprocessed: dict | None,
+        frame_shape: tuple[int, int] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        result = super()._pack_output(postprocessed, frame_shape=frame_shape)
+        export_object_ids = [
+            int(value) for value in result["object_ids"].reshape(-1).to(dtype=torch.int64).tolist()
+        ]
+        category_ids: list[int] = []
+        for export_object_id in export_object_ids:
+            category_id = self._export_obj_id_to_category_id.get(export_object_id)
+            if category_id is None:
+                category_id = self._category_id_for_new_export_track()
+                self._export_obj_id_to_category_id[export_object_id] = int(category_id)
+            category_ids.append(int(category_id))
+
+        result["category_ids"] = torch.tensor([category_ids], dtype=torch.int64)
+        result["category_semantics"] = self._encode_category_semantics()
+        return result
+
+    def forward(
+        self,
+        rgb_frame: torch.Tensor,
+        text_prompt: str | None = None,
+        frame_id: torch.Tensor | None = None,
+        context: Context | None = None,  # noqa: ARG002
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Process one RGB frame with an optional runtime text prompt."""
+        frame_np = rgb_frame[0].detach().cpu().numpy()
+        frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
+
+        stream_idx = self._frame_idx
+        source_frame_id = self._resolve_source_frame_id(frame_id, fallback_stream_idx=stream_idx)
+        self._register_source_frame_id(stream_idx, source_frame_id)
+
+        normalized_prompt = self._normalize_runtime_text_prompt(text_prompt)
+        has_prompt = normalized_prompt is not None
+        prompt_category_id: int | None = None
+        if normalized_prompt is not None:
+            prompt_category_id = self._reserve_category_id(normalized_prompt)
+
+        if self._inference_state is not None or has_prompt:
+            self._ensure_model()
+
+        self._current_prompt_category_id = None
+        internal_frame_idx: int | None = None
+
+        if self._inference_state is None:
+            if not has_prompt:
+                self._frame_idx += 1
+                return self._empty_output(*frame_shape)
+
+            self._initialize_stream_state(frame_np)
+            self._seed_source_stream_idx = stream_idx
+            internal_frame_idx = 0
+            self._mark_cudagraph_step_begin()
+            self._apply_runtime_text_prompt(
+                prompt_text=normalized_prompt,
+                frame_idx=internal_frame_idx,
+                reset_state=True,
+            )
+            self._current_prompt_category_id = int(prompt_category_id)
+            self._last_successful_prompt_category_id = int(prompt_category_id)
+            self._start_generator(start_frame_idx=internal_frame_idx)
+        else:
+            internal_frame_idx = self._frame_buffer.add(frame_np)
+            self._extend_state_for_frame(internal_frame_idx)
+            if has_prompt:
+                self._mark_cudagraph_step_begin()
+                self._apply_runtime_text_prompt(
+                    prompt_text=normalized_prompt,
+                    frame_idx=internal_frame_idx,
+                    reset_state=False,
+                )
+                self._current_prompt_category_id = int(prompt_category_id)
+                self._last_successful_prompt_category_id = int(prompt_category_id)
+                self._start_generator(start_frame_idx=internal_frame_idx)
+
+        if internal_frame_idx is None:
+            raise RuntimeError("Internal frame index was not initialized for text propagation.")
+
+        _yield_frame_idx, postprocessed = self._next_generator_output(internal_frame_idx)
+        result = self._pack_output(postprocessed, frame_shape=frame_shape)
+        self._current_prompt_category_id = None
+
+        self._evict_excess_tracker_states(internal_frame_idx)
+        self._prune_state_for_frame(internal_frame_idx)
+        if torch.cuda.is_available() and internal_frame_idx > 0 and internal_frame_idx % 50 == 0:
+            torch.cuda.empty_cache()
+
+        self._frame_idx += 1
+        return result
 
 
 class SAM3BboxPropagation(SAM3TrackerInference):

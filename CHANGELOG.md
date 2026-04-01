@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Added optional runtime `text_prompt` input support to `SAM3TextPropagation`, including empty pre-seed frames, first-successful-frame seeding, later text re-prompts without reset, and cumulative `category_semantics` output as UTF-8 JSON bytes.
+- Breaking: removed constructor-seeded `prompt_text` from the public `SAM3TextPropagation` contract in favor of runtime text prompting through the `text_prompt` input port.
+- Added `category_ids` output to `SAM3TextPropagation`, aligned with `object_ids`, with category assignment owned by the node and stable exported track/category mappings across later frames.
 - Added `SAM3SegmentEverything`, a prompt-free SAM2-style automatic mask generator node for per-frame RGB segmentation via point-grid prompting, filtering, and NMS deduplication.
 - Added optional runtime `bboxes` input support to `SAM3BboxPropagation`, including lazy initialization on the first prompted frame, later bbox updates without reset, and stable exported IDs from per-prompt `object_id` values.
 - Breaking: removed constructor-seeded bbox prompt arguments from the public `SAM3BboxPropagation` contract in favor of runtime bbox prompting via the `bboxes` input port.

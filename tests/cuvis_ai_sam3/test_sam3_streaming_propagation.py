@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -176,6 +177,7 @@ def _run_streaming(
     h: int = 10,
     w: int = 12,
     frame_ids: list[int] | None = None,
+    text_prompts: list[str | None] | None = None,
     masks: list[torch.Tensor | None] | None = None,
     bbox_prompts: list[list[dict[str, float | int]] | None] | None = None,
 ) -> list[dict[str, torch.Tensor]]:
@@ -195,6 +197,8 @@ def _run_streaming(
     results = []
     if frame_ids is not None and len(frame_ids) != num_frames:
         raise ValueError("frame_ids length must match num_frames.")
+    if text_prompts is not None and len(text_prompts) != num_frames:
+        raise ValueError("text_prompts length must match num_frames.")
     if masks is not None and len(masks) != num_frames:
         raise ValueError("masks length must match num_frames.")
     if bbox_prompts is not None and len(bbox_prompts) != num_frames:
@@ -204,9 +208,16 @@ def _run_streaming(
         frame_id_t = (
             torch.tensor([int(frame_ids[i])], dtype=torch.int64) if frame_ids is not None else None
         )
+        text_prompt_t = text_prompts[i] if text_prompts is not None else None
         mask_t = masks[i] if masks is not None else None
         bboxes_t = bbox_prompts[i] if bbox_prompts is not None else None
-        result = node.forward(rgb, frame_id=frame_id_t, mask=mask_t, bboxes=bboxes_t)
+        result = node.forward(
+            rgb,
+            frame_id=frame_id_t,
+            text_prompt=text_prompt_t,
+            mask=mask_t,
+            bboxes=bboxes_t,
+        )
         results.append(result)
     return results
 
@@ -219,54 +230,255 @@ def _run_streaming(
 class TestSAM3TextPropagation:
     @pytest.fixture()
     def node_text(self) -> SAM3TextPropagation:
-        return SAM3TextPropagation(
-            prompt_text="person",
-            name="test_streaming",
+        return SAM3TextPropagation(name="test_streaming")
+
+    @staticmethod
+    def _decode_category_semantics(result: dict[str, torch.Tensor]) -> dict[str, str]:
+        return json.loads(bytes(result["category_semantics"].cpu().tolist()).decode("utf-8"))
+
+    def test_no_prompt_yet_returns_empty_outputs_without_model_init(self) -> None:
+        node = SAM3TextPropagation(name="test_no_prompt")
+        node._ensure_model = MagicMock()
+
+        results = _run_streaming(node, num_frames=2, h=10, w=12, text_prompts=[None, ""])
+
+        assert len(results) == 2
+        for result in results:
+            assert result["mask"].shape == (1, 10, 12)
+            assert torch.count_nonzero(result["mask"]).item() == 0
+            assert result["object_ids"].shape == (1, 0)
+            assert result["detection_scores"].shape == (1, 0)
+            assert result["category_ids"].shape == (1, 0)
+            assert self._decode_category_semantics(result) == {}
+
+        node._ensure_model.assert_not_called()
+
+    def test_first_successful_runtime_text_prompt_starts_propagation(
+        self, node_text: SAM3TextPropagation
+    ) -> None:
+        results = _run_streaming(
+            node_text,
+            num_frames=3,
+            h=10,
+            w=12,
+            text_prompts=[None, "person", None],
         )
 
-    def test_text_prompt_streaming(self, node_text: SAM3TextPropagation) -> None:
-        results = _run_streaming(node_text, num_frames=5, h=10, w=12)
+        assert results[0]["object_ids"].shape == (1, 0)
+        assert results[1]["object_ids"].shape == (1, 2)
+        assert results[1]["category_ids"].shape == (1, 2)
+        assert results[1]["category_ids"].tolist() == [[1, 1]]
+        assert self._decode_category_semantics(results[1]) == {"1": "person"}
+        assert node_text._seed_source_stream_idx == 1
 
-        assert len(results) == 5
-        for r in results:
-            assert r["mask"].shape == (1, 10, 12)
-            assert r["mask"].dtype == torch.int32
-            assert r["object_ids"].shape == (1, 2)
-            assert r["detection_scores"].shape == (1, 2)
+        actual_calls = [
+            call
+            for call in node_text._model.add_prompt.call_args_list
+            if call.kwargs.get("frame_idx") == 0
+        ]
+        assert len(actual_calls) == 1
+        assert all(call.kwargs["text_str"] == "person" for call in actual_calls)
+        assert all(call.kwargs["reset_state"] is True for call in actual_calls)
+        assert node_text._model.propagate_in_video.call_count == 1
 
-        # Verify add_prompt was called exactly once on first frame
-        node_text._model.add_prompt.assert_called_once()
-        call_kwargs = node_text._model.add_prompt.call_args.kwargs
-        assert call_kwargs["frame_idx"] == 0
-        assert call_kwargs["text_str"] == "person"
+    def test_first_prompt_with_zero_matches_still_seeds_propagation(self) -> None:
+        node = SAM3TextPropagation(name="test_first_zero_prompt_seeds")
+        mock_model = _make_mock_model()
 
-    def test_prompt_applied_on_first_frame(self) -> None:
-        node = SAM3TextPropagation(prompt_text="person", name="test_first_frame_prompt")
+        def _add_prompt_side_effect(_state, **kwargs):  # noqa: ANN001
+            if kwargs["text_str"] == "ghost":
+                return 0, {
+                    "out_obj_ids": np.array([], dtype=np.int64),
+                    "out_probs": np.array([], dtype=np.float32),
+                    "out_boxes_xywh": np.zeros((0, 4), dtype=np.float32),
+                    "out_binary_masks": np.zeros((0, 10, 12), dtype=bool),
+                }
+            return _make_mock_model().add_prompt.return_value
+
+        mock_model.add_prompt.side_effect = _add_prompt_side_effect
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        results = _run_streaming(
+            node,
+            num_frames=3,
+            h=10,
+            w=12,
+            text_prompts=["ghost", None, None],
+        )
+
+        assert results[0]["object_ids"].shape == (1, 2)
+        assert self._decode_category_semantics(results[0]) == {"1": "ghost"}
+        assert results[1]["object_ids"].shape == (1, 2)
+        assert results[2]["object_ids"].shape == (1, 2)
+        assert node._seed_source_stream_idx == 0
+        assert mock_model.propagate_in_video.call_count == 1
+        assert any(
+            call.kwargs.get("frame_idx") == 0
+            and call.kwargs.get("text_str") == "ghost"
+            and call.kwargs.get("reset_state") is True
+            for call in mock_model.add_prompt.call_args_list
+        )
+
+    def test_frame_id_port_sets_source_mapping(self) -> None:
+        node = SAM3TextPropagation(name="test_frame_id_mapping")
+        frame_ids = [100, 101, 102, 103, 104]
+        _run_streaming(
+            node,
+            num_frames=5,
+            h=10,
+            w=12,
+            frame_ids=frame_ids,
+            text_prompts=["person", None, None, None, None],
+        )
+        assert node._source_frame_ids == frame_ids
+
+    def test_fallback_stream_idx_when_no_frame_id(self) -> None:
+        node = SAM3TextPropagation(name="test_fallback_stream_idx")
+        _run_streaming(
+            node,
+            num_frames=4,
+            h=10,
+            w=12,
+            frame_ids=None,
+            text_prompts=["person", None, None, None],
+        )
+        assert node._source_frame_ids == [0, 1, 2, 3]
+
+    def test_later_text_prompt_updates_without_reset_and_assigns_new_category(self) -> None:
+        node = SAM3TextPropagation(name="test_later_prompt_update")
         mock_model = _make_mock_model()
         node._model = mock_model
         node._ensure_model = MagicMock()
 
-        _run_streaming(node, num_frames=1, h=10, w=12)
+        def _propagate_from_state(_inference_state, **kwargs):  # noqa: ANN001
+            start_frame_idx = int(kwargs.get("start_frame_idx", 0))
+            frame_idx = start_frame_idx
+            while True:
+                if frame_idx < 2:
+                    masks = np.zeros((1, 10, 12), dtype=bool)
+                    masks[0, 1:5, 1:5] = True
+                    yield (
+                        frame_idx,
+                        {
+                            "out_obj_ids": np.array([1], dtype=np.int64),
+                            "out_probs": np.array([0.95], dtype=np.float32),
+                            "out_binary_masks": masks,
+                            "out_boxes_xywh": np.array([[0.08, 0.10, 0.30, 0.30]], dtype=np.float32),
+                        },
+                    )
+                else:
+                    masks = np.zeros((2, 10, 12), dtype=bool)
+                    masks[0, 1:5, 1:5] = True
+                    masks[1, 5:9, 6:10] = True
+                    yield (
+                        frame_idx,
+                        {
+                            "out_obj_ids": np.array([1, 2], dtype=np.int64),
+                            "out_probs": np.array([0.95, 0.81], dtype=np.float32),
+                            "out_binary_masks": masks,
+                            "out_boxes_xywh": np.array(
+                                [
+                                    [0.08, 0.10, 0.30, 0.30],
+                                    [0.50, 0.50, 0.30, 0.30],
+                                ],
+                                dtype=np.float32,
+                            ),
+                        },
+                    )
+                frame_idx += 1
 
-        mock_model.add_prompt.assert_called_once()
-        assert mock_model.add_prompt.call_args.kwargs["frame_idx"] == 0
+        mock_model.propagate_in_video.side_effect = _propagate_from_state
 
-    def test_frame_id_port_sets_source_mapping(self) -> None:
-        node = SAM3TextPropagation(prompt_text="person", name="test_frame_id_mapping")
-        frame_ids = [100, 101, 102, 103, 104]
-        _run_streaming(node, num_frames=5, h=10, w=12, frame_ids=frame_ids)
-        assert node._source_frame_ids == frame_ids
-
-    def test_fallback_stream_idx_when_no_frame_id(self) -> None:
-        node = SAM3TextPropagation(prompt_text="person", name="test_fallback_stream_idx")
-        _run_streaming(node, num_frames=4, h=10, w=12, frame_ids=None)
-        assert node._source_frame_ids == [0, 1, 2, 3]
-
-    def test_text_prompt_remaps_zero_internal_id(self) -> None:
-        node = SAM3TextPropagation(
-            prompt_text="person",
-            name="test_text_id_remap",
+        results = _run_streaming(
+            node,
+            num_frames=3,
+            h=10,
+            w=12,
+            text_prompts=["person", None, "car"],
         )
+
+        assert results[0]["category_ids"].tolist() == [[1]]
+        assert results[2]["object_ids"].tolist() == [[1, 2]]
+        assert results[2]["category_ids"].tolist() == [[1, 2]]
+        assert self._decode_category_semantics(results[2]) == {"1": "person", "2": "car"}
+        assert node._model.propagate_in_video.call_count == 2
+        assert [call.kwargs.get("start_frame_idx") for call in node._model.propagate_in_video.call_args_list] == [
+            0,
+            2,
+        ]
+        assert any(
+            call.kwargs.get("frame_idx") == 2
+            and call.kwargs.get("text_str") == "car"
+            and call.kwargs.get("reset_state") is False
+            for call in node._model.add_prompt.call_args_list
+        )
+        assert node._model.add_mask.call_count == 0
+
+    def test_later_zero_match_prompt_still_applies_and_restarts_propagation(self) -> None:
+        node = SAM3TextPropagation(name="test_later_zero_prompt")
+        mock_model = _make_mock_model()
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        def _add_prompt_side_effect(_state, **kwargs):  # noqa: ANN001
+            if kwargs["text_str"] == "ghost":
+                return 0, {
+                    "out_obj_ids": np.array([], dtype=np.int64),
+                    "out_probs": np.array([], dtype=np.float32),
+                    "out_boxes_xywh": np.zeros((0, 4), dtype=np.float32),
+                    "out_binary_masks": np.zeros((0, 10, 12), dtype=bool),
+                }
+            return _make_mock_model().add_prompt.return_value
+
+        mock_model.add_prompt.side_effect = _add_prompt_side_effect
+
+        results = _run_streaming(
+            node,
+            num_frames=3,
+            h=10,
+            w=12,
+            text_prompts=["person", None, "ghost"],
+        )
+
+        assert results[2]["object_ids"].tolist() == [[1, 2]]
+        assert results[2]["category_ids"].tolist() == [[1, 1]]
+        assert self._decode_category_semantics(results[2]) == {"1": "person", "2": "ghost"}
+        assert node._model.propagate_in_video.call_count == 2
+        assert any(
+            call.kwargs.get("frame_idx") == 2
+            and call.kwargs.get("text_str") == "ghost"
+            and call.kwargs.get("reset_state") is False
+            for call in mock_model.add_prompt.call_args_list
+        )
+        assert mock_model.add_mask.call_count == 0
+
+    def test_repeated_same_prompt_reuses_category_and_restarts_generator(self) -> None:
+        node = SAM3TextPropagation(name="test_repeat_same_prompt")
+        mock_model = _make_mock_model()
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        results = _run_streaming(
+            node,
+            num_frames=2,
+            h=10,
+            w=12,
+            text_prompts=["person", "person"],
+        )
+
+        assert results[0]["category_ids"].tolist() == [[1, 1]]
+        assert results[1]["category_ids"].tolist() == [[1, 1]]
+        assert self._decode_category_semantics(results[1]) == {"1": "person"}
+        assert node._model.propagate_in_video.call_count == 2
+        assert mock_model.add_mask.call_count == 0
+        assert [call.kwargs.get("reset_state") for call in mock_model.add_prompt.call_args_list] == [
+            True,
+            False,
+        ]
+
+    def test_text_prompt_remaps_zero_internal_id_and_aligns_category_ids(self) -> None:
+        node = SAM3TextPropagation(name="test_text_id_remap")
         mock_model = _make_mock_model()
 
         def _gen(_inference_state, **kwargs):  # noqa: ANN001
@@ -298,11 +510,13 @@ class TestSAM3TextPropagation:
         node._model = mock_model
         node._ensure_model = MagicMock()
 
-        results = _run_streaming(node, num_frames=3, h=10, w=12)
+        results = _run_streaming(node, num_frames=3, h=10, w=12, text_prompts=["person", None, None])
         first_ids: list[int] | None = None
         for result in results:
             obj_ids = [int(v) for v in result["object_ids"][0].cpu().tolist()]
+            category_ids = [int(v) for v in result["category_ids"][0].cpu().tolist()]
             assert len(obj_ids) == 2
+            assert category_ids == [1, 1]
             assert all(v > 0 for v in obj_ids)
             assert len(set(obj_ids)) == 2
             if first_ids is None:
@@ -316,7 +530,11 @@ class TestSAM3TextPropagation:
                 assert obj_id in mask_values
 
     def test_single_generator_called_once(self, node_text: SAM3TextPropagation) -> None:
-        _run_streaming(node_text, num_frames=5)
+        _run_streaming(
+            node_text,
+            num_frames=5,
+            text_prompts=["person", None, None, None, None],
+        )
         assert node_text._model.propagate_in_video.call_count == 1
         call_kwargs = node_text._model.propagate_in_video.call_args.kwargs
         assert call_kwargs["start_frame_idx"] == 0
@@ -702,7 +920,6 @@ class TestValidation:
     def test_output_specs_compatible(self) -> None:
         """Output specs should match TrackingOverlayNode / TrackingCocoJsonNode inputs."""
         for cls in [
-            SAM3TextPropagation,
             SAM3BboxPropagation,
             SAM3PointPropagation,
             SAM3MaskPropagation,
@@ -714,8 +931,22 @@ class TestValidation:
             assert specs["mask"].dtype == torch.int32
             assert specs["object_ids"].dtype == torch.int64
 
+        text_specs = SAM3TextPropagation.OUTPUT_SPECS
+        assert text_specs["mask"].dtype == torch.int32
+        assert text_specs["object_ids"].dtype == torch.int64
+        assert text_specs["detection_scores"].dtype == torch.float32
+        assert text_specs["category_ids"].dtype == torch.int64
+        assert text_specs["category_semantics"].dtype == torch.uint8
+
+    def test_text_runtime_contract_exposes_optional_port_and_no_constructor_prompt(self) -> None:
+        node = SAM3TextPropagation(name="test_text_specs")
+
+        assert "text_prompt" in SAM3TextPropagation.INPUT_SPECS
+        assert SAM3TextPropagation.INPUT_SPECS["text_prompt"].optional is True
+        assert "prompt_text" not in node.hparams
+
     def test_detector_guard_installed_on_ensure_model(self) -> None:
-        node = SAM3TextPropagation(prompt_text="person", name="test_guard")
+        node = SAM3TextPropagation(name="test_guard")
         mock_model = _make_mock_model()
         mock_detector = MagicMock()
         mock_detector._streaming_guard_installed = False
