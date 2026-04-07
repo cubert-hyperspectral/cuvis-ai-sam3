@@ -863,6 +863,8 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             self._add_output_per_object(
                 inference_state, frame_idx, current_out, storage_key
             )
+            # Trim old per-object outputs to free GPU memory held by tensor slices
+            self._trim_output_per_object(inference_state, frame_idx)
             inference_state["frames_already_tracked"][frame_idx] = {"reverse": reverse}
 
             # Resize the output mask to the original video resolution (we directly use
@@ -902,6 +904,46 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             if maskmem_pos_enc is not None:
                 obj_out["maskmem_pos_enc"] = [x[obj_slice] for x in maskmem_pos_enc]
             obj_output_dict[storage_key][frame_idx] = obj_out
+
+    def _trim_output_per_object(self, inference_state, frame_idx):
+        """
+        Trim old entries from output_dict_per_obj to prevent unbounded memory
+        growth. The per-object slices share tensor storage with output_dict, so
+        old entries here keep large tensors (maskmem_features, maskmem_pos_enc)
+        alive even after output_dict is trimmed.
+        """
+        if self.training:
+            return
+        r = self.memory_temporal_stride_for_eval
+        # Trim the same frame that track_step trims in output_dict
+        past_frame_idx = frame_idx - r * self.num_maskmem
+        output_dict_per_obj = inference_state["output_dict_per_obj"]
+        for obj_output_dict in output_dict_per_obj.values():
+            past_out = obj_output_dict["non_cond_frame_outputs"].get(
+                past_frame_idx, None
+            )
+            if past_out is not None and "maskmem_features" in past_out:
+                obj_output_dict["non_cond_frame_outputs"][past_frame_idx] = {
+                    "pred_masks": past_out["pred_masks"],
+                    "obj_ptr": past_out["obj_ptr"],
+                    "object_score_logits": past_out["object_score_logits"],
+                }
+        # Aggressively delete very old entries that are beyond the memory
+        # window. _prepare_memory_conditioned_features only accesses at most
+        # max_obj_ptrs_in_encoder recent frames via frame_filter, so anything
+        # further back can be fully removed from both dicts.
+        evict_before = frame_idx - 4 * self.max_obj_ptrs_in_encoder
+        if evict_before > 0:
+            output_dict = inference_state["output_dict"]
+            non_cond = output_dict["non_cond_frame_outputs"]
+            stale_keys = [k for k in non_cond if k < evict_before]
+            for k in stale_keys:
+                del non_cond[k]
+            for obj_output_dict in output_dict_per_obj.values():
+                obj_non_cond = obj_output_dict["non_cond_frame_outputs"]
+                stale_keys = [k for k in obj_non_cond if k < evict_before]
+                for k in stale_keys:
+                    del obj_non_cond[k]
 
     @torch.inference_mode()
     def clear_all_points_in_frame(

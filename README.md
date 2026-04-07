@@ -62,44 +62,44 @@ This breakthrough is driven by an innovative data engine that has automatically 
 - A new suite of improved model checkpoints (denoted as **SAM 3.1**) are released on [Hugging Face](https://huggingface.co/facebook/sam3.1). See [`RELEASE_SAM3p1.md`](RELEASE_SAM3p1.md) for full details.
   * To use the new SAM 3.1 checkpoints, you need the latest model code from this repo. If you have installed an earlier version of this repo, pull the latest code from this repo (with `git pull`), and then reinstall the repo following [Installation](#installation) below.
 
+## Cuvis.AI Plugin
+
+This repository is a port of SAM 3 to the [Cuvis.AI](https://docs.cuvis.ai) framework for building ML pipelines to process hyperspectral data. It is imported into [Cuvis.AI](https://github.com/cubert-hyperspectral/cuvis-ai) as a plugin, adding the following pipeline nodes:
+
+| Node | Description |
+|------|-------------|
+| `SAM3TextPropagation` | Text/concept-based object detection and tracking |
+| `SAM3BboxPropagation` | Bounding-box prompt tracking |
+| `SAM3PointPropagation` | Point-based prompt tracking |
+| `SAM3MaskPropagation` | Mask/label-map based tracking |
+| `SAM3SegmentEverything` | Prompt-free instance segmentation |
+
+See the [example pipelines](https://github.com/cubert-hyperspectral/cuvis-ai/tree/main/examples/object_tracking/sam3) for usage within Cuvis.AI.
+
+## Windows Installer (CuvisAI Phase 11B)
+
+This repository now includes a Windows installer pipeline under `installer/` for:
+
+- `sam3-rest-api.exe` (REST server)
+- `sam3-tray.exe` (system tray launcher)
+- `download-weights.exe` (checkpoint downloader)
+
+Build from repo root:
+
+```powershell
+installer\build.bat
+```
+
+Installer output:
+
+- `installer\Output\CuvisAI-SAM3-Server-<version>-Setup.exe`
+
 ## Installation
 
-### Prerequisites
-
-- Python 3.12 or higher
-- PyTorch 2.7 or higher
-- CUDA-compatible GPU with CUDA 12.6 or higher
-
-1. **Create a new Conda environment:**
-
 ```bash
-conda create -n sam3 python=3.12
-conda deactivate
-conda activate sam3
-```
-
-2. **Install PyTorch with CUDA support:**
-
-```bash
-pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
-```
-
-3. **Clone the repository and install the package:**
-
-```bash
-git clone https://github.com/facebookresearch/sam3.git
-cd sam3
-pip install -e .
-```
-
-4. **Install additional dependencies for example notebooks or development:**
-
-```bash
-# For running example notebooks
-pip install -e ".[notebooks]"
-
-# For development
-pip install -e ".[train,dev]"
+git clone https://github.com/cubert-hyperspectral/cuvis-ai-sam3.git
+cd cuvis-ai-sam3
+uv sync --all-extras
 ```
 
 5. **Optional dependencies for faster inference**

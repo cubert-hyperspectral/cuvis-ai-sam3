@@ -4,6 +4,8 @@
 
 import logging
 
+logger = logging.getLogger(__name__)
+
 import torch
 import torch.nn.functional as F
 from sam3.model.memory import SimpleMaskEncoder
@@ -536,7 +538,15 @@ class Sam3TrackerBase(torch.nn.Module):
             must_include = frame_idx + 1
 
         valid_indices = []
+        # Limit scan depth to avoid O(N) iteration over all past frames.
+        # We scan at most 4x the number of needed pointers; beyond that,
+        # old entries are evicted anyway.
+        max_scan = 4 * max_num
+        scanned = 0
         for i in range(start, end, step):
+            scanned += 1
+            if scanned > max_scan:
+                break
             if (
                 i not in output_dict["non_cond_frame_outputs"]
                 or "eff_iou_score" not in output_dict["non_cond_frame_outputs"][i]
@@ -1079,7 +1089,7 @@ class Sam3TrackerBase(torch.nn.Module):
             past_out = output_dict["non_cond_frame_outputs"].get(past_frame_idx, None)
 
             if past_out is not None:
-                print(past_out.get("eff_iou_score", 0))
+                logger.debug("eff_iou_score for frame %d: %s", past_frame_idx, past_out.get("eff_iou_score", 0))
                 if (
                     self.use_memory_selection
                     and past_out.get("eff_iou_score", 0) < self.mf_threshold

@@ -1,135 +1,246 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sam3"
+name = "cuvis-ai-sam3"
 dynamic = ["version"]
-description = "SAM3 (Segment Anything Model 3) implementation"
+description = "SAM3 (Segment Anything Model 3) with a cuvis.ai-compatible plugin package."
 readme = "README.md"
-requires-python = ">=3.8"
-license = {file = "LICENSE"}
+requires-python = ">=3.11,<3.12"
+license = { file = "LICENSE" }
 authors = [
-    {name = "Meta AI Research"}
+    { name = "Meta AI Research" },
+    { name = "Cubert GmbH, Ulm, Germany", email = "cuvis.ai@cubert-gmbh.com" },
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+    "Operating System :: OS Independent",
+]
+keywords = [
+    "cuvis",
+    "hyperspectral",
+    "SAM3",
+    "segment-anything",
+    "video-tracking",
+    "computer-vision",
+    "deep-learning",
+    "plugin",
 ]
 dependencies = [
+    # cuvis-ai-core framework (provides torch, torchvision, numpy, Node base class, plugin system)
+    # Note: cuvis-ai (node catalog) is NOT needed -- only the core framework.
+    "cuvis-ai-core>=0.2.0",
+    # SAM3-specific dependencies (not provided by cuvis-ai-core)
     "timm>=1.0.17",
-    "numpy>=1.26,<2",
     "tqdm",
     "ftfy==6.1.1",
     "regex",
     "iopath>=0.1.10",
     "typing_extensions",
     "huggingface_hub",
+    "einops",
+    "decord",
+    # Triton is imported by sam3/model/edt.py on module import.
+    "triton-windows; platform_system == 'Windows'",
+    "triton; platform_system != 'Windows'",
+    "psutil",
+    # sam3/model_builder.py imports pkg_resources at runtime.
+    "setuptools<81",
+    "opencv-python-headless>=4.13.0.92",
+    "click>=8.3.1",
+    "uvicorn>=0.41.0",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.13.1",
+    "fastapi>=0.135.1",
+    "sse-starlette>=3.3.2",
 ]
 
 [project.optional-dependencies]
+rest = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "sse-starlette>=2.0",
+    "pydantic-settings>=2.0",
+]
 dev = [
     "pytest",
     "pytest-cov",
-    "black==24.2.0",
-    "ufmt==2.8.0",
-    "ruff-api==0.1.0",
-    "usort==1.0.2",
-    "gitpython==3.1.31",
-    "yt-dlp",
-    "pandas",
-    "opencv-python",
-    "pycocotools",
-    "numba",
-    "python-rapidjson",
+    "ruff",
+    "mypy",
+    "ipython",
+    "interrogate>=1.5.0",
+    # --- Release automation & security ---
+    "twine>=6.2.0",
+    "pip-audit>=2.7.0",
+    "bandit[toml]>=1.7.0",
+    "detect-secrets>=1.4.0",
+    "pip-licenses>=4.0.0",
+    "cyclonedx-bom>=4.0.0",
+    # --- REST API test dependencies ---
+    "httpx>=0.27",
 ]
-notebooks = [
-    "matplotlib",
-    "jupyter",
-    "notebook",
-    "ipywidgets",
-    "ipycanvas",
-    "ipympl",
-    "pycocotools",
-    "decord",
-    "opencv-python",
-    "einops",
-    "scikit-image",
-    "scikit-learn",
-]
-train = [
-    "hydra-core",
-    "submitit",
-    "tensorboard",
-    "zstandard",
-    "scipy",
-    "torchmetrics",
-    "fvcore",
-    "fairscale",
-    "scikit-image",
-    "scikit-learn",
-]
+
+[project.scripts]
+rest-api = "rest_api.__main__:main"
 
 [project.urls]
-"Homepage" = "https://github.com/facebookresearch/sam3"
-"Bug Tracker" = "https://github.com/facebookresearch/sam3/issues"
+Homepage = "https://www.cubert-hyperspectral.com/"
+Repository = "https://github.com/cubert-hyperspectral/cuvis-ai-sam3"
+Changelog = "https://github.com/cubert-hyperspectral/cuvis-ai-sam3/releases"
+Issues = "https://github.com/cubert-hyperspectral/cuvis-ai-sam3/issues"
 
 [tool.setuptools.packages.find]
-include = ["sam3*"]
-exclude = ["build*", "scripts*", "examples*"]
+include = ["sam3*", "cuvis_ai_sam3*", "rest_api*"]
 
 [tool.setuptools.package-data]
 sam3 = ["assets/*.txt.gz"]
 
-[tool.setuptools.dynamic]
-version = {attr = "sam3.__version__"}
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+# Local development alternative (uncomment to use local path instead)
+# cuvis-ai-core = { path = "../../cuvis-ai-core/cuvis-ai-core-sam3", editable = true }
 
-[tool.black]
-line-length = 88
-target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
-include = '\.pyi?$'
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
-[tool.isort]
-profile = "black"
-multi_line_output = 3
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# Exclude upstream SAM3 fork and Meta scripts from ALL ruff processing (format + lint)
+extend-exclude = ["sam3", "scripts", "examples"]
 
-[tool.usort]
-first_party_detection = false
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
 
-[tool.ufmt]
-formatter = "ruff-api"
-
-[tool.mypy]
-python_version = "3.12"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-
-[[tool.mypy.overrides]]
-module = [
-    "torch.*",
-    "torchvision.*",
-    "timm.*",
-    "numpy.*",
-    "PIL.*",
-    "tqdm.*",
-    "ftfy.*",
-    "regex.*",
-    "iopath.*",
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+    "B",
+    "UP",
+    "C4",
 ]
-ignore_missing_imports = true
+extend-select = [
+    "ANN201",
+    "ANN202",
+    "ANN204",
+]
+ignore = [
+    "ANN401",
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Ignore upstream SAM3 code -- do not lint the fork
+"sam3/**" = ["ALL"]
+"scripts/**" = ["ALL"]
+"examples/**" = ["ALL"]
+"docs/**" = [
+    "ANN201",
+    "ANN202",
+    "ANN204",
+]
+"tests/**" = [
+    "ANN201",
+    "ANN202",
+    "ANN204",
+]
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+local_scheme = "node-and-date"
+
+[dependency-groups]
+dev = [
+    "setuptools-scm>=9.2.2",
+]
 
 [tool.pytest.ini_options]
+addopts = "-v -ra --showlocals --strict-markers --tb=short --color=yes"
 testpaths = ["tests"]
+xfail_strict = true
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+norecursedirs = ".* build dist CVS _darcs {arch} *.egg venv .venv .git .hg .bzr .tox __pycache__ node_modules sam3"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+    "ignore:Module already imported so cannot be rewritten",
+    "ignore:.*num_workers.*:UserWarning",
+]
+markers = [
+    "unit: Unit tests for individual components",
+    "integration: Integration tests across multiple components",
+    "slow: Tests that take significant time to run",
+    "gpu: Tests that require GPU hardware",
+]
+log_cli = false
+log_cli_level = "INFO"
+minversion = "7.0"
+
+[tool.interrogate]
+ignore-init-method = true
+ignore-init-module = false
+ignore-magic = false
+ignore-module = false
+ignore-nested-functions = false
+ignore-nested-classes = false
+ignore-private = false
+ignore-property-decorators = false
+ignore-semiprivate = false
+ignore-setters = false
+fail-under = 80.0
+exclude = [
+    "setup.py",
+    "docs",
+    "build",
+    "tests",
+    "sam3",
+    "scripts",
+    "examples",
+    "cuvis_ai_sam3/node/sam3_segment_everything.py",
+    "cuvis_ai_sam3/node/sam3_streaming_propagation.py",
+]
+ignore-regex = ["^get$", "^set$", "^main$"]
+verbose = 2
+quiet = false
+whitelist-regex = []
+color = true
+omit-covered-files = false
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+exclude = ["tests", "build", "dist", "sam3", "scripts", "examples"]
+
+# Skip upstream sam3 code when following imports
+[[tool.mypy.overrides]]
+module = "sam3.*"
+follow_imports = "skip"
+
+[tool.bandit]
+exclude_dirs = ["tests", "sam3", "scripts", "examples"]
+skips = ["B101"]  # Skip assert_used check

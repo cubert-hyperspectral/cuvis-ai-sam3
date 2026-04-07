@@ -386,6 +386,7 @@ class Sam3VideoBase(nn.Module):
         orig_vid_width: int,
         is_image_only: bool = False,
         allow_new_detections: bool = True,
+        disable_hotstart_retro_suppression: bool = False,
     ):
         """
         This function handles one-step inference for the DenseTracking model in an SPMD manner.
@@ -450,6 +451,7 @@ class Sam3VideoBase(nn.Module):
                 tracker_metadata_prev=tracker_metadata_prev,
                 tracker_states_local=tracker_states_local,
                 is_image_only=is_image_only,
+                disable_hotstart_retro_suppression=disable_hotstart_retro_suppression,
             )
         )
 
@@ -737,6 +739,7 @@ class Sam3VideoBase(nn.Module):
         tracker_metadata_prev: Dict[str, npt.NDArray],
         tracker_states_local: List[Any],
         is_image_only: bool = False,
+        disable_hotstart_retro_suppression: bool = False,
     ):
         # initialize new metadata from previous metadata (its values will be updated later)
         tracker_metadata_new = self._create_planning_metadata(tracker_metadata_prev)
@@ -797,8 +800,24 @@ class Sam3VideoBase(nn.Module):
             # here `rank0_metadata` contains metadata stored on (and only accessible to) GPU 0;
             # we avoid broadcasting them to other GPUs to save communication cost, assuming
             # that `rank0_metadata` is not needed by other GPUs
-            rank0_metadata_new = deepcopy(tracker_metadata_prev["rank0_metadata"])
-            if not hasattr(self, "_warm_up_complete") or self._warm_up_complete:
+            # Shallow-copy rank0_metadata — nested structures (unmatched_frame_inds,
+            # overlap_pair_to_frame_inds, suppressed_obj_ids, etc.) are append-only
+            # and the previous metadata is discarded after this frame. A deepcopy
+            # here caused O(N²) overhead as these structures grow per-frame.
+            rank0_metadata_new = dict(tracker_metadata_prev["rank0_metadata"])
+            if "masklet_confirmation" in rank0_metadata_new:
+                # masklet_confirmation arrays are replaced (not mutated) in
+                # update_masklet_confirmation_status, so a shallow dict copy suffices.
+                rank0_metadata_new["masklet_confirmation"] = dict(
+                    rank0_metadata_new["masklet_confirmation"]
+                )
+            if disable_hotstart_retro_suppression:
+                # Keep hotstart metadata stable for this frame, but skip any suppression/removal.
+                # This preserves tracker state so long-range propagation is not cut short by
+                # hotstart-unmatched thresholds.
+                obj_ids_newly_removed = set()
+                rank0_metadata_new["suppressed_obj_ids"][frame_idx] = set()
+            elif not hasattr(self, "_warm_up_complete") or self._warm_up_complete:
                 obj_ids_newly_removed, rank0_metadata_new = self._process_hotstart(
                     frame_idx=frame_idx,
                     num_frames=num_frames,
@@ -1150,8 +1169,6 @@ class Sam3VideoBase(nn.Module):
 
     def _create_planning_metadata(self, tracker_metadata_prev):
         """Create the metadata dict for the planning phase from previous metadata."""
-        from copy import deepcopy
-
         score_key = "obj_id_to_tracker_score_frame_wise"
         if score_key not in tracker_metadata_prev:
             score_key = "obj_id_to_sam2_score_frame_wise"
@@ -1160,9 +1177,11 @@ class Sam3VideoBase(nn.Module):
             "obj_ids_all_gpu": None,
             "num_obj_per_gpu": deepcopy(tracker_metadata_prev["num_obj_per_gpu"]),
             "obj_id_to_score": deepcopy(tracker_metadata_prev["obj_id_to_score"]),
-            score_key: deepcopy(tracker_metadata_prev[score_key]),
+            # This mapping is append-only across frames, so sharing it avoids
+            # quadratic metadata growth during long tracking runs.
+            score_key: tracker_metadata_prev[score_key],
             "obj_id_to_last_occluded": {},
-            "max_obj_id": deepcopy(tracker_metadata_prev["max_obj_id"]),
+            "max_obj_id": tracker_metadata_prev["max_obj_id"],
         }
         return metadata
 
@@ -1352,6 +1371,7 @@ class Sam3VideoBase(nn.Module):
 
             # propagate one frame
             num_frames_propagated = 0
+            out_frame_idx = None
             for out in self.tracker.propagate_in_video(
                 inference_state,
                 start_frame_idx=frame_idx,
@@ -1557,11 +1577,21 @@ class Sam3VideoBase(nn.Module):
             else frame_idx + self.hotstart_delay
         )
 
-        # Step 1: log the frame index where each object ID first appears
-        for obj_id in new_det_obj_ids:
+        def _ensure_hotstart_metadata(obj_id: int) -> int:
+            # Prompt-seeded tracks may bypass detector-based initialization; hotstart
+            # still needs a first-seen frame and keep-alive entry for those IDs.
             if obj_id not in obj_first_frame_idx:
                 obj_first_frame_idx[obj_id] = frame_idx
-            assert obj_id not in trk_keep_alive
+                logger.debug(
+                    f"Initializing missing hotstart metadata for object {obj_id} at frame {frame_idx}"
+                )
+            if obj_id not in trk_keep_alive:
+                trk_keep_alive[obj_id] = self.init_trk_keep_alive
+            return obj_first_frame_idx[obj_id]
+
+        # Step 1: log the frame index where each object ID first appears
+        for obj_id in new_det_obj_ids:
+            _ensure_hotstart_metadata(obj_id)
             trk_keep_alive[obj_id] = self.init_trk_keep_alive
 
         matched_trks = set()
@@ -1569,11 +1599,13 @@ class Sam3VideoBase(nn.Module):
         for matched_trks_per_det in det_to_matched_trk_obj_ids.values():
             matched_trks.update(matched_trks_per_det)
         for obj_id in matched_trks:
+            _ensure_hotstart_metadata(obj_id)
             # NOTE: To minimize number of configurable params, we use the hotstart_unmatch_thresh to set the max value of trk_keep_alive
             trk_keep_alive[obj_id] = min(
                 self.max_trk_keep_alive, trk_keep_alive[obj_id] + 1
             )
         for obj_id in unmatched_trk_obj_ids:
+            _ensure_hotstart_metadata(obj_id)
             unmatched_frame_inds[obj_id].append(frame_idx)
             # NOTE: To minimize number of configurable params, we use the hotstart_unmatch_thresh to set the min value of trk_keep_alive
             # The max keep alive is 2x the min, means the model prefers to keep the prediction rather than suppress it if it was matched long enough.
@@ -1582,6 +1614,7 @@ class Sam3VideoBase(nn.Module):
             )
         if self.decrease_trk_keep_alive_for_empty_masklets:
             for obj_id in empty_trk_obj_ids:
+                _ensure_hotstart_metadata(obj_id)
                 # NOTE: To minimize number of configurable params, we use the hotstart_unmatch_thresh to set the min value of trk_keep_alive
                 trk_keep_alive[obj_id] = max(
                     self.min_trk_keep_alive, trk_keep_alive[obj_id] - 1
@@ -1596,10 +1629,11 @@ class Sam3VideoBase(nn.Module):
         for obj_id, frame_indices in unmatched_frame_inds.items():
             if obj_id in removed_obj_ids or obj_id in obj_ids_newly_removed:
                 continue  # skip if the object is already removed
+            first_frame_idx = _ensure_hotstart_metadata(obj_id)
             if len(frame_indices) >= self.hotstart_unmatch_thresh:
                 is_within_hotstart = (
-                    obj_first_frame_idx[obj_id] > hotstart_diff and not reverse
-                ) or (obj_first_frame_idx[obj_id] < hotstart_diff and reverse)
+                    first_frame_idx > hotstart_diff and not reverse
+                ) or (first_frame_idx < hotstart_diff and reverse)
                 if is_within_hotstart:
                     obj_ids_newly_removed.add(obj_id)
                     logger.debug(
@@ -1625,9 +1659,9 @@ class Sam3VideoBase(nn.Module):
             # if there are multiple matched track ids, we need to find the one that appeared first;
             # these later appearing ids may be removed since they may be considered as duplicates
             first_appear_obj_id = (
-                min(matched_trk_obj_ids, key=lambda x: obj_first_frame_idx[x])
+                min(matched_trk_obj_ids, key=_ensure_hotstart_metadata)
                 if not reverse
-                else max(matched_trk_obj_ids, key=lambda x: obj_first_frame_idx[x])
+                else max(matched_trk_obj_ids, key=_ensure_hotstart_metadata)
             )
             for obj_id in matched_trk_obj_ids:
                 if obj_id != first_appear_obj_id:
@@ -1639,8 +1673,9 @@ class Sam3VideoBase(nn.Module):
         for (first_obj_id, obj_id), frame_indices in overlap_pair_to_frame_inds.items():
             if obj_id in removed_obj_ids or obj_id in obj_ids_newly_removed:
                 continue  # skip if the object is already removed
-            if (obj_first_frame_idx[obj_id] > hotstart_diff and not reverse) or (
-                obj_first_frame_idx[obj_id] < hotstart_diff and reverse
+            first_frame_idx = _ensure_hotstart_metadata(obj_id)
+            if (first_frame_idx > hotstart_diff and not reverse) or (
+                first_frame_idx < hotstart_diff and reverse
             ):
                 if len(frame_indices) >= self.hotstart_dup_thresh:
                     obj_ids_newly_removed.add(obj_id)
@@ -1650,6 +1685,16 @@ class Sam3VideoBase(nn.Module):
                     )
 
         removed_obj_ids.update(obj_ids_newly_removed)
+        # Clean up metadata for newly removed objects to prevent unbounded growth
+        for obj_id in obj_ids_newly_removed:
+            unmatched_frame_inds.pop(obj_id, None)
+            trk_keep_alive.pop(obj_id, None)
+            # Clean overlap pairs involving the removed object
+            keys_to_remove = [
+                k for k in overlap_pair_to_frame_inds if obj_id in k
+            ]
+            for k in keys_to_remove:
+                del overlap_pair_to_frame_inds[k]
         return obj_ids_newly_removed, rank0_metadata
 
     def _tracker_update_memories(

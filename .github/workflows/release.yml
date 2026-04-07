@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate Release Candidate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Run focused tests
+        run: |
+          uv run pytest \
+            tests/cuvis_ai_sam3/test_sam3_streaming_propagation.py \
+            tests/cuvis_ai_sam3/test_sam3_segment_everything.py \
+            tests/cuvis_ai_sam3/test_sam3_video_base.py \
+            tests/rest_api/test_routes.py \
+            tests/rest_api/test_session_manager.py
+
+      - name: Run ruff format check
+        run: uv run ruff format --check .
+
+      - name: Run ruff linter
+        run: uv run ruff check .
+
+  build:
+    name: Build And Validate Artifacts
+    needs: validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Validate distributions
+        run: uv run twine check dist/*
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          export TAG_VERSION
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          dist_dir = pathlib.Path("dist")
+          wheel = next(dist_dir.glob("*.whl"))
+          match = re.match(r"^cuvis_ai_sam3-([^-]+)-", wheel.name)
+          if match is None:
+              raise SystemExit(f"Could not parse version from wheel name: {wheel.name}")
+
+          package_version = match.group(1)
+          expected = os.environ["TAG_VERSION"]
+          print(f"Package version: {package_version}")
+          print(f"Tag version: {expected}")
+          if package_version != expected:
+              raise SystemExit(
+                  f"Tag version {expected!r} does not match package version {package_version!r}."
+              )
+          PY
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          retention-days: 7
+
+  create-release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Extract changelog entry
+        id: changelog
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          version = os.environ["GITHUB_REF_NAME"][1:]
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = re.compile(
+              rf"^## {re.escape(version)}(?:\s+-.*)?$\n(?P<body>.*?)(?=^## |\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          match = pattern.search(changelog)
+          if match is None:
+              raise SystemExit(
+                  f"No CHANGELOG.md entry found for version {version}. "
+                  f"Expected a heading starting with '## {version}'."
+              )
+
+          release_notes = match.group(0).strip() + "\n"
+          pathlib.Path("release_notes.md").write_text(release_notes, encoding="utf-8")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+          PY
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release v${{ steps.changelog.outputs.version }}
+          body_path: release_notes.md
+          files: dist/*

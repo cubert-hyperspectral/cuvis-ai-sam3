@@ -30,6 +30,7 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!installer/*.spec
 
 # Installer logs
 pip-log.txt
@@ -151,3 +152,9 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
+.history/
+.claude/
+.cursor/
+.ruff_cache/
+models/
+outputs/
