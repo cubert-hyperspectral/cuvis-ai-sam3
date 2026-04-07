@@ -3,6 +3,7 @@
 # pyre-unsafe
 
 from functools import wraps
+import warnings
 
 import torch
 from sam3.model.data_misc import BatchedDatapoint, NestedTensor
@@ -64,20 +65,34 @@ def compile_wrapper(
     """Compile with recursive_contiguous on inputs and recursive_clone on outputs.
     Used for SAM2 tracker components that need contiguous inputs for CUDA graphs."""
     compiled_fn = torch.compile(fn, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
+    compile_enabled = True
 
     def compiled_fn_wrapper(*args, **kwargs):
+        nonlocal compile_enabled
         with torch.autograd.profiler.record_function(
             f"compiled {fn}" if name is None else name
         ):
-            # Ensure each invocation starts a fresh CUDA graph step boundary.
-            # This avoids stale tensor output reuse between successive runs.
-            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                torch.compiler.cudagraph_mark_step_begin()
             cont_args = recursive_contiguous(args)
             cont_kwargs = recursive_contiguous(kwargs)
-            result = compiled_fn(*cont_args, **cont_kwargs)
-            cloned_result = recursive_clone(result)
-            return cloned_result
+            if compile_enabled:
+                try:
+                    # Ensure each invocation starts a fresh CUDA graph step boundary.
+                    # This avoids stale tensor output reuse between successive runs.
+                    if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                        torch.compiler.cudagraph_mark_step_begin()
+                    result = compiled_fn(*cont_args, **cont_kwargs)
+                    return recursive_clone(result)
+                except Exception as exc:
+                    if exc.__class__.__name__ != "TritonMissing":
+                        raise
+                    compile_enabled = False
+                    warnings.warn(
+                        "torch.compile requested but Triton is unavailable; "
+                        "falling back to eager execution for this function.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            return fn(*cont_args, **cont_kwargs)
 
     return compiled_fn_wrapper
 

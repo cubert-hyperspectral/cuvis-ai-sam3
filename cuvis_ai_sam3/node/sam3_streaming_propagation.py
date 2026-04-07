@@ -1432,6 +1432,9 @@ class SAM3PointPropagation(SAM3TrackerInference):
             point_labels=point_labels,
             obj_id=self._prompt_obj_id,
         )
+        # Streaming starts from a fresh state with no cached base predictions.
+        # Force a full propagation pass instead of tracker-only partial propagation.
+        self._inference_state["action_history"].clear()
 
 
 class SAM3MaskPropagation(SAM3TrackerInference):

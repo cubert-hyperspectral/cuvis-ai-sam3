@@ -34,6 +34,8 @@ class Sam3BasePredictor:
         # Subclasses must populate these
         self.model = None
         self._all_inference_states: Dict[str, dict] = {}
+        # Backward-compatible alias used by local REST/service code.
+        self._ALL_INFERENCE_STATES = self._all_inference_states
 
     # ── Request dispatch ──────────────────────────────────────────────
 
@@ -56,7 +58,11 @@ class Sam3BasePredictor:
                 point_labels=request.get("point_labels", None),
                 clear_old_points=request.get("clear_old_points", True),
                 bounding_boxes=request.get("bounding_boxes", None),
-                bounding_box_labels=request.get("bounding_box_labels", None),
+                bounding_box_labels=(
+                    request.get("bounding_box_labels", None)
+                    if request.get("bounding_box_labels", None) is not None
+                    else request.get("bounding_box_is_positive", None)
+                ),
                 clear_old_boxes=request.get("clear_old_boxes", True),
                 output_prob_thresh=request.get(
                     "output_prob_thresh",
@@ -95,6 +101,10 @@ class Sam3BasePredictor:
                 output_prob_thresh=request.get(
                     "output_prob_thresh",
                     getattr(self, "default_output_prob_thresh", 0.5),
+                ),
+                disable_hotstart_retro_suppression=request.get(
+                    "disable_hotstart_retro_suppression",
+                    False,
                 ),
             )
         else:
@@ -140,6 +150,7 @@ class Sam3BasePredictor:
         clear_old_points: bool = True,
         bounding_boxes=None,
         bounding_box_labels=None,
+        bounding_box_is_positive=None,
         clear_old_boxes: bool = True,
         output_prob_thresh: float = 0.5,
         obj_id: Optional[int] = None,
@@ -148,6 +159,8 @@ class Sam3BasePredictor:
         session = self._get_session(session_id)
         inference_state = session["state"]
         self._extend_expiration_time(session)
+        if bounding_box_labels is None:
+            bounding_box_labels = bounding_box_is_positive
 
         # Convert lists to tensors if needed
         if points is not None and not isinstance(points, torch.Tensor):

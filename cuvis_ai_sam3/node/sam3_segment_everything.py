@@ -7,6 +7,7 @@ independently and emits a dense per-frame label map plus per-instance scores.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass
 from itertools import product
@@ -348,6 +349,17 @@ class SAM3SegmentEverything(Node):
             self._crop_n_layers,
         )
 
+    def _model_eval_context(self) -> contextlib.AbstractContextManager[None]:
+        """Run image-model inference under the expected CUDA autocast mode.
+
+        The SAM3 image stack emits bfloat16 activations in its vision path and
+        expects CUDA autocast to reconcile those with float32 weights. Make the
+        autocast mode explicit here instead of relying on ambient state.
+        """
+        if str(self._resolved_device).startswith("cuda"):
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
+
     @staticmethod
     def _normalize_frame(rgb_frame: torch.Tensor) -> np.ndarray:
         if rgb_frame.ndim != 4 or int(rgb_frame.shape[0]) != 1:
@@ -445,14 +457,15 @@ class SAM3SegmentEverything(Node):
 
         point_coords = np.asarray(points_xy, dtype=np.float32)[:, None, :]
         point_labels = np.ones((point_coords.shape[0], 1), dtype=np.int32)
-        masks_np, scores_np, _ = self._model.predict_inst(
-            inference_state,
-            point_coords=point_coords,
-            point_labels=point_labels,
-            multimask_output=self._multimask_output,
-            return_logits=True,
-            normalize_coords=True,
-        )
+        with self._model_eval_context():
+            masks_np, scores_np, _ = self._model.predict_inst(
+                inference_state,
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=self._multimask_output,
+                return_logits=True,
+                normalize_coords=True,
+            )
 
         mask_logits = torch.as_tensor(masks_np, dtype=torch.float32)
         if mask_logits.ndim == 3:
@@ -590,7 +603,8 @@ class SAM3SegmentEverything(Node):
             return []
 
         cropped_u8 = np.clip(cropped_frame * 255.0, 0.0, 255.0).astype(np.uint8)
-        inference_state = self._processor.set_image(Image.fromarray(cropped_u8))
+        with self._model_eval_context():
+            inference_state = self._processor.set_image(Image.fromarray(cropped_u8))
 
         crop_hw = cropped_frame.shape[:2]
         points_scale = np.array(crop_hw, dtype=np.float32)[None, ::-1]

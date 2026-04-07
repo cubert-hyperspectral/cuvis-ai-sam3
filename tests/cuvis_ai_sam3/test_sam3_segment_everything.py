@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Sequence
 from unittest.mock import MagicMock
 
@@ -160,6 +161,58 @@ class TestSAM3SegmentEverything:
         assert candidates == []
         assert seen_batch_sizes == [2, 2, 1]
         assert len(node._processor.images) == 1
+
+    def test_process_crop_uses_explicit_model_eval_context(self) -> None:
+        node = SAM3SegmentEverything(
+            points_per_batch=2,
+            pred_iou_thresh=0.0,
+            stability_score_thresh=0.0,
+            name="test_segment_everything_context",
+        )
+        node._processor = _FakeProcessor()
+        node._model = _FakeModel(
+            masks=np.asarray(
+                [
+                    [
+                        [
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                            [0, 0, 1, 1, 1, 1, 0, 0],
+                            [0, 0, 1, 1, 1, 1, 0, 0],
+                            [0, 0, 1, 1, 1, 1, 0, 0],
+                            [0, 0, 1, 1, 1, 1, 0, 0],
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                        ]
+                    ]
+                ],
+                dtype=np.float32,
+            ),
+            scores=np.asarray([[0.95]], dtype=np.float32),
+        )
+        node._point_grids = [np.asarray([[0.5, 0.5]], dtype=np.float32)]
+
+        entered: list[str] = []
+
+        @contextlib.contextmanager
+        def fake_context():
+            entered.append("enter")
+            try:
+                yield
+            finally:
+                entered.append("exit")
+
+        node._model_eval_context = lambda: fake_context()  # type: ignore[method-assign]
+
+        candidates = node._process_crop(
+            frame_np=np.zeros((8, 8, 3), dtype=np.float32),
+            crop_box_xyxy=[0, 0, 8, 8],
+            layer_idx=0,
+            frame_shape=(8, 8),
+        )
+
+        assert len(candidates) == 1
+        assert entered == ["enter", "exit", "enter", "exit"]
 
     def test_process_point_batch_flattens_multimask_outputs(self) -> None:
         node = SAM3SegmentEverything(

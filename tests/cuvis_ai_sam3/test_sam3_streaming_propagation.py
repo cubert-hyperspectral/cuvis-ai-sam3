@@ -783,6 +783,30 @@ class TestSAM3PointPropagation:
         node._model.add_prompt.assert_called_once()
         assert node._model.add_prompt.call_args.kwargs["frame_idx"] == 0
 
+    def test_apply_prompt_clears_action_history_for_initial_full_propagation(self) -> None:
+        node = SAM3PointPropagation(
+            prompt_points=[[0.5, 0.5]],
+            prompt_point_labels=[1],
+            prompt_obj_id=1,
+            name="test_point_action_history",
+        )
+        mock_model = _make_mock_model()
+
+        def _point_prompt_side_effect(inference_state, **kwargs):  # noqa: ANN001
+            inference_state["action_history"].append(
+                {"type": "add", "frame_idx": kwargs["frame_idx"], "obj_ids": [kwargs["obj_id"]]}
+            )
+            return 0, None
+
+        mock_model.add_prompt.side_effect = _point_prompt_side_effect
+        node._model = mock_model
+        node._inference_state = node._build_state(orig_height=10, orig_width=12)
+        node._extend_state_for_frame(0)
+
+        node._apply_prompt()
+
+        assert node._inference_state["action_history"] == []
+
 
 # ---------------------------------------------------------------------------
 # SAM3MaskPropagation tests

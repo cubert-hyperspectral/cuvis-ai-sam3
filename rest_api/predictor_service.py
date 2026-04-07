@@ -32,6 +32,8 @@ class Sam3VideoPredictorLazy(Sam3VideoPredictor):
         self.model = model
         self.async_loading_frames = kwargs.get("async_loading_frames", False)
         self.video_loader_type = kwargs.get("video_loader_type", "cv2")
+        self._all_inference_states: dict[str, dict] = {}
+        self._ALL_INFERENCE_STATES = self._all_inference_states
 
 
 class PredictorService:
@@ -83,7 +85,10 @@ class PredictorService:
                 session_id=session_id,
             )
         sid = result["session_id"]
-        state = self._predictor._ALL_INFERENCE_STATES[sid]["state"]
+        state_store = getattr(self._predictor, "_all_inference_states", None)
+        if state_store is None:
+            state_store = self._predictor._ALL_INFERENCE_STATES
+        state = state_store[sid]["state"]
         info = self.session_manager.register(sid, video_path, state)
         return StartSessionResponse(
             session_id=sid,
