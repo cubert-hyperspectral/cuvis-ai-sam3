@@ -1,4 +1,4 @@
-"""CLI entry point: ``python -m rest_api`` or ``sam3-rest-api``."""
+"""CLI entry point for the SAM3 REST server."""
 
 from __future__ import annotations
 

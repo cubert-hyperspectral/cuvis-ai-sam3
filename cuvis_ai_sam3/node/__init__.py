@@ -3,6 +3,7 @@
 Node classes are registered via `cuvis_ai_sam3.register_all_nodes()`.
 """
 
+from .sam3_segment_everything import SAM3SegmentEverything
 from .sam3_streaming_propagation import (
     SAM3BboxPropagation,
     SAM3MaskPropagation,
@@ -10,7 +11,6 @@ from .sam3_streaming_propagation import (
     SAM3TextPropagation,
     SAM3TrackerInference,
 )
-from .sam3_segment_everything import SAM3SegmentEverything
 
 __all__ = [
     "SAM3TrackerInference",

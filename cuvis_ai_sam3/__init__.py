@@ -9,6 +9,7 @@ This package lives inside the forked SAM3 repository and provides:
 """
 
 from importlib.metadata import PackageNotFoundError, version
+from typing import cast
 
 try:
     __version__ = version("cuvis-ai-sam3")
@@ -37,7 +38,7 @@ def register_all_nodes() -> int:
     from cuvis_ai_core.utils.node_registry import NodeRegistry
 
     registry = NodeRegistry()
-    return registry.auto_register_package(package_name)
+    return cast(int, registry.auto_register_package(package_name))
 
 
 __all__ = [

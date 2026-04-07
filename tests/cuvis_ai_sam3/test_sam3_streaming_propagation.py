@@ -364,7 +364,9 @@ class TestSAM3TextPropagation:
                             "out_obj_ids": np.array([1], dtype=np.int64),
                             "out_probs": np.array([0.95], dtype=np.float32),
                             "out_binary_masks": masks,
-                            "out_boxes_xywh": np.array([[0.08, 0.10, 0.30, 0.30]], dtype=np.float32),
+                            "out_boxes_xywh": np.array(
+                                [[0.08, 0.10, 0.30, 0.30]], dtype=np.float32
+                            ),
                         },
                     )
                 else:
@@ -403,7 +405,10 @@ class TestSAM3TextPropagation:
         assert results[2]["category_ids"].tolist() == [[1, 2]]
         assert self._decode_category_semantics(results[2]) == {"1": "person", "2": "car"}
         assert node._model.propagate_in_video.call_count == 2
-        assert [call.kwargs.get("start_frame_idx") for call in node._model.propagate_in_video.call_args_list] == [
+        assert [
+            call.kwargs.get("start_frame_idx")
+            for call in node._model.propagate_in_video.call_args_list
+        ] == [
             0,
             2,
         ]
@@ -472,7 +477,9 @@ class TestSAM3TextPropagation:
         assert self._decode_category_semantics(results[1]) == {"1": "person"}
         assert node._model.propagate_in_video.call_count == 2
         assert mock_model.add_mask.call_count == 0
-        assert [call.kwargs.get("reset_state") for call in mock_model.add_prompt.call_args_list] == [
+        assert [
+            call.kwargs.get("reset_state") for call in mock_model.add_prompt.call_args_list
+        ] == [
             True,
             False,
         ]
@@ -510,7 +517,9 @@ class TestSAM3TextPropagation:
         node._model = mock_model
         node._ensure_model = MagicMock()
 
-        results = _run_streaming(node, num_frames=3, h=10, w=12, text_prompts=["person", None, None])
+        results = _run_streaming(
+            node, num_frames=3, h=10, w=12, text_prompts=["person", None, None]
+        )
         first_ids: list[int] | None = None
         for result in results:
             obj_ids = [int(v) for v in result["object_ids"][0].cpu().tolist()]

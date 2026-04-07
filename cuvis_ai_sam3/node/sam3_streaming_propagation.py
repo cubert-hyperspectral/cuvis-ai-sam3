@@ -877,7 +877,9 @@ class SAM3TextPropagation(SAM3TrackerInference):
         return True
 
     def _apply_prompt(self) -> None:
-        raise RuntimeError("SAM3TextPropagation applies prompts from the runtime 'text_prompt' input.")
+        raise RuntimeError(
+            "SAM3TextPropagation applies prompts from the runtime 'text_prompt' input."
+        )
 
     @staticmethod
     def _normalize_runtime_text_prompt(text_prompt: str | None) -> str | None:
