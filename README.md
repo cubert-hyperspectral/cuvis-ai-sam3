@@ -2,9 +2,7 @@
 
 # CUVIS.AI SAM3
 
-This repository is the port of SAM3 for the cuvis.ai framework to provide nodes.
-
-Maintained by Cubert GmbH as part of the [cuvis.ai](https://docs.cuvis.ai/latest/) ecosystem, this repository packages SAM3 as a cuvis.ai plugin for promptable segmentation and tracking workflows.
+This repository provides a port of SAM3 as a cuvis.ai plugin, enabling promptable segmentation and tracking pipelines. It is maintained by Cubert GmbH as part of the cuvis.ai ecosystem.
 
 ## Platform
 
