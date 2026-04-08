@@ -1443,6 +1443,8 @@ class SAM3MaskPropagation(SAM3TrackerInference):
     The optional ``mask`` input is an int32 label map shaped ``[1, H, W]``:
     ``0`` is background and each positive label value is treated as an object ID.
     Propagation starts on the first frame where a non-empty prompt mask arrives.
+    An optional runtime ``text_prompt`` can provide semantic context while the
+    mask is injected, without switching the stream into text-driven detection.
     """
 
     INPUT_SPECS = {
@@ -1453,6 +1455,15 @@ class SAM3MaskPropagation(SAM3TrackerInference):
             description=(
                 "Optional int32 label map [1,H,W]. 0=background, each positive "
                 "label is treated as an object ID prompt on that frame."
+            ),
+            optional=True,
+        ),
+        "text_prompt": PortSpec(
+            dtype=str,
+            shape=(),
+            description=(
+                "Optional text description applied only while injecting the runtime "
+                "mask prompt on the current frame."
             ),
             optional=True,
         ),
@@ -1468,6 +1479,17 @@ class SAM3MaskPropagation(SAM3TrackerInference):
 
     def _apply_prompt(self) -> None:
         raise RuntimeError("SAM3MaskPropagation applies prompts from the runtime 'mask' input.")
+
+    @staticmethod
+    def _normalize_runtime_text_prompt(text_prompt: str | None) -> str | None:
+        if text_prompt is None:
+            return None
+        if not isinstance(text_prompt, str):
+            raise ValueError(
+                f"Expected runtime text_prompt to be a string, got {type(text_prompt).__name__}."
+            )
+        normalized = text_prompt.strip()
+        return normalized or None
 
     @staticmethod
     def _normalize_runtime_mask(
@@ -1489,22 +1511,66 @@ class SAM3MaskPropagation(SAM3TrackerInference):
             )
         return np.asarray(mask[0].detach().cpu().numpy(), dtype=np.int64)
 
-    def _apply_runtime_mask(self, label_map: np.ndarray, frame_idx: int) -> None:
-        positive_labels = [int(label) for label in np.unique(label_map).tolist() if int(label) > 0]
-        for obj_id in positive_labels:
-            self._inject_mask_prompt_for_object(
-                label_map == obj_id,
-                frame_idx=int(frame_idx),
-                obj_id=int(obj_id),
-            )
-        # Force regular propagation after the initial mask add.
-        # Tracker partial propagation for mask-only prompts can require point inputs.
-        self._inference_state["action_history"].clear()
+    def _push_runtime_text_context(self, text_prompt: str | None) -> dict[str, Any] | None:
+        normalized_prompt = self._normalize_runtime_text_prompt(text_prompt)
+        if normalized_prompt is None:
+            return None
+        if self._inference_state is None:
+            raise RuntimeError("Inference state must be initialized before applying text context.")
+
+        input_batch = self._inference_state["input_batch"]
+        text_id_raw = getattr(self._model, "TEXT_ID_FOR_TEXT", 0)
+        text_id = int(text_id_raw) if isinstance(text_id_raw, (int, np.integer)) else 0
+        snapshot = {
+            "find_text_batch_0": input_batch.find_text_batch[0],
+            "text_ids": {
+                int(frame_idx): stage.text_ids.clone()
+                for frame_idx, stage in input_batch.find_inputs.items()
+            },
+        }
+
+        input_batch.find_text_batch[0] = normalized_prompt
+        for stage in input_batch.find_inputs.values():
+            stage.text_ids[...] = text_id
+        return snapshot
+
+    def _restore_runtime_text_context(self, snapshot: dict[str, Any] | None) -> None:
+        if snapshot is None or self._inference_state is None:
+            return
+
+        input_batch = self._inference_state["input_batch"]
+        input_batch.find_text_batch[0] = snapshot["find_text_batch_0"]
+        for frame_idx, saved_text_ids in snapshot["text_ids"].items():
+            stage = input_batch.find_inputs.get(int(frame_idx))
+            if stage is not None:
+                stage.text_ids[...] = saved_text_ids
+
+    def _apply_runtime_mask(
+        self,
+        label_map: np.ndarray,
+        frame_idx: int,
+        text_prompt: str | None = None,
+    ) -> None:
+        text_snapshot = self._push_runtime_text_context(text_prompt)
+        try:
+            positive_labels = [int(label) for label in np.unique(label_map).tolist() if int(label) > 0]
+            for obj_id in positive_labels:
+                self._inject_mask_prompt_for_object(
+                    label_map == obj_id,
+                    frame_idx=int(frame_idx),
+                    obj_id=int(obj_id),
+                )
+            # Force regular propagation after the initial mask add.
+            # Tracker partial propagation for mask-only prompts can require point inputs.
+            self._inference_state["action_history"].clear()
+        finally:
+            self._restore_runtime_text_context(text_snapshot)
 
     def forward(
         self,
         rgb_frame: torch.Tensor,
         mask: torch.Tensor | None = None,
+        text_prompt: str | None = None,
         frame_id: torch.Tensor | None = None,
         context: Context | None = None,  # noqa: ARG002
         **_: Any,
@@ -1531,14 +1597,22 @@ class SAM3MaskPropagation(SAM3TrackerInference):
             self._seed_source_stream_idx = stream_idx
             internal_frame_idx = 0
             self._mark_cudagraph_step_begin()
-            self._apply_runtime_mask(label_map, frame_idx=internal_frame_idx)
+            self._apply_runtime_mask(
+                label_map,
+                frame_idx=internal_frame_idx,
+                text_prompt=text_prompt,
+            )
             self._start_generator(start_frame_idx=internal_frame_idx)
         else:
             internal_frame_idx = self._frame_buffer.add(frame_np)
             self._extend_state_for_frame(internal_frame_idx)
             if has_prompt:
                 self._mark_cudagraph_step_begin()
-                self._apply_runtime_mask(label_map, frame_idx=internal_frame_idx)
+                self._apply_runtime_mask(
+                    label_map,
+                    frame_idx=internal_frame_idx,
+                    text_prompt=text_prompt,
+                )
 
         if internal_frame_idx is None:
             raise RuntimeError("Internal frame index was not initialized for mask propagation.")

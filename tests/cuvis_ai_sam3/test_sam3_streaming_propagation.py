@@ -859,6 +859,22 @@ class TestSAM3MaskPropagation:
         assert result["detection_scores"].shape == (1, 0)
         node._ensure_model.assert_not_called()
 
+    def test_text_without_mask_returns_empty_output_and_skips_model_init(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_text_no_seed")
+        node._ensure_model = MagicMock()
+
+        result = node.forward(
+            torch.rand(1, 10, 12, 3, dtype=torch.float32),
+            mask=None,
+            text_prompt="human in black hoodie",
+        )
+
+        assert result["mask"].shape == (1, 10, 12)
+        assert torch.count_nonzero(result["mask"]).item() == 0
+        assert result["object_ids"].shape == (1, 0)
+        assert result["detection_scores"].shape == (1, 0)
+        node._ensure_model.assert_not_called()
+
     def test_first_mask_lazily_initializes_model(self) -> None:
         node = SAM3MaskPropagation(name="test_mask_lazy_init")
         mock_model = _make_mock_model()
@@ -935,11 +951,54 @@ class TestSAM3MaskPropagation:
         assert [call.kwargs["obj_id"] for call in add_prompt_calls] == [5, 9]
         assert [call.kwargs["frame_idx"] for call in add_prompt_calls] == [0, 0]
 
+    def test_mask_prompt_with_text_uses_temporary_text_context_only_during_prompt_stage(
+        self,
+    ) -> None:
+        node = SAM3MaskPropagation(name="test_mask_text_context")
+        mock_model = _make_mock_model()
+        seen_text_batches: list[str] = []
+        seen_text_ids: list[int] = []
+
+        def _record_prompt_context(inference_state, **kwargs):  # noqa: ANN001
+            del kwargs
+            seen_text_batches.append(inference_state["input_batch"].find_text_batch[0])
+            seen_text_ids.append(
+                int(inference_state["input_batch"].find_inputs[0].text_ids.reshape(-1)[0].item())
+            )
+            return 0, None
+
+        mock_model.add_mask.side_effect = _record_prompt_context
+        mock_model.add_prompt.side_effect = _record_prompt_context
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        prompt_mask = torch.zeros(1, 10, 12, dtype=torch.int32)
+        prompt_mask[:, 2:8, 3:9] = 1
+
+        result = node.forward(
+            torch.rand(1, 10, 12, 3, dtype=torch.float32),
+            mask=prompt_mask,
+            text_prompt="human in black hoodie",
+        )
+
+        assert result["mask"].shape == (1, 10, 12)
+        assert seen_text_batches == ["human in black hoodie", "human in black hoodie"]
+        assert seen_text_ids == [0, 0]
+        assert node._inference_state is not None
+        assert node._inference_state["input_batch"].find_text_batch[0] == "<text placeholder>"
+        restored_text_id = int(
+            node._inference_state["input_batch"].find_inputs[0].text_ids.reshape(-1)[0].item()
+        )
+        assert restored_text_id == 0
+        assert all("text_str" not in call.kwargs for call in mock_model.add_prompt.call_args_list)
+
     def test_mask_input_spec_is_optional_and_constructor_is_runtime_only(self) -> None:
         node = SAM3MaskPropagation(name="test_mask_specs")
 
         assert "mask" in SAM3MaskPropagation.INPUT_SPECS
         assert SAM3MaskPropagation.INPUT_SPECS["mask"].optional is True
+        assert "text_prompt" in SAM3MaskPropagation.INPUT_SPECS
+        assert SAM3MaskPropagation.INPUT_SPECS["text_prompt"].optional is True
         assert "prompt_mask_path" not in node.hparams
         assert "prompt_obj_id" not in node.hparams
 
