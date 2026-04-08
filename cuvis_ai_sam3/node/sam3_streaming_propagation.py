@@ -1553,7 +1553,9 @@ class SAM3MaskPropagation(SAM3TrackerInference):
     ) -> None:
         text_snapshot = self._push_runtime_text_context(text_prompt)
         try:
-            positive_labels = [int(label) for label in np.unique(label_map).tolist() if int(label) > 0]
+            positive_labels = [
+                int(label) for label in np.unique(label_map).tolist() if int(label) > 0
+            ]
             for obj_id in positive_labels:
                 self._inject_mask_prompt_for_object(
                     label_map == obj_id,
