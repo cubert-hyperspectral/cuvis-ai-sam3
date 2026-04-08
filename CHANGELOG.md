@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.1 - 2026-04-08
+
 - Added optional runtime `text_prompt` support to `SAM3MaskPropagation`, applying semantic context only while a mask prompt is injected without switching to text-driven detection
 - Changed the minimum `cuvis-ai-core` dependency to `>=0.3.0`
 
