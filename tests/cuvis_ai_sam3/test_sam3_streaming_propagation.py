@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from unittest.mock import MagicMock
 
@@ -556,6 +557,89 @@ class TestSAM3TextPropagation:
 
 
 class TestSAM3BboxPropagation:
+    def test_streaming_model_calls_run_under_model_eval_context(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_model_eval_context")
+        mock_model = _make_mock_model()
+        active_context_depth = 0
+        seen_phases: list[str] = []
+
+        @contextlib.contextmanager
+        def _recording_context():
+            nonlocal active_context_depth
+            active_context_depth += 1
+            try:
+                yield
+            finally:
+                active_context_depth -= 1
+
+        def _assert_context_active(phase: str) -> None:
+            assert active_context_depth > 0, f"{phase} ran outside _model_eval_context"
+            seen_phases.append(phase)
+
+        def _bbox_prompt_side_effect(_inference_state, **kwargs):  # noqa: ANN001
+            if "boxes_xywh" in kwargs:
+                _assert_context_active("bbox_probe")
+                boxes = np.asarray(kwargs["boxes_xywh"], dtype=np.float32)
+                return 0, _postprocessed_for_prompt_boxes(boxes, h=10, w=12)
+            if "points" in kwargs:
+                _assert_context_active("point_update")
+            return kwargs["frame_idx"], None
+
+        def _add_mask_side_effect(_inference_state, **kwargs):  # noqa: ANN001
+            del kwargs
+            _assert_context_active("mask_update")
+            return 0, None
+
+        def _propagate_from_state(_inference_state, **kwargs):  # noqa: ANN001
+            _assert_context_active("generator_start")
+            start_frame_idx = int(kwargs.get("start_frame_idx", 0))
+
+            def _generator():
+                _assert_context_active("generator_step")
+                yield (
+                    start_frame_idx,
+                    {
+                        "out_obj_ids": np.array([5], dtype=np.int64),
+                        "out_probs": np.array([0.93], dtype=np.float32),
+                        "out_binary_masks": np.ones((1, 10, 12), dtype=bool),
+                        "out_boxes_xywh": np.array([[0.25, 0.20, 0.25, 0.50]], dtype=np.float32),
+                    },
+                )
+                while True:
+                    _assert_context_active("generator_step")
+                    yield (
+                        start_frame_idx,
+                        {
+                            "out_obj_ids": np.array([5], dtype=np.int64),
+                            "out_probs": np.array([0.93], dtype=np.float32),
+                            "out_binary_masks": np.ones((1, 10, 12), dtype=bool),
+                            "out_boxes_xywh": np.array([[0.25, 0.20, 0.25, 0.50]], dtype=np.float32),
+                        },
+                    )
+
+            return _generator()
+
+        mock_model.add_prompt.side_effect = _bbox_prompt_side_effect
+        mock_model.add_mask.side_effect = _add_mask_side_effect
+        mock_model.propagate_in_video.side_effect = _propagate_from_state
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+        node._model_eval_context = _recording_context
+
+        result = node.forward(
+            torch.rand(1, 10, 12, 3, dtype=torch.float32),
+            bboxes=[_bbox_prompt(5, 3, 2, 6, 7)],
+        )
+
+        assert int(result["object_ids"][0, 0].item()) == 5
+        assert seen_phases == [
+            "bbox_probe",
+            "mask_update",
+            "point_update",
+            "generator_start",
+            "generator_step",
+        ]
+
     def test_no_bbox_returns_full_frame_empty_output_and_skips_model_init(self) -> None:
         node = SAM3BboxPropagation(name="test_bbox_no_seed")
         node._ensure_model = MagicMock()

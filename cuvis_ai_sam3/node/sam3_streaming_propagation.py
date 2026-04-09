@@ -10,6 +10,7 @@ Hierarchy:
 
 from __future__ import annotations
 
+import contextlib
 import json
 from abc import abstractmethod
 from typing import Any
@@ -271,6 +272,14 @@ class SAM3TrackerInference(Node):
         except StopIteration:
             return torch.device("cpu")
 
+    def _model_eval_context(self) -> contextlib.AbstractContextManager[None]:
+        """Run streaming-model inference under the expected CUDA autocast mode."""
+        if self._model is None:
+            return contextlib.nullcontext()
+        if self._model_device().type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
+
     # -- State initialization -------------------------------------------------
 
     def _build_state(self, orig_height: int, orig_width: int) -> dict[str, Any]:
@@ -376,7 +385,8 @@ class SAM3TrackerInference(Node):
             raise RuntimeError("Propagation generator is not initialized.")
         self._mark_cudagraph_step_begin()
         try:
-            return next(self._generator)
+            with self._model_eval_context():
+                return next(self._generator)
         except StopIteration as exc:
             raise RuntimeError(
                 f"{self.__class__.__name__} generator exhausted early at frame {requested_frame_idx}."
@@ -452,12 +462,13 @@ class SAM3TrackerInference(Node):
             if isinstance(tracker_state, dict):
                 tracker_state["num_frames"] = _STREAMING_SENTINEL
 
-        self._generator = self._model.propagate_in_video(
-            self._inference_state,
-            start_frame_idx=int(start_frame_idx),
-            max_frame_num_to_track=None,
-            reverse=False,
-        )
+        with self._model_eval_context():
+            self._generator = self._model.propagate_in_video(
+                self._inference_state,
+                start_frame_idx=int(start_frame_idx),
+                max_frame_num_to_track=None,
+                reverse=False,
+            )
 
     # -- Prompt application (subclass responsibility) -------------------------
 
@@ -647,24 +658,26 @@ class SAM3TrackerInference(Node):
 
         mask_binary = np.asarray(binary_mask > 0, dtype=np.float32)
         mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
-        self._model.add_mask(
-            self._inference_state,
-            frame_idx=int(frame_idx),
-            obj_id=int(obj_id),
-            mask=mask_tensor,
-        )
+        with self._model_eval_context():
+            self._model.add_mask(
+                self._inference_state,
+                frame_idx=int(frame_idx),
+                obj_id=int(obj_id),
+                mask=mask_tensor,
+            )
 
         point_xy = _centroid_point_from_binary_mask(mask_binary)
         if point_xy is None:
             return
 
-        self._model.add_prompt(
-            self._inference_state,
-            frame_idx=int(frame_idx),
-            points=torch.tensor([list(point_xy)], dtype=torch.float32, device=device),
-            point_labels=torch.tensor([1], dtype=torch.int64, device=device),
-            obj_id=int(obj_id),
-        )
+        with self._model_eval_context():
+            self._model.add_prompt(
+                self._inference_state,
+                frame_idx=int(frame_idx),
+                points=torch.tensor([list(point_xy)], dtype=torch.float32, device=device),
+                point_labels=torch.tensor([1], dtype=torch.int64, device=device),
+                obj_id=int(obj_id),
+            )
 
     def _evict_excess_tracker_states(self, frame_idx: int) -> None:
         """Evict oldest non-primary tracker states when the count exceeds the cap."""
@@ -947,12 +960,13 @@ class SAM3TextPropagation(SAM3TrackerInference):
                 tracker_state["num_frames"] = int(clamped_num_frames)
 
         try:
-            _, postprocessed = self._model.add_prompt(
-                state,
-                frame_idx=int(frame_idx),
-                text_str=prompt_text,
-                reset_state=bool(reset_state),
-            )
+            with self._model_eval_context():
+                _, postprocessed = self._model.add_prompt(
+                    state,
+                    frame_idx=int(frame_idx),
+                    text_str=prompt_text,
+                    reset_state=bool(reset_state),
+                )
         finally:
             state["num_frames"] = int(original_num_frames)
             for tracker_state, original_tracker_num_frames_value in original_tracker_num_frames:
@@ -1243,12 +1257,13 @@ class SAM3BboxPropagation(SAM3TrackerInference):
             axis=0,
         )
         labels = torch.ones(len(prompt_boxes), dtype=torch.long, device=device)
-        _, postprocessed = self._model.add_prompt(
-            probe_state,
-            frame_idx=0,
-            boxes_xywh=boxes_xywh,
-            box_labels=labels,
-        )
+        with self._model_eval_context():
+            _, postprocessed = self._model.add_prompt(
+                probe_state,
+                frame_idx=0,
+                boxes_xywh=boxes_xywh,
+                box_labels=labels,
+            )
         return postprocessed
 
     @classmethod
@@ -1425,13 +1440,14 @@ class SAM3PointPropagation(SAM3TrackerInference):
         device = self._model_device()
         points = torch.tensor(self._prompt_points, dtype=torch.float32, device=device)
         point_labels = torch.tensor(self._prompt_point_labels, dtype=torch.int64, device=device)
-        self._model.add_prompt(
-            self._inference_state,
-            frame_idx=0,
-            points=points,
-            point_labels=point_labels,
-            obj_id=self._prompt_obj_id,
-        )
+        with self._model_eval_context():
+            self._model.add_prompt(
+                self._inference_state,
+                frame_idx=0,
+                points=points,
+                point_labels=point_labels,
+                obj_id=self._prompt_obj_id,
+            )
         # Streaming starts from a fresh state with no cached base predictions.
         # Force a full propagation pass instead of tracker-only partial propagation.
         self._inference_state["action_history"].clear()
