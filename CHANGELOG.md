@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed SAM3 streaming and segment-everything nodes to release loaded models, frame buffers, generators, and prompt-tracking runtime state when the hosting gRPC session tears down its pipeline.
+
 ## 0.1.2 - 2026-04-08
 
 - Changed the root README to a cuvis.ai-focused plugin landing page and moved the upstream SAM3 project README into `README_original.md`

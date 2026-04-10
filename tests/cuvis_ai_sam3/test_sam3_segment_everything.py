@@ -111,6 +111,18 @@ class TestSAM3SegmentEverything:
         assert build_calls[0]["enable_inst_interactivity"] is True
         assert isinstance(node._processor, FakeSam3Processor)
 
+    def test_cleanup_releases_model_and_processor(self) -> None:
+        node = SAM3SegmentEverything(name="test_segment_everything_cleanup")
+        node._model = object()
+        node._processor = object()
+        node._warned_small_region_skip = True
+
+        node.cleanup()
+
+        assert node._model is None
+        assert node._processor is None
+        assert node._warned_small_region_skip is False
+
     def test_empty_forward_returns_full_frame_empty_outputs(self) -> None:
         node = SAM3SegmentEverything(name="test_segment_everything_empty")
         node._ensure_model = MagicMock()

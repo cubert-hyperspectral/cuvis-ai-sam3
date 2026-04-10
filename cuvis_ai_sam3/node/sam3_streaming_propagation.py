@@ -280,6 +280,18 @@ class SAM3TrackerInference(Node):
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         return contextlib.nullcontext()
 
+    def cleanup(self) -> None:
+        """Release streaming runtime state and the loaded SAM3 video model."""
+        self._generator = None
+        self._frame_buffer = None
+        self._inference_state = None
+        self._model = None
+        self._frame_idx = 0
+        self._source_frame_ids.clear()
+        self._internal_to_export_obj_id.clear()
+        self._next_export_obj_id = 1
+        self._evict_horizon = 64
+
     # -- State initialization -------------------------------------------------
 
     def _build_state(self, orig_height: int, orig_width: int) -> dict[str, Any]:
@@ -894,6 +906,17 @@ class SAM3TextPropagation(SAM3TrackerInference):
             "SAM3TextPropagation applies prompts from the runtime 'text_prompt' input."
         )
 
+    def cleanup(self) -> None:
+        """Release runtime prompt/category state kept across streaming frames."""
+        SAM3TrackerInference.cleanup(self)
+        self._seed_source_stream_idx = None
+        self._semantic_to_category_id.clear()
+        self._category_id_to_semantic.clear()
+        self._export_obj_id_to_category_id.clear()
+        self._next_category_id = 1
+        self._current_prompt_category_id = None
+        self._last_successful_prompt_category_id = None
+
     @staticmethod
     def _normalize_runtime_text_prompt(text_prompt: str | None) -> str | None:
         if text_prompt is None:
@@ -1113,6 +1136,10 @@ class SAM3BboxPropagation(SAM3TrackerInference):
 
     def _apply_prompt(self) -> None:
         raise RuntimeError("SAM3BboxPropagation applies prompts from the runtime 'bboxes' input.")
+
+    def cleanup(self) -> None:
+        SAM3TrackerInference.cleanup(self)
+        self._seed_source_stream_idx = None
 
     @staticmethod
     def _normalize_runtime_bboxes(
@@ -1495,6 +1522,10 @@ class SAM3MaskPropagation(SAM3TrackerInference):
 
     def _apply_prompt(self) -> None:
         raise RuntimeError("SAM3MaskPropagation applies prompts from the runtime 'mask' input.")
+
+    def cleanup(self) -> None:
+        SAM3TrackerInference.cleanup(self)
+        self._seed_source_stream_idx = None
 
     @staticmethod
     def _normalize_runtime_text_prompt(text_prompt: str | None) -> str | None:

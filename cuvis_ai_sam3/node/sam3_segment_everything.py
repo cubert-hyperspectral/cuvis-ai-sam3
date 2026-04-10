@@ -360,6 +360,12 @@ class SAM3SegmentEverything(Node):
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         return contextlib.nullcontext()
 
+    def cleanup(self) -> None:
+        """Release the loaded SAM3 image model and processor handles."""
+        self._model = None
+        self._processor = None
+        self._warned_small_region_skip = False
+
     @staticmethod
     def _normalize_frame(rgb_frame: torch.Tensor) -> np.ndarray:
         if rgb_frame.ndim != 4 or int(rgb_frame.shape[0]) != 1:
