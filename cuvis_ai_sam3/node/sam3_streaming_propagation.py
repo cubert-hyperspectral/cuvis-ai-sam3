@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 from abc import abstractmethod
-from typing import Any
+from typing import Any, ClassVar
 
 import cv2
 import numpy as np
@@ -142,6 +142,11 @@ class SAM3TrackerInference(Node):
 
     Compatible with ``TrackingOverlayNode`` and ``TrackingCocoJsonNode`` sinks.
     """
+
+    _AUTOCAST_DTYPE: ClassVar[dict[str, torch.dtype]] = {
+        "cuda": torch.bfloat16,
+        "cpu": torch.bfloat16,
+    }
 
     INPUT_SPECS = {
         "rgb_frame": PortSpec(dtype=torch.float32, shape=(1, -1, -1, 3)),
@@ -273,11 +278,13 @@ class SAM3TrackerInference(Node):
             return torch.device("cpu")
 
     def _model_eval_context(self) -> contextlib.AbstractContextManager[None]:
-        """Run streaming-model inference under the expected CUDA autocast mode."""
+        """Return the appropriate autocast context for the model's current device."""
         if self._model is None:
             return contextlib.nullcontext()
-        if self._model_device().type == "cuda":
-            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        device_type = self._model_device().type
+        dtype = self._AUTOCAST_DTYPE.get(device_type)
+        if dtype is not None:
+            return torch.autocast(device_type=device_type, dtype=dtype)
         return contextlib.nullcontext()
 
     def cleanup(self) -> None:
@@ -1257,11 +1264,11 @@ class SAM3BboxPropagation(SAM3TrackerInference):
         boxes_xyxy[:, 3] = (boxes_xywh[:, 1] + boxes_xywh[:, 3]) * height
         return boxes_xyxy
 
-    def _probe_prompt_frame(
+    def _probe_prompt_box(
         self,
         *,
         frame_np: np.ndarray,
-        prompt_boxes: list[dict[str, float | int]],
+        prompt_box: dict[str, float | int],
         frame_shape: tuple[int, int],
     ) -> dict | None:
         device = self._model_device()
@@ -1279,11 +1286,9 @@ class SAM3BboxPropagation(SAM3TrackerInference):
         finally:
             self._frame_buffer = original_buffer
 
-        boxes_xywh = np.stack(
-            [self._prompt_box_xywh_normalized(prompt, frame_shape) for prompt in prompt_boxes],
-            axis=0,
-        )
-        labels = torch.ones(len(prompt_boxes), dtype=torch.long, device=device)
+        # Fresh-state SAM3 box prompting only supports one initial box per add_prompt call.
+        boxes_xywh = self._prompt_box_xywh_normalized(prompt_box, frame_shape)[None, :]
+        labels = torch.ones(1, dtype=torch.long, device=device)
         with self._model_eval_context():
             _, postprocessed = self._model.add_prompt(
                 probe_state,
@@ -1344,18 +1349,17 @@ class SAM3BboxPropagation(SAM3TrackerInference):
         frame_shape: tuple[int, int],
         frame_idx: int,
     ) -> None:
-        postprocessed = self._probe_prompt_frame(
-            frame_np=frame_np,
-            prompt_boxes=prompt_boxes,
-            frame_shape=frame_shape,
-        )
-        matched_masks = self._match_prompt_masks(
-            prompt_boxes=prompt_boxes,
-            postprocessed=postprocessed,
-            frame_shape=frame_shape,
-        )
-
-        for prompt_box, matched_mask in zip(prompt_boxes, matched_masks, strict=False):
+        for prompt_box in prompt_boxes:
+            postprocessed = self._probe_prompt_box(
+                frame_np=frame_np,
+                prompt_box=prompt_box,
+                frame_shape=frame_shape,
+            )
+            matched_mask = self._match_prompt_masks(
+                prompt_boxes=[prompt_box],
+                postprocessed=postprocessed,
+                frame_shape=frame_shape,
+            )[0]
             if matched_mask is None or int(np.count_nonzero(matched_mask)) == 0:
                 matched_mask = _binary_mask_from_xyxy(
                     x_min=float(prompt_box["x_min"]),

@@ -673,7 +673,9 @@ class TestSAM3BboxPropagation:
                             "out_obj_ids": np.array([5], dtype=np.int64),
                             "out_probs": np.array([0.93], dtype=np.float32),
                             "out_binary_masks": np.ones((1, 10, 12), dtype=bool),
-                            "out_boxes_xywh": np.array([[0.25, 0.20, 0.25, 0.50]], dtype=np.float32),
+                            "out_boxes_xywh": np.array(
+                                [[0.25, 0.20, 0.25, 0.50]], dtype=np.float32
+                            ),
                         },
                     )
 
@@ -831,11 +833,53 @@ class TestSAM3BboxPropagation:
             call for call in mock_model.add_prompt.call_args_list if "boxes_xywh" in call.kwargs
         ]
 
-        assert len(probe_calls) == 2
+        assert len(probe_calls) == 3
+        assert [tuple(np.asarray(call.kwargs["boxes_xywh"]).shape) for call in probe_calls] == [
+            (1, 4),
+            (1, 4),
+            (1, 4),
+        ]
         assert [call.kwargs["obj_id"] for call in add_mask_calls] == [2, 4, 7]
         assert [call.kwargs["frame_idx"] for call in add_mask_calls] == [0, 2, 2]
         assert [call.kwargs["obj_id"] for call in point_calls] == [2, 4, 7]
         assert [call.kwargs["frame_idx"] for call in point_calls] == [0, 2, 2]
+
+    def test_multi_bbox_probe_never_batches_boxes_on_fresh_state(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_single_box_probe_only")
+        mock_model = _make_mock_model()
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        def _bbox_prompt_side_effect(inference_state, **kwargs):  # noqa: ANN001
+            if "boxes_xywh" in kwargs:
+                boxes = np.asarray(kwargs["boxes_xywh"], dtype=np.float32)
+                if boxes.shape != (1, 4):
+                    raise AssertionError(
+                        f"Fresh-state bbox probe must be single-box, got {boxes.shape}"
+                    )
+                return 0, _postprocessed_for_prompt_boxes(boxes, h=10, w=12)
+            return kwargs["frame_idx"], None
+
+        mock_model.add_prompt.side_effect = _bbox_prompt_side_effect
+
+        result = node.forward(
+            torch.rand(1, 10, 12, 3, dtype=torch.float32),
+            bboxes=[
+                _bbox_prompt(4, 1, 5, 4, 9),
+                _bbox_prompt(7, 7, 2, 10, 6),
+            ],
+        )
+
+        probe_calls = [
+            call for call in mock_model.add_prompt.call_args_list if "boxes_xywh" in call.kwargs
+        ]
+        assert len(probe_calls) == 2
+        assert [tuple(np.asarray(call.kwargs["boxes_xywh"]).shape) for call in probe_calls] == [
+            (1, 4),
+            (1, 4),
+        ]
+        assert mock_model.add_mask.call_count == 2
+        assert result["object_ids"].shape == (1, 2)
 
     def test_reprompted_object_reuses_same_exported_id(self) -> None:
         node = SAM3BboxPropagation(name="test_bbox_reprompt")

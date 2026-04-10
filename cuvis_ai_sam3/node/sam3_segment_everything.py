@@ -11,7 +11,7 @@ import contextlib
 import math
 from dataclasses import dataclass
 from itertools import product
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -47,6 +47,11 @@ class SAM3SegmentEverything(Node):
     Output IDs are per-frame only: every ``forward()`` call restarts instance
     numbering from ``1`` and keeps ``0`` for background.
     """
+
+    _AUTOCAST_DTYPE: ClassVar[dict[str, torch.dtype]] = {
+        "cuda": torch.bfloat16,
+        "cpu": torch.bfloat16,
+    }
 
     INPUT_SPECS = {
         "rgb_frame": PortSpec(
@@ -350,14 +355,15 @@ class SAM3SegmentEverything(Node):
         )
 
     def _model_eval_context(self) -> contextlib.AbstractContextManager[None]:
-        """Run image-model inference under the expected CUDA autocast mode.
+        """Return the appropriate autocast context for the resolved device.
 
         The SAM3 image stack emits bfloat16 activations in its vision path and
-        expects CUDA autocast to reconcile those with float32 weights. Make the
-        autocast mode explicit here instead of relying on ambient state.
+        expects autocast to reconcile those with float32 weights.
         """
-        if str(self._resolved_device).startswith("cuda"):
-            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        device_type = str(self._resolved_device).split(":")[0]
+        dtype = self._AUTOCAST_DTYPE.get(device_type)
+        if dtype is not None:
+            return torch.autocast(device_type=device_type, dtype=dtype)
         return contextlib.nullcontext()
 
     def cleanup(self) -> None:

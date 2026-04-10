@@ -5,7 +5,8 @@
 ## 0.1.3 - 2026-04-10
 
 - Added `cleanup()` hooks to `SAM3SegmentEverything`, `SAM3TrackerInference`, `SAM3TextPropagation`, `SAM3BboxPropagation`, and `SAM3MaskPropagation` so loaded models, frame buffers, generators, and prompt-tracking runtime state are released when the hosting gRPC session tears down its pipeline.
-- Fixed missing CUDA autocast context during streaming propagation by wrapping all `add_prompt`, `add_mask`, `propagate_in_video`, and generator `next()` calls in `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`.
+- Fixed missing CUDA autocast context during streaming propagation by wrapping all `add_prompt`, `add_mask`, `propagate_in_video`, and generator `next()` calls in `torch.autocast`.
+- Changed autocast device selection from hardcoded CUDA to device-agnostic lookup via `_AUTOCAST_DTYPE` class variable, enabling bfloat16 autocast on CPU and extensibility to MPS/XPU.
 - Changed minimum `cuvis-ai-core` dependency to `>=0.3.4` for eager GPU resource cleanup support.
 - Added tests for cleanup lifecycle on all node types and autocast context coverage during streaming model calls.
 
