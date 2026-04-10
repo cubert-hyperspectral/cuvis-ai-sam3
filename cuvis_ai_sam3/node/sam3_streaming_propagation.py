@@ -10,9 +10,10 @@ Hierarchy:
 
 from __future__ import annotations
 
+import contextlib
 import json
 from abc import abstractmethod
-from typing import Any
+from typing import Any, ClassVar
 
 import cv2
 import numpy as np
@@ -141,6 +142,11 @@ class SAM3TrackerInference(Node):
 
     Compatible with ``TrackingOverlayNode`` and ``TrackingCocoJsonNode`` sinks.
     """
+
+    _AUTOCAST_DTYPE: ClassVar[dict[str, torch.dtype]] = {
+        "cuda": torch.bfloat16,
+        "cpu": torch.bfloat16,
+    }
 
     INPUT_SPECS = {
         "rgb_frame": PortSpec(dtype=torch.float32, shape=(1, -1, -1, 3)),
@@ -271,6 +277,28 @@ class SAM3TrackerInference(Node):
         except StopIteration:
             return torch.device("cpu")
 
+    def _model_eval_context(self) -> contextlib.AbstractContextManager[None]:
+        """Return the appropriate autocast context for the model's current device."""
+        if self._model is None:
+            return contextlib.nullcontext()
+        device_type = self._model_device().type
+        dtype = self._AUTOCAST_DTYPE.get(device_type)
+        if dtype is not None:
+            return torch.autocast(device_type=device_type, dtype=dtype)
+        return contextlib.nullcontext()
+
+    def cleanup(self) -> None:
+        """Release streaming runtime state and the loaded SAM3 video model."""
+        self._generator = None
+        self._frame_buffer = None
+        self._inference_state = None
+        self._model = None
+        self._frame_idx = 0
+        self._source_frame_ids.clear()
+        self._internal_to_export_obj_id.clear()
+        self._next_export_obj_id = 1
+        self._evict_horizon = 64
+
     # -- State initialization -------------------------------------------------
 
     def _build_state(self, orig_height: int, orig_width: int) -> dict[str, Any]:
@@ -376,7 +404,8 @@ class SAM3TrackerInference(Node):
             raise RuntimeError("Propagation generator is not initialized.")
         self._mark_cudagraph_step_begin()
         try:
-            return next(self._generator)
+            with self._model_eval_context():
+                return next(self._generator)
         except StopIteration as exc:
             raise RuntimeError(
                 f"{self.__class__.__name__} generator exhausted early at frame {requested_frame_idx}."
@@ -452,12 +481,13 @@ class SAM3TrackerInference(Node):
             if isinstance(tracker_state, dict):
                 tracker_state["num_frames"] = _STREAMING_SENTINEL
 
-        self._generator = self._model.propagate_in_video(
-            self._inference_state,
-            start_frame_idx=int(start_frame_idx),
-            max_frame_num_to_track=None,
-            reverse=False,
-        )
+        with self._model_eval_context():
+            self._generator = self._model.propagate_in_video(
+                self._inference_state,
+                start_frame_idx=int(start_frame_idx),
+                max_frame_num_to_track=None,
+                reverse=False,
+            )
 
     # -- Prompt application (subclass responsibility) -------------------------
 
@@ -647,24 +677,26 @@ class SAM3TrackerInference(Node):
 
         mask_binary = np.asarray(binary_mask > 0, dtype=np.float32)
         mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
-        self._model.add_mask(
-            self._inference_state,
-            frame_idx=int(frame_idx),
-            obj_id=int(obj_id),
-            mask=mask_tensor,
-        )
+        with self._model_eval_context():
+            self._model.add_mask(
+                self._inference_state,
+                frame_idx=int(frame_idx),
+                obj_id=int(obj_id),
+                mask=mask_tensor,
+            )
 
         point_xy = _centroid_point_from_binary_mask(mask_binary)
         if point_xy is None:
             return
 
-        self._model.add_prompt(
-            self._inference_state,
-            frame_idx=int(frame_idx),
-            points=torch.tensor([list(point_xy)], dtype=torch.float32, device=device),
-            point_labels=torch.tensor([1], dtype=torch.int64, device=device),
-            obj_id=int(obj_id),
-        )
+        with self._model_eval_context():
+            self._model.add_prompt(
+                self._inference_state,
+                frame_idx=int(frame_idx),
+                points=torch.tensor([list(point_xy)], dtype=torch.float32, device=device),
+                point_labels=torch.tensor([1], dtype=torch.int64, device=device),
+                obj_id=int(obj_id),
+            )
 
     def _evict_excess_tracker_states(self, frame_idx: int) -> None:
         """Evict oldest non-primary tracker states when the count exceeds the cap."""
@@ -881,6 +913,17 @@ class SAM3TextPropagation(SAM3TrackerInference):
             "SAM3TextPropagation applies prompts from the runtime 'text_prompt' input."
         )
 
+    def cleanup(self) -> None:
+        """Release runtime prompt/category state kept across streaming frames."""
+        SAM3TrackerInference.cleanup(self)
+        self._seed_source_stream_idx = None
+        self._semantic_to_category_id.clear()
+        self._category_id_to_semantic.clear()
+        self._export_obj_id_to_category_id.clear()
+        self._next_category_id = 1
+        self._current_prompt_category_id = None
+        self._last_successful_prompt_category_id = None
+
     @staticmethod
     def _normalize_runtime_text_prompt(text_prompt: str | None) -> str | None:
         if text_prompt is None:
@@ -947,12 +990,13 @@ class SAM3TextPropagation(SAM3TrackerInference):
                 tracker_state["num_frames"] = int(clamped_num_frames)
 
         try:
-            _, postprocessed = self._model.add_prompt(
-                state,
-                frame_idx=int(frame_idx),
-                text_str=prompt_text,
-                reset_state=bool(reset_state),
-            )
+            with self._model_eval_context():
+                _, postprocessed = self._model.add_prompt(
+                    state,
+                    frame_idx=int(frame_idx),
+                    text_str=prompt_text,
+                    reset_state=bool(reset_state),
+                )
         finally:
             state["num_frames"] = int(original_num_frames)
             for tracker_state, original_tracker_num_frames_value in original_tracker_num_frames:
@@ -1100,6 +1144,10 @@ class SAM3BboxPropagation(SAM3TrackerInference):
     def _apply_prompt(self) -> None:
         raise RuntimeError("SAM3BboxPropagation applies prompts from the runtime 'bboxes' input.")
 
+    def cleanup(self) -> None:
+        SAM3TrackerInference.cleanup(self)
+        self._seed_source_stream_idx = None
+
     @staticmethod
     def _normalize_runtime_bboxes(
         bboxes: list[dict[str, Any]] | None,
@@ -1216,11 +1264,11 @@ class SAM3BboxPropagation(SAM3TrackerInference):
         boxes_xyxy[:, 3] = (boxes_xywh[:, 1] + boxes_xywh[:, 3]) * height
         return boxes_xyxy
 
-    def _probe_prompt_frame(
+    def _probe_prompt_box(
         self,
         *,
         frame_np: np.ndarray,
-        prompt_boxes: list[dict[str, float | int]],
+        prompt_box: dict[str, float | int],
         frame_shape: tuple[int, int],
     ) -> dict | None:
         device = self._model_device()
@@ -1238,17 +1286,16 @@ class SAM3BboxPropagation(SAM3TrackerInference):
         finally:
             self._frame_buffer = original_buffer
 
-        boxes_xywh = np.stack(
-            [self._prompt_box_xywh_normalized(prompt, frame_shape) for prompt in prompt_boxes],
-            axis=0,
-        )
-        labels = torch.ones(len(prompt_boxes), dtype=torch.long, device=device)
-        _, postprocessed = self._model.add_prompt(
-            probe_state,
-            frame_idx=0,
-            boxes_xywh=boxes_xywh,
-            box_labels=labels,
-        )
+        # Fresh-state SAM3 box prompting only supports one initial box per add_prompt call.
+        boxes_xywh = self._prompt_box_xywh_normalized(prompt_box, frame_shape)[None, :]
+        labels = torch.ones(1, dtype=torch.long, device=device)
+        with self._model_eval_context():
+            _, postprocessed = self._model.add_prompt(
+                probe_state,
+                frame_idx=0,
+                boxes_xywh=boxes_xywh,
+                box_labels=labels,
+            )
         return postprocessed
 
     @classmethod
@@ -1302,18 +1349,17 @@ class SAM3BboxPropagation(SAM3TrackerInference):
         frame_shape: tuple[int, int],
         frame_idx: int,
     ) -> None:
-        postprocessed = self._probe_prompt_frame(
-            frame_np=frame_np,
-            prompt_boxes=prompt_boxes,
-            frame_shape=frame_shape,
-        )
-        matched_masks = self._match_prompt_masks(
-            prompt_boxes=prompt_boxes,
-            postprocessed=postprocessed,
-            frame_shape=frame_shape,
-        )
-
-        for prompt_box, matched_mask in zip(prompt_boxes, matched_masks, strict=False):
+        for prompt_box in prompt_boxes:
+            postprocessed = self._probe_prompt_box(
+                frame_np=frame_np,
+                prompt_box=prompt_box,
+                frame_shape=frame_shape,
+            )
+            matched_mask = self._match_prompt_masks(
+                prompt_boxes=[prompt_box],
+                postprocessed=postprocessed,
+                frame_shape=frame_shape,
+            )[0]
             if matched_mask is None or int(np.count_nonzero(matched_mask)) == 0:
                 matched_mask = _binary_mask_from_xyxy(
                     x_min=float(prompt_box["x_min"]),
@@ -1425,13 +1471,14 @@ class SAM3PointPropagation(SAM3TrackerInference):
         device = self._model_device()
         points = torch.tensor(self._prompt_points, dtype=torch.float32, device=device)
         point_labels = torch.tensor(self._prompt_point_labels, dtype=torch.int64, device=device)
-        self._model.add_prompt(
-            self._inference_state,
-            frame_idx=0,
-            points=points,
-            point_labels=point_labels,
-            obj_id=self._prompt_obj_id,
-        )
+        with self._model_eval_context():
+            self._model.add_prompt(
+                self._inference_state,
+                frame_idx=0,
+                points=points,
+                point_labels=point_labels,
+                obj_id=self._prompt_obj_id,
+            )
         # Streaming starts from a fresh state with no cached base predictions.
         # Force a full propagation pass instead of tracker-only partial propagation.
         self._inference_state["action_history"].clear()
@@ -1479,6 +1526,10 @@ class SAM3MaskPropagation(SAM3TrackerInference):
 
     def _apply_prompt(self) -> None:
         raise RuntimeError("SAM3MaskPropagation applies prompts from the runtime 'mask' input.")
+
+    def cleanup(self) -> None:
+        SAM3TrackerInference.cleanup(self)
+        self._seed_source_stream_idx = None
 
     @staticmethod
     def _normalize_runtime_text_prompt(text_prompt: str | None) -> str | None:

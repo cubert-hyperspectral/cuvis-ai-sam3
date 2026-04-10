@@ -40,7 +40,7 @@ keywords = [
 dependencies = [
     # cuvis-ai-core framework (provides torch, torchvision, numpy, Node base class, plugin system)
     # Note: cuvis-ai (node catalog) is NOT needed -- only the core framework.
-    "cuvis-ai-core>=0.3.0",
+    "cuvis-ai-core>=0.3.4",
     # SAM3-specific dependencies (not provided by cuvis-ai-core)
     "timm>=1.0.17",
     "tqdm",

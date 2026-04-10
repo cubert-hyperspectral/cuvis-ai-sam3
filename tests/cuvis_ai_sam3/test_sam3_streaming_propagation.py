@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from unittest.mock import MagicMock
 
@@ -220,6 +221,66 @@ def _run_streaming(
         )
         results.append(result)
     return results
+
+
+# ---------------------------------------------------------------------------
+# Cleanup tests
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingCleanup:
+    def test_text_cleanup_releases_model_and_runtime_state(self) -> None:
+        node = SAM3TextPropagation(name="test_streaming_cleanup")
+        node._model = _make_mock_model()
+        node._frame_buffer = _FrameBuffer(image_size=4, device=torch.device("cpu"))
+        node._frame_buffer.add(np.zeros((4, 4, 3), dtype=np.float32))
+        node._inference_state = {"cached_frame_outputs": {0: {"mock": 1}}}
+        node._generator = iter([("frame", None)])
+        node._frame_idx = 7
+        node._source_frame_ids.extend([10, 11])
+        node._internal_to_export_obj_id[3] = 9
+        node._next_export_obj_id = 10
+        node._seed_source_stream_idx = 4
+        node._semantic_to_category_id["person"] = 1
+        node._category_id_to_semantic[1] = "person"
+        node._export_obj_id_to_category_id[9] = 1
+        node._next_category_id = 2
+        node._current_prompt_category_id = 1
+        node._last_successful_prompt_category_id = 1
+
+        node.cleanup()
+
+        assert node._model is None
+        assert node._frame_buffer is None
+        assert node._inference_state is None
+        assert node._generator is None
+        assert node._frame_idx == 0
+        assert node._source_frame_ids == []
+        assert node._internal_to_export_obj_id == {}
+        assert node._next_export_obj_id == 1
+        assert node._seed_source_stream_idx is None
+        assert node._semantic_to_category_id == {}
+        assert node._category_id_to_semantic == {}
+        assert node._export_obj_id_to_category_id == {}
+        assert node._next_category_id == 1
+        assert node._current_prompt_category_id is None
+        assert node._last_successful_prompt_category_id is None
+
+    def test_bbox_cleanup_resets_seed_frame(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_cleanup")
+        node._seed_source_stream_idx = 12
+
+        node.cleanup()
+
+        assert node._seed_source_stream_idx is None
+
+    def test_mask_cleanup_resets_seed_frame(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_cleanup")
+        node._seed_source_stream_idx = 15
+
+        node.cleanup()
+
+        assert node._seed_source_stream_idx is None
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +617,91 @@ class TestSAM3TextPropagation:
 
 
 class TestSAM3BboxPropagation:
+    def test_streaming_model_calls_run_under_model_eval_context(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_model_eval_context")
+        mock_model = _make_mock_model()
+        active_context_depth = 0
+        seen_phases: list[str] = []
+
+        @contextlib.contextmanager
+        def _recording_context():
+            nonlocal active_context_depth
+            active_context_depth += 1
+            try:
+                yield
+            finally:
+                active_context_depth -= 1
+
+        def _assert_context_active(phase: str) -> None:
+            assert active_context_depth > 0, f"{phase} ran outside _model_eval_context"
+            seen_phases.append(phase)
+
+        def _bbox_prompt_side_effect(_inference_state, **kwargs):  # noqa: ANN001
+            if "boxes_xywh" in kwargs:
+                _assert_context_active("bbox_probe")
+                boxes = np.asarray(kwargs["boxes_xywh"], dtype=np.float32)
+                return 0, _postprocessed_for_prompt_boxes(boxes, h=10, w=12)
+            if "points" in kwargs:
+                _assert_context_active("point_update")
+            return kwargs["frame_idx"], None
+
+        def _add_mask_side_effect(_inference_state, **kwargs):  # noqa: ANN001
+            del kwargs
+            _assert_context_active("mask_update")
+            return 0, None
+
+        def _propagate_from_state(_inference_state, **kwargs):  # noqa: ANN001
+            _assert_context_active("generator_start")
+            start_frame_idx = int(kwargs.get("start_frame_idx", 0))
+
+            def _generator():
+                _assert_context_active("generator_step")
+                yield (
+                    start_frame_idx,
+                    {
+                        "out_obj_ids": np.array([5], dtype=np.int64),
+                        "out_probs": np.array([0.93], dtype=np.float32),
+                        "out_binary_masks": np.ones((1, 10, 12), dtype=bool),
+                        "out_boxes_xywh": np.array([[0.25, 0.20, 0.25, 0.50]], dtype=np.float32),
+                    },
+                )
+                while True:
+                    _assert_context_active("generator_step")
+                    yield (
+                        start_frame_idx,
+                        {
+                            "out_obj_ids": np.array([5], dtype=np.int64),
+                            "out_probs": np.array([0.93], dtype=np.float32),
+                            "out_binary_masks": np.ones((1, 10, 12), dtype=bool),
+                            "out_boxes_xywh": np.array(
+                                [[0.25, 0.20, 0.25, 0.50]], dtype=np.float32
+                            ),
+                        },
+                    )
+
+            return _generator()
+
+        mock_model.add_prompt.side_effect = _bbox_prompt_side_effect
+        mock_model.add_mask.side_effect = _add_mask_side_effect
+        mock_model.propagate_in_video.side_effect = _propagate_from_state
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+        node._model_eval_context = _recording_context
+
+        result = node.forward(
+            torch.rand(1, 10, 12, 3, dtype=torch.float32),
+            bboxes=[_bbox_prompt(5, 3, 2, 6, 7)],
+        )
+
+        assert int(result["object_ids"][0, 0].item()) == 5
+        assert seen_phases == [
+            "bbox_probe",
+            "mask_update",
+            "point_update",
+            "generator_start",
+            "generator_step",
+        ]
+
     def test_no_bbox_returns_full_frame_empty_output_and_skips_model_init(self) -> None:
         node = SAM3BboxPropagation(name="test_bbox_no_seed")
         node._ensure_model = MagicMock()
@@ -687,11 +833,53 @@ class TestSAM3BboxPropagation:
             call for call in mock_model.add_prompt.call_args_list if "boxes_xywh" in call.kwargs
         ]
 
-        assert len(probe_calls) == 2
+        assert len(probe_calls) == 3
+        assert [tuple(np.asarray(call.kwargs["boxes_xywh"]).shape) for call in probe_calls] == [
+            (1, 4),
+            (1, 4),
+            (1, 4),
+        ]
         assert [call.kwargs["obj_id"] for call in add_mask_calls] == [2, 4, 7]
         assert [call.kwargs["frame_idx"] for call in add_mask_calls] == [0, 2, 2]
         assert [call.kwargs["obj_id"] for call in point_calls] == [2, 4, 7]
         assert [call.kwargs["frame_idx"] for call in point_calls] == [0, 2, 2]
+
+    def test_multi_bbox_probe_never_batches_boxes_on_fresh_state(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_single_box_probe_only")
+        mock_model = _make_mock_model()
+        node._model = mock_model
+        node._ensure_model = MagicMock()
+
+        def _bbox_prompt_side_effect(inference_state, **kwargs):  # noqa: ANN001
+            if "boxes_xywh" in kwargs:
+                boxes = np.asarray(kwargs["boxes_xywh"], dtype=np.float32)
+                if boxes.shape != (1, 4):
+                    raise AssertionError(
+                        f"Fresh-state bbox probe must be single-box, got {boxes.shape}"
+                    )
+                return 0, _postprocessed_for_prompt_boxes(boxes, h=10, w=12)
+            return kwargs["frame_idx"], None
+
+        mock_model.add_prompt.side_effect = _bbox_prompt_side_effect
+
+        result = node.forward(
+            torch.rand(1, 10, 12, 3, dtype=torch.float32),
+            bboxes=[
+                _bbox_prompt(4, 1, 5, 4, 9),
+                _bbox_prompt(7, 7, 2, 10, 6),
+            ],
+        )
+
+        probe_calls = [
+            call for call in mock_model.add_prompt.call_args_list if "boxes_xywh" in call.kwargs
+        ]
+        assert len(probe_calls) == 2
+        assert [tuple(np.asarray(call.kwargs["boxes_xywh"]).shape) for call in probe_calls] == [
+            (1, 4),
+            (1, 4),
+        ]
+        assert mock_model.add_mask.call_count == 2
+        assert result["object_ids"].shape == (1, 2)
 
     def test_reprompted_object_reuses_same_exported_id(self) -> None:
         node = SAM3BboxPropagation(name="test_bbox_reprompt")
