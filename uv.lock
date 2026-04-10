@@ -403,7 +403,7 @@ wheels = [
 
 [[package]]
 name = "cuvis-ai-core"
-version = "0.3.0"
+version = "0.3.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuvis" },
@@ -418,7 +418,7 @@ dependencies = [
     { name = "loguru" },
     { name = "numpy" },
     { name = "omegaconf" },
-    { name = "opencv-python" },
+    { name = "opencv-python-headless" },
     { name = "pillow" },
     { name = "protobuf" },
     { name = "pycocotools" },
@@ -432,9 +432,9 @@ dependencies = [
     { name = "torchvision" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/31/60/9688a4065b97c93209eaf00e90bb903e18ecf459513e90f5a76a3df1021a/cuvis_ai_core-0.3.0.tar.gz", hash = "sha256:7b0fc3143b28ef0d453c6aff30ad14e2e063d4067b6fa865d15350dbe6f1d771", size = 444398, upload-time = "2026-04-07T12:22:18.027Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c4/b1/0102cbeee82d9c27be05b8eb76a791258442bb83314a3007d46429a93a90/cuvis_ai_core-0.3.4.tar.gz", hash = "sha256:4fdadc74b033eb5cb2afe90b9e8ce1248d64378bd0c958d604a876703509fa48", size = 446050, upload-time = "2026-04-10T11:26:12.528Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d4/7b/dec3b35cac5864253edb13033b9b66a90810958c2ea388dfc068fa8a3ca5/cuvis_ai_core-0.3.0-py3-none-any.whl", hash = "sha256:732e6fd804610de5683bbb70154ec9ca3c83de56218fab151d0b91334fb1dbe1", size = 140837, upload-time = "2026-04-07T12:22:16.698Z" },
+    { url = "https://files.pythonhosted.org/packages/17/c4/c9ee2163ea8bb003b425fd2e9c2e70e56041e607b083d7149cf131c86f98/cuvis_ai_core-0.3.4-py3-none-any.whl", hash = "sha256:26448589cad7b152c84e3d98c07f43f93166df717a6b4d0bfdd33567470dc14f", size = 141479, upload-time = "2026-04-10T11:26:11.194Z" },
 ]
 
 [[package]]
@@ -496,7 +496,7 @@ dev = [
 requires-dist = [
     { name = "bandit", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=1.7.0" },
     { name = "click", specifier = ">=8.3.1" },
-    { name = "cuvis-ai-core", specifier = ">=0.3.0" },
+    { name = "cuvis-ai-core", specifier = ">=0.3.4" },
     { name = "cyclonedx-bom", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "decord" },
     { name = "detect-secrets", marker = "extra == 'dev'", specifier = ">=1.4.0" },
@@ -1706,24 +1706,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/09/48/6388f1bb9da707110532cb70ec4d2822858ddfb44f1cdf1233c20a80ea4b/omegaconf-2.3.0.tar.gz", hash = "sha256:d5d4b6d29955cc50ad50c46dc269bcd92c6e00f5f90d23ab5fee7bfca4ba4cc7", size = 3298120, upload-time = "2022-12-08T20:59:22.753Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e3/94/1843518e420fa3ed6919835845df698c7e27e183cb997394e4a670973a65/omegaconf-2.3.0-py3-none-any.whl", hash = "sha256:7b4df175cdb08ba400f45cae3bdcae7ba8365db4d165fc65fd04b050ab63b46b", size = 79500, upload-time = "2022-12-08T20:59:19.686Z" },
-]
-
-[[package]]
-name = "opencv-python"
-version = "4.13.0.92"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/fc/6f/5a28fef4c4a382be06afe3938c64cc168223016fa520c5abaf37e8862aa5/opencv_python-4.13.0.92-cp37-abi3-macosx_13_0_arm64.whl", hash = "sha256:caf60c071ec391ba51ed00a4a920f996d0b64e3e46068aac1f646b5de0326a19", size = 46247052, upload-time = "2026-02-05T07:01:25.046Z" },
-    { url = "https://files.pythonhosted.org/packages/08/ac/6c98c44c650b8114a0fb901691351cfb3956d502e8e9b5cd27f4ee7fbf2f/opencv_python-4.13.0.92-cp37-abi3-macosx_14_0_x86_64.whl", hash = "sha256:5868a8c028a0b37561579bfb8ac1875babdc69546d236249fff296a8c010ccf9", size = 32568781, upload-time = "2026-02-05T07:01:41.379Z" },
-    { url = "https://files.pythonhosted.org/packages/3e/51/82fed528b45173bf629fa44effb76dff8bc9f4eeaee759038362dfa60237/opencv_python-4.13.0.92-cp37-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:0bc2596e68f972ca452d80f444bc404e08807d021fbba40df26b61b18e01838a", size = 47685527, upload-time = "2026-02-05T06:59:11.24Z" },
-    { url = "https://files.pythonhosted.org/packages/db/07/90b34a8e2cf9c50fe8ed25cac9011cde0676b4d9d9c973751ac7616223a2/opencv_python-4.13.0.92-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:402033cddf9d294693094de5ef532339f14ce821da3ad7df7c9f6e8316da32cf", size = 70460872, upload-time = "2026-02-05T06:59:19.162Z" },
-    { url = "https://files.pythonhosted.org/packages/02/6d/7a9cc719b3eaf4377b9c2e3edeb7ed3a81de41f96421510c0a169ca3cfd4/opencv_python-4.13.0.92-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:bccaabf9eb7f897ca61880ce2869dcd9b25b72129c28478e7f2a5e8dee945616", size = 46708208, upload-time = "2026-02-05T06:59:15.419Z" },
-    { url = "https://files.pythonhosted.org/packages/fd/55/b3b49a1b97aabcfbbd6c7326df9cb0b6fa0c0aefa8e89d500939e04aa229/opencv_python-4.13.0.92-cp37-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:620d602b8f7d8b8dab5f4b99c6eb353e78d3fb8b0f53db1bd258bb1aa001c1d5", size = 72927042, upload-time = "2026-02-05T06:59:23.389Z" },
-    { url = "https://files.pythonhosted.org/packages/fb/17/de5458312bcb07ddf434d7bfcb24bb52c59635ad58c6e7c751b48949b009/opencv_python-4.13.0.92-cp37-abi3-win32.whl", hash = "sha256:372fe164a3148ac1ca51e5f3ad0541a4a276452273f503441d718fab9c5e5f59", size = 30932638, upload-time = "2026-02-05T07:02:14.98Z" },
-    { url = "https://files.pythonhosted.org/packages/e9/a5/1be1516390333ff9be3a9cb648c9f33df79d5096e5884b5df71a588af463/opencv_python-4.13.0.92-cp37-abi3-win_amd64.whl", hash = "sha256:423d934c9fafb91aad38edf26efb46da91ffbc05f3f59c4b0c72e699720706f5", size = 40212062, upload-time = "2026-02-05T07:02:12.724Z" },
 ]
 
 [[package]]
