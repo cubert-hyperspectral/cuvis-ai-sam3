@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 import torch
 from cuvis_ai_core.node import Node
+from cuvis_ai_schemas.enums import NodeCategory, NodeTag
 from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from loguru import logger
@@ -142,6 +143,20 @@ class SAM3TrackerInference(Node):
 
     Compatible with ``TrackingOverlayNode`` and ``TrackingCocoJsonNode`` sinks.
     """
+
+    _category = NodeCategory.MODEL
+    _tags = frozenset({
+        NodeTag.VIDEO,
+        NodeTag.RGB,
+        NodeTag.MASK,
+        NodeTag.TRACKING,
+        NodeTag.SEGMENTATION,
+        NodeTag.INFERENCE,
+        NodeTag.LEARNABLE,
+        NodeTag.BATCHED,
+        NodeTag.STATEFUL,
+        NodeTag.TORCH,
+    })
 
     _AUTOCAST_DTYPE: ClassVar[dict[str, torch.dtype]] = {
         "cuda": torch.bfloat16,
@@ -866,6 +881,21 @@ class SAM3TextPropagation(SAM3TrackerInference):
     (e.g. ``"person"`` or ``"car"``).
     """
 
+    _category = NodeCategory.MODEL
+    _tags = frozenset({
+        NodeTag.VIDEO,
+        NodeTag.RGB,
+        NodeTag.MASK,
+        NodeTag.TEXT,
+        NodeTag.TRACKING,
+        NodeTag.SEGMENTATION,
+        NodeTag.INFERENCE,
+        NodeTag.LEARNABLE,
+        NodeTag.BATCHED,
+        NodeTag.STATEFUL,
+        NodeTag.TORCH,
+    })
+
     INPUT_SPECS = {
         **SAM3TrackerInference.INPUT_SPECS,
         "text_prompt": PortSpec(
@@ -1123,6 +1153,21 @@ class SAM3BboxPropagation(SAM3TrackerInference):
     injects the resulting masks into the tracker under the requested
     ``object_id`` values.
     """
+
+    _category = NodeCategory.MODEL
+    _tags = frozenset({
+        NodeTag.VIDEO,
+        NodeTag.RGB,
+        NodeTag.MASK,
+        NodeTag.BBOX,
+        NodeTag.TRACKING,
+        NodeTag.SEGMENTATION,
+        NodeTag.INFERENCE,
+        NodeTag.LEARNABLE,
+        NodeTag.BATCHED,
+        NodeTag.STATEFUL,
+        NodeTag.TORCH,
+    })
 
     INPUT_SPECS = {
         **SAM3TrackerInference.INPUT_SPECS,
@@ -1446,6 +1491,21 @@ class SAM3PointPropagation(SAM3TrackerInference):
     Tracks a single object specified by click points and ``prompt_obj_id``.
     """
 
+    _category = NodeCategory.MODEL
+    _tags = frozenset({
+        NodeTag.VIDEO,
+        NodeTag.RGB,
+        NodeTag.MASK,
+        NodeTag.KEYPOINTS,
+        NodeTag.TRACKING,
+        NodeTag.SEGMENTATION,
+        NodeTag.INFERENCE,
+        NodeTag.LEARNABLE,
+        NodeTag.BATCHED,
+        NodeTag.STATEFUL,
+        NodeTag.TORCH,
+    })
+
     def __init__(
         self,
         prompt_points: list[list[float]],
@@ -1493,6 +1553,20 @@ class SAM3MaskPropagation(SAM3TrackerInference):
     An optional runtime ``text_prompt`` can provide semantic context while the
     mask is injected, without switching the stream into text-driven detection.
     """
+
+    _category = NodeCategory.MODEL
+    _tags = frozenset({
+        NodeTag.VIDEO,
+        NodeTag.RGB,
+        NodeTag.MASK,
+        NodeTag.TRACKING,
+        NodeTag.SEGMENTATION,
+        NodeTag.INFERENCE,
+        NodeTag.LEARNABLE,
+        NodeTag.BATCHED,
+        NodeTag.STATEFUL,
+        NodeTag.TORCH,
+    })
 
     INPUT_SPECS = {
         **SAM3TrackerInference.INPUT_SPECS,
