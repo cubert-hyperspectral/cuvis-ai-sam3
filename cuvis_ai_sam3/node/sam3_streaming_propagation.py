@@ -145,18 +145,20 @@ class SAM3TrackerInference(Node):
     """
 
     _category = NodeCategory.MODEL
-    _tags = frozenset({
-        NodeTag.VIDEO,
-        NodeTag.RGB,
-        NodeTag.MASK,
-        NodeTag.TRACKING,
-        NodeTag.SEGMENTATION,
-        NodeTag.INFERENCE,
-        NodeTag.LEARNABLE,
-        NodeTag.BATCHED,
-        NodeTag.STATEFUL,
-        NodeTag.TORCH,
-    })
+    _tags = frozenset(
+        {
+            NodeTag.VIDEO,
+            NodeTag.RGB,
+            NodeTag.MASK,
+            NodeTag.TRACKING,
+            NodeTag.SEGMENTATION,
+            NodeTag.INFERENCE,
+            NodeTag.LEARNABLE,
+            NodeTag.BATCHED,
+            NodeTag.STATEFUL,
+            NodeTag.TORCH,
+        }
+    )
 
     _AUTOCAST_DTYPE: ClassVar[dict[str, torch.dtype]] = {
         "cuda": torch.bfloat16,
@@ -882,19 +884,21 @@ class SAM3TextPropagation(SAM3TrackerInference):
     """
 
     _category = NodeCategory.MODEL
-    _tags = frozenset({
-        NodeTag.VIDEO,
-        NodeTag.RGB,
-        NodeTag.MASK,
-        NodeTag.TEXT,
-        NodeTag.TRACKING,
-        NodeTag.SEGMENTATION,
-        NodeTag.INFERENCE,
-        NodeTag.LEARNABLE,
-        NodeTag.BATCHED,
-        NodeTag.STATEFUL,
-        NodeTag.TORCH,
-    })
+    _tags = frozenset(
+        {
+            NodeTag.VIDEO,
+            NodeTag.RGB,
+            NodeTag.MASK,
+            NodeTag.TEXT,
+            NodeTag.TRACKING,
+            NodeTag.SEGMENTATION,
+            NodeTag.INFERENCE,
+            NodeTag.LEARNABLE,
+            NodeTag.BATCHED,
+            NodeTag.STATEFUL,
+            NodeTag.TORCH,
+        }
+    )
 
     INPUT_SPECS = {
         **SAM3TrackerInference.INPUT_SPECS,
@@ -1155,19 +1159,21 @@ class SAM3BboxPropagation(SAM3TrackerInference):
     """
 
     _category = NodeCategory.MODEL
-    _tags = frozenset({
-        NodeTag.VIDEO,
-        NodeTag.RGB,
-        NodeTag.MASK,
-        NodeTag.BBOX,
-        NodeTag.TRACKING,
-        NodeTag.SEGMENTATION,
-        NodeTag.INFERENCE,
-        NodeTag.LEARNABLE,
-        NodeTag.BATCHED,
-        NodeTag.STATEFUL,
-        NodeTag.TORCH,
-    })
+    _tags = frozenset(
+        {
+            NodeTag.VIDEO,
+            NodeTag.RGB,
+            NodeTag.MASK,
+            NodeTag.BBOX,
+            NodeTag.TRACKING,
+            NodeTag.SEGMENTATION,
+            NodeTag.INFERENCE,
+            NodeTag.LEARNABLE,
+            NodeTag.BATCHED,
+            NodeTag.STATEFUL,
+            NodeTag.TORCH,
+        }
+    )
 
     INPUT_SPECS = {
         **SAM3TrackerInference.INPUT_SPECS,
@@ -1492,19 +1498,21 @@ class SAM3PointPropagation(SAM3TrackerInference):
     """
 
     _category = NodeCategory.MODEL
-    _tags = frozenset({
-        NodeTag.VIDEO,
-        NodeTag.RGB,
-        NodeTag.MASK,
-        NodeTag.KEYPOINTS,
-        NodeTag.TRACKING,
-        NodeTag.SEGMENTATION,
-        NodeTag.INFERENCE,
-        NodeTag.LEARNABLE,
-        NodeTag.BATCHED,
-        NodeTag.STATEFUL,
-        NodeTag.TORCH,
-    })
+    _tags = frozenset(
+        {
+            NodeTag.VIDEO,
+            NodeTag.RGB,
+            NodeTag.MASK,
+            NodeTag.KEYPOINTS,
+            NodeTag.TRACKING,
+            NodeTag.SEGMENTATION,
+            NodeTag.INFERENCE,
+            NodeTag.LEARNABLE,
+            NodeTag.BATCHED,
+            NodeTag.STATEFUL,
+            NodeTag.TORCH,
+        }
+    )
 
     def __init__(
         self,
@@ -1555,18 +1563,20 @@ class SAM3MaskPropagation(SAM3TrackerInference):
     """
 
     _category = NodeCategory.MODEL
-    _tags = frozenset({
-        NodeTag.VIDEO,
-        NodeTag.RGB,
-        NodeTag.MASK,
-        NodeTag.TRACKING,
-        NodeTag.SEGMENTATION,
-        NodeTag.INFERENCE,
-        NodeTag.LEARNABLE,
-        NodeTag.BATCHED,
-        NodeTag.STATEFUL,
-        NodeTag.TORCH,
-    })
+    _tags = frozenset(
+        {
+            NodeTag.VIDEO,
+            NodeTag.RGB,
+            NodeTag.MASK,
+            NodeTag.TRACKING,
+            NodeTag.SEGMENTATION,
+            NodeTag.INFERENCE,
+            NodeTag.LEARNABLE,
+            NodeTag.BATCHED,
+            NodeTag.STATEFUL,
+            NodeTag.TORCH,
+        }
+    )
 
     INPUT_SPECS = {
         **SAM3TrackerInference.INPUT_SPECS,

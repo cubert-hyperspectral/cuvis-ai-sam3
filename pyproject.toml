@@ -65,6 +65,8 @@ dependencies = [
     "pydantic-settings>=2.13.1",
     "fastapi>=0.135.1",
     "sse-starlette>=3.3.2",
+    # CVE-2026-28684 fix; pulled in transitively by pydantic-settings / dotenv.
+    "python-dotenv>=1.2.2",
 ]
 
 [project.optional-dependencies]

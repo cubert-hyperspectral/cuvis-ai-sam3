@@ -50,16 +50,18 @@ class SAM3SegmentEverything(Node):
     """
 
     _category = NodeCategory.MODEL
-    _tags = frozenset({
-        NodeTag.RGB,
-        NodeTag.IMAGE,
-        NodeTag.MASK,
-        NodeTag.SEGMENTATION,
-        NodeTag.INFERENCE,
-        NodeTag.LEARNABLE,
-        NodeTag.BATCHED,
-        NodeTag.TORCH,
-    })
+    _tags = frozenset(
+        {
+            NodeTag.RGB,
+            NodeTag.IMAGE,
+            NodeTag.MASK,
+            NodeTag.SEGMENTATION,
+            NodeTag.INFERENCE,
+            NodeTag.LEARNABLE,
+            NodeTag.BATCHED,
+            NodeTag.TORCH,
+        }
+    )
 
     _AUTOCAST_DTYPE: ClassVar[dict[str, torch.dtype]] = {
         "cuda": torch.bfloat16,

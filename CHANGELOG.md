@@ -4,7 +4,7 @@
 
 ## 0.1.4 - 2026-04-29
 
-- Annotated all six SAM3 node classes with `_category = NodeCategory.MODEL` and `_tags` ClassVars (ALL-5187 Phase 6). The base `SAM3TrackerInference` carries the shared `{VIDEO, RGB, MASK, TRACKING, SEGMENTATION, INFERENCE, LEARNABLE, BATCHED, STATEFUL, TORCH}` set; `SAM3TextPropagation`, `SAM3BboxPropagation`, and `SAM3PointPropagation` add their prompt modality (`TEXT`, `BBOX`, `KEYPOINTS`); `SAM3MaskPropagation` reuses the base set (mask is already present); `SAM3SegmentEverything` declares the single-frame variant `{RGB, IMAGE, MASK, SEGMENTATION, INFERENCE, LEARNABLE, BATCHED, TORCH}`.
+- Annotated all six SAM3 node classes with `_category = NodeCategory.MODEL` and `_tags` ClassVars. The base `SAM3TrackerInference` carries the shared `{VIDEO, RGB, MASK, TRACKING, SEGMENTATION, INFERENCE, LEARNABLE, BATCHED, STATEFUL, TORCH}` set; `SAM3TextPropagation`, `SAM3BboxPropagation`, and `SAM3PointPropagation` add their prompt modality (`TEXT`, `BBOX`, `KEYPOINTS`); `SAM3MaskPropagation` reuses the base set (mask is already present); `SAM3SegmentEverything` declares the single-frame variant `{RGB, IMAGE, MASK, SEGMENTATION, INFERENCE, LEARNABLE, BATCHED, TORCH}`.
 - Added `cuvis-ai-schemas>=0.4.0` to dependencies (`NodeCategory` / `NodeTag` enums live there).
 - Stripped `hash` fields from `torch` / `torchvision` wheel entries in `uv.lock`.
 
