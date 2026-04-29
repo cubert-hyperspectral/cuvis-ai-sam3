@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## 0.1.4 - 2026-04-29
+
+- Annotated all six SAM3 node classes with `_category = NodeCategory.MODEL` and `_tags` ClassVars. The base `SAM3TrackerInference` carries the shared `{VIDEO, RGB, MASK, TRACKING, SEGMENTATION, INFERENCE, LEARNABLE, BATCHED, STATEFUL, TORCH}` set; `SAM3TextPropagation`, `SAM3BboxPropagation`, and `SAM3PointPropagation` add their prompt modality (`TEXT`, `BBOX`, `KEYPOINTS`); `SAM3MaskPropagation` reuses the base set (mask is already present); `SAM3SegmentEverything` declares the single-frame variant `{RGB, IMAGE, MASK, SEGMENTATION, INFERENCE, LEARNABLE, BATCHED, TORCH}`.
+- Added `cuvis-ai-schemas>=0.4.0` to dependencies (`NodeCategory` / `NodeTag` enums live there).
+- Stripped `hash` fields from `torch` / `torchvision` wheel entries in `uv.lock`.
+
 ## 0.1.3 - 2026-04-10
 
 - Added `cleanup()` hooks to `SAM3SegmentEverything`, `SAM3TrackerInference`, `SAM3TextPropagation`, `SAM3BboxPropagation`, and `SAM3MaskPropagation` so loaded models, frame buffers, generators, and prompt-tracking runtime state are released when the hosting gRPC session tears down its pipeline.

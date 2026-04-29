@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from cuvis_ai_core.node import Node
+from cuvis_ai_schemas.enums import NodeCategory, NodeTag
 from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from loguru import logger
@@ -47,6 +48,20 @@ class SAM3SegmentEverything(Node):
     Output IDs are per-frame only: every ``forward()`` call restarts instance
     numbering from ``1`` and keeps ``0`` for background.
     """
+
+    _category = NodeCategory.MODEL
+    _tags = frozenset(
+        {
+            NodeTag.RGB,
+            NodeTag.IMAGE,
+            NodeTag.MASK,
+            NodeTag.SEGMENTATION,
+            NodeTag.INFERENCE,
+            NodeTag.LEARNABLE,
+            NodeTag.BATCHED,
+            NodeTag.TORCH,
+        }
+    )
 
     _AUTOCAST_DTYPE: ClassVar[dict[str, torch.dtype]] = {
         "cuda": torch.bfloat16,
