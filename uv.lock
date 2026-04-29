@@ -443,6 +443,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "cuvis-ai-core" },
+    { name = "cuvis-ai-schemas" },
     { name = "decord" },
     { name = "einops" },
     { name = "fastapi" },
@@ -497,6 +498,7 @@ requires-dist = [
     { name = "bandit", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=1.7.0" },
     { name = "click", specifier = ">=8.3.1" },
     { name = "cuvis-ai-core", specifier = ">=0.3.4" },
+    { name = "cuvis-ai-schemas", specifier = ">=0.4.0" },
     { name = "cyclonedx-bom", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "decord" },
     { name = "detect-secrets", marker = "extra == 'dev'", specifier = ">=1.4.0" },
@@ -540,15 +542,15 @@ dev = [{ name = "setuptools-scm", specifier = ">=9.2.2" }]
 
 [[package]]
 name = "cuvis-ai-schemas"
-version = "0.3.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3b/88/6abec000894108c7206e545b7d4a546e76b4e49194b6e61929712bfc7353/cuvis_ai_schemas-0.3.0.tar.gz", hash = "sha256:7c593bce250eb14a1ab512714a7c532152cb0b604759ac3392fc309b1106c7d0", size = 129186, upload-time = "2026-03-31T13:09:11.163Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/29/16/0e5ce1a9e968cb0bf755b52af436b2fbd852b519918ac972fb225325456c/cuvis_ai_schemas-0.4.0.tar.gz", hash = "sha256:3b507eb22b520725fa03c1038e726c229f613184b3cf220d12b6d69adab9747a", size = 141470, upload-time = "2026-04-29T10:42:42.37Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/90/25/5cd461357ced5b7e5a404d7b4460ef9e94145ff7911526a6c2995836257e/cuvis_ai_schemas-0.3.0-py3-none-any.whl", hash = "sha256:4f8991ab7050c93875e248273fcc6b965f7d169c68dd1cbc4f9ff3fe093b367b", size = 47473, upload-time = "2026-03-31T13:09:09.557Z" },
+    { url = "https://files.pythonhosted.org/packages/21/7b/7d3811c009ce326959bb6a08579628d0a3fd6dd3557e96c873dc54cef8fd/cuvis_ai_schemas-0.4.0-py3-none-any.whl", hash = "sha256:4ee89ed8e253c1302e224da5edca28078bb8b5306ed1408ecfb2b75ad9072eba", size = 60150, upload-time = "2026-04-29T10:42:40.665Z" },
 ]
 
 [[package]]
