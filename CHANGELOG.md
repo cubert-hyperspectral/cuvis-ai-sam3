@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## 0.1.5 - 2026-04-30
+
+- Added `reset()` to `SAM3TrackerInference` and overrides in `SAM3TextPropagation`, `SAM3BboxPropagation`, and `SAM3MaskPropagation`. `reset()` clears per-stream tracker state (`_inference_state`, `_generator`, `_frame_buffer`, `_frame_idx`, `_source_frame_ids`, `_internal_to_export_obj_id`, `_next_export_obj_id`, plus prompt-specific seed/category state in subclasses) while preserving the loaded `_model` on GPU. `Predictor._reset_nodes()` now drives this automatically at the start of each `predict()` run, so reusing the same streaming node across two runs (for example, mask propagation on RGB then on a CIR rendering of the same scene) starts the second run with a fresh stream instead of carrying state over.
+- Refactored `cleanup()` on the same four classes to delegate to `reset()` and then null `_model` and reset `_evict_horizon`, removing duplicated attribute lists between the two methods. External `cleanup()` behavior is unchanged.
+
 ## 0.1.4 - 2026-04-29
 
 - Annotated all six SAM3 node classes with `_category = NodeCategory.MODEL` and `_tags` ClassVars. The base `SAM3TrackerInference` carries the shared `{VIDEO, RGB, MASK, TRACKING, SEGMENTATION, INFERENCE, LEARNABLE, BATCHED, STATEFUL, TORCH}` set; `SAM3TextPropagation`, `SAM3BboxPropagation`, and `SAM3PointPropagation` add their prompt modality (`TEXT`, `BBOX`, `KEYPOINTS`); `SAM3MaskPropagation` reuses the base set (mask is already present); `SAM3SegmentEverything` declares the single-frame variant `{RGB, IMAGE, MASK, SEGMENTATION, INFERENCE, LEARNABLE, BATCHED, TORCH}`.

@@ -304,16 +304,30 @@ class SAM3TrackerInference(Node):
             return torch.autocast(device_type=device_type, dtype=dtype)
         return contextlib.nullcontext()
 
-    def cleanup(self) -> None:
-        """Release streaming runtime state and the loaded SAM3 video model."""
+    def reset(self) -> None:
+        """Clear per-stream tracker state for reuse on a new video without reloading the model.
+
+        Called automatically by ``Predictor._reset_nodes()`` at the start of each
+        predict run, so reusing the same node across two ``predict()`` calls — for
+        example, running the same mask-propagation pipeline on RGB and then CIR
+        renderings of the same scene — starts the second run with a fresh stream
+        instead of carrying ``_inference_state`` over.
+
+        Unlike :meth:`cleanup`, the loaded ``_model`` and the model-derived
+        ``_evict_horizon`` are preserved.
+        """
         self._generator = None
         self._frame_buffer = None
         self._inference_state = None
-        self._model = None
         self._frame_idx = 0
         self._source_frame_ids.clear()
         self._internal_to_export_obj_id.clear()
         self._next_export_obj_id = 1
+
+    def cleanup(self) -> None:
+        """Release streaming runtime state and the loaded SAM3 video model."""
+        self.reset()
+        self._model = None
         self._evict_horizon = 64
 
     # -- State initialization -------------------------------------------------
@@ -947,9 +961,9 @@ class SAM3TextPropagation(SAM3TrackerInference):
             "SAM3TextPropagation applies prompts from the runtime 'text_prompt' input."
         )
 
-    def cleanup(self) -> None:
-        """Release runtime prompt/category state kept across streaming frames."""
-        SAM3TrackerInference.cleanup(self)
+    def reset(self) -> None:
+        """Clear text-prompt-specific state in addition to the base streaming state."""
+        super().reset()
         self._seed_source_stream_idx = None
         self._semantic_to_category_id.clear()
         self._category_id_to_semantic.clear()
@@ -1195,8 +1209,9 @@ class SAM3BboxPropagation(SAM3TrackerInference):
     def _apply_prompt(self) -> None:
         raise RuntimeError("SAM3BboxPropagation applies prompts from the runtime 'bboxes' input.")
 
-    def cleanup(self) -> None:
-        SAM3TrackerInference.cleanup(self)
+    def reset(self) -> None:
+        """Clear bbox-prompt seed-stream state in addition to the base streaming state."""
+        super().reset()
         self._seed_source_stream_idx = None
 
     @staticmethod
@@ -1611,8 +1626,9 @@ class SAM3MaskPropagation(SAM3TrackerInference):
     def _apply_prompt(self) -> None:
         raise RuntimeError("SAM3MaskPropagation applies prompts from the runtime 'mask' input.")
 
-    def cleanup(self) -> None:
-        SAM3TrackerInference.cleanup(self)
+    def reset(self) -> None:
+        """Clear mask-prompt seed-stream state in addition to the base streaming state."""
+        super().reset()
         self._seed_source_stream_idx = None
 
     @staticmethod
