@@ -283,6 +283,81 @@ class TestStreamingCleanup:
         assert node._seed_source_stream_idx is None
 
 
+class TestStreamingReset:
+    """`reset()` clears per-stream state but keeps the loaded model on GPU.
+
+    `Predictor._reset_nodes()` calls `reset()` before each `predict()` run, so
+    reusing the same node across two runs (e.g. mask propagation on RGB then CIR)
+    starts the second run with a fresh stream.
+    """
+
+    def test_text_reset_keeps_model_clears_runtime_state(self) -> None:
+        node = SAM3TextPropagation(name="test_streaming_reset")
+        sentinel_model = _make_mock_model()
+        node._model = sentinel_model
+        node._frame_buffer = _FrameBuffer(image_size=4, device=torch.device("cpu"))
+        node._frame_buffer.add(np.zeros((4, 4, 3), dtype=np.float32))
+        node._inference_state = {"cached_frame_outputs": {0: {"mock": 1}}}
+        node._generator = iter([("frame", None)])
+        node._frame_idx = 7
+        node._source_frame_ids.extend([10, 11])
+        node._internal_to_export_obj_id[3] = 9
+        node._next_export_obj_id = 10
+        node._evict_horizon = 99
+        node._seed_source_stream_idx = 4
+        node._semantic_to_category_id["person"] = 1
+        node._category_id_to_semantic[1] = "person"
+        node._export_obj_id_to_category_id[9] = 1
+        node._next_category_id = 2
+        node._current_prompt_category_id = 1
+        node._last_successful_prompt_category_id = 1
+
+        node.reset()
+
+        assert node._model is sentinel_model
+        assert node._evict_horizon == 99
+        assert node._frame_buffer is None
+        assert node._inference_state is None
+        assert node._generator is None
+        assert node._frame_idx == 0
+        assert node._source_frame_ids == []
+        assert node._internal_to_export_obj_id == {}
+        assert node._next_export_obj_id == 1
+        assert node._seed_source_stream_idx is None
+        assert node._semantic_to_category_id == {}
+        assert node._category_id_to_semantic == {}
+        assert node._export_obj_id_to_category_id == {}
+        assert node._next_category_id == 1
+        assert node._current_prompt_category_id is None
+        assert node._last_successful_prompt_category_id is None
+
+    def test_bbox_reset_keeps_model_clears_seed_frame(self) -> None:
+        node = SAM3BboxPropagation(name="test_bbox_reset")
+        sentinel_model = _make_mock_model()
+        node._model = sentinel_model
+        node._frame_idx = 5
+        node._seed_source_stream_idx = 12
+
+        node.reset()
+
+        assert node._model is sentinel_model
+        assert node._frame_idx == 0
+        assert node._seed_source_stream_idx is None
+
+    def test_mask_reset_keeps_model_clears_seed_frame(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_reset")
+        sentinel_model = _make_mock_model()
+        node._model = sentinel_model
+        node._frame_idx = 5
+        node._seed_source_stream_idx = 15
+
+        node.reset()
+
+        assert node._model is sentinel_model
+        assert node._frame_idx == 0
+        assert node._seed_source_stream_idx is None
+
+
 # ---------------------------------------------------------------------------
 # SAM3TextPropagation tests
 # ---------------------------------------------------------------------------
