@@ -140,8 +140,9 @@ explicit = true
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-# Exclude upstream SAM3 fork and Meta scripts from ALL ruff processing (format + lint)
-extend-exclude = ["sam3", "scripts", "examples"]
+# Exclude upstream SAM3 fork and Meta scripts/tests from ALL ruff processing (format + lint).
+# `test` is Meta's upstream test dir (cuvis tests live in `tests`).
+extend-exclude = ["sam3", "scripts", "examples", "test"]
 
 [tool.ruff.format]
 quote-style = "double"
