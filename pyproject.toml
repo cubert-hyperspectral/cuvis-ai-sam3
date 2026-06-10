@@ -40,8 +40,8 @@ keywords = [
 dependencies = [
     # cuvis-ai-core framework (provides torch, torchvision, numpy, Node base class, plugin system)
     # Note: cuvis-ai (node catalog) is NOT needed -- only the core framework.
-    "cuvis-ai-core>=0.3.4",
-    "cuvis-ai-schemas>=0.4.0",
+    "cuvis-ai-core>=0.7.1",
+    "cuvis-ai-schemas>=0.5.2",
     # SAM3-specific dependencies (not provided by cuvis-ai-core)
     "timm>=1.0.17",
     "tqdm",
@@ -71,6 +71,11 @@ dependencies = [
     "lxml>=6.1.0",
     # CVE-2026-40192 fix; pulled in transitively (torchvision et al.).
     "pillow>=12.2.0",
+    # gitpython / idna / urllib3 / aiohttp security floors now live in cuvis-ai-core (>=0.7.1)
+    # and are inherited transitively, so they are no longer pinned here.
+    # starlette stays: it is sam3-specific (fastapi REST API), not provided by core.
+    # PYSEC-2026-161 fix; fastapi resolves starlette 1.x.
+    "starlette>=1.0.1",
 ]
 
 [project.optional-dependencies]
@@ -90,6 +95,8 @@ dev = [
     # --- Release automation & security ---
     "twine>=6.2.0",
     "pip-audit>=2.7.0",
+    # CVE-2026-6357 / PYSEC-2026-196 fix; pip-audit pulls pip into the dev env.
+    "pip>=26.1.2",
     "bandit[toml]>=1.7.0",
     "detect-secrets>=1.4.0",
     "pip-licenses>=4.0.0",
@@ -127,8 +134,9 @@ explicit = true
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-# Exclude upstream SAM3 fork and Meta scripts from ALL ruff processing (format + lint)
-extend-exclude = ["sam3", "scripts", "examples"]
+# Exclude upstream SAM3 fork and Meta scripts/tests from ALL ruff processing (format + lint).
+# `test` is Meta's upstream test dir (cuvis tests live in `tests`).
+extend-exclude = ["sam3", "scripts", "examples", "test"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## 0.1.6 - 2026-06-10
+
+- Require `cuvis-ai-core>=0.7.1` and `cuvis-ai-schemas>=0.5.2`, inheriting the upstream security floors (`gitpython`, `idna`, `urllib3`, `aiohttp`) transitively instead of pinning them here; kept the `starlette>=1.0.1` pin (REST API, PYSEC-2026-161).
+- Synced the fork with `facebookresearch/sam3` `main`.
+- Added the `cuvis_ai_compat.yml` dependency-compatibility workflow (audits the plugin's deps against the cuvis-ai-core lock).
+- Removed the PyPI/TestPyPI release workflow; the plugin is distributed via git tags referenced from cuvis-ai plugin manifests.
+- Excluded Meta's upstream `test/` directory from ruff; stripped `torch` / `torchvision` wheel hashes from `uv.lock`.
+
 ## 0.1.5 - 2026-04-30
 
 - Added `reset()` to `SAM3TrackerInference` and overrides in `SAM3TextPropagation`, `SAM3BboxPropagation`, and `SAM3MaskPropagation`. `reset()` clears per-stream tracker state (`_inference_state`, `_generator`, `_frame_buffer`, `_frame_idx`, `_source_frame_ids`, `_internal_to_export_obj_id`, `_next_export_obj_id`, plus prompt-specific seed/category state in subclasses) while preserving the loaded `_model` on GPU. `Predictor._reset_nodes()` now drives this automatically at the start of each `predict()` run, so reusing the same streaming node across two runs (for example, mask propagation on RGB then on a CIR rendering of the same scene) starts the second run with a fresh stream instead of carrying state over.
