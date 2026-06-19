@@ -77,8 +77,8 @@ dependencies = [
     # gitpython / idna / urllib3 / aiohttp security floors now live in cuvis-ai-core (>=0.7.1)
     # and are inherited transitively, so they are no longer pinned here.
     # starlette stays: it is sam3-specific (fastapi REST API), not provided by core.
-    # PYSEC-2026-161 fix; fastapi resolves starlette 1.x.
-    "starlette>=1.0.1",
+    # >=1.3.1 fixes CVE-2026-54282 / CVE-2026-54283 (urlencoded form DoS, URL authority spoof).
+    "starlette>=1.3.1",
 ]
 
 [project.optional-dependencies]
