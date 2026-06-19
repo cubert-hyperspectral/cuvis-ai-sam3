@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## 0.1.7 - 2026-06-19
+
+- Require `cuvis-ai-core>=0.8.0` and `cuvis-ai-schemas>=0.6.0`, adopting the released framework versions.
+- Capped `setuptools<83` (was `<81`) so the plugin co-installs with cuvis-ai, which requires `setuptools>=81`. `sam3/model_builder.py` imports the deprecated `pkg_resources` at runtime, which still ships in setuptools 81 and 82.
+
 ## 0.1.6 - 2026-06-10
 
 - Require `cuvis-ai-core>=0.7.1` and `cuvis-ai-schemas>=0.5.2`, inheriting the upstream security floors (`gitpython`, `idna`, `urllib3`, `aiohttp`) transitively instead of pinning them here; kept the `starlette>=1.0.1` pin (REST API, PYSEC-2026-161).
