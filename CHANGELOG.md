@@ -7,6 +7,7 @@
 - Require `cuvis-ai-core>=0.10.0` and `cuvis-ai-schemas>=0.7.0`, adopting the released framework versions.
 - Capped `setuptools<83` (was `<81`) so the plugin co-installs with cuvis-ai, which requires `setuptools>=81`. `sam3/model_builder.py` imports the deprecated `pkg_resources` at runtime, which still ships in setuptools 81 and 82.
 - Bumped `starlette>=1.3.1` for the CVE-2026-54282 / CVE-2026-54283 fixes, and ignored the torch `CVE-2025-3000` (no fixed release) and cryptography `GHSA-537c-gmf6-5ccf` (the 48.0.1 fix must land in a cuvis-ai-core release first) advisories in the pip-audit step.
+- Bumped `pydantic-settings>=2.14.2` (GHSA-4xgf-cpjx-pc3j, symlink secrets-dir escape) and refreshed the locked `msgpack` to 1.2.1 (GHSA-6v7p-g79w-8964, pulled in transitively by pip-audit).
 
 ## 0.1.6 - 2026-06-10
 
