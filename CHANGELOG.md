@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- CI: scope the detect-secrets scan to git-tracked files (drop `--all-files`), cutting the Security Scanning job runtime.
+
 ## 0.1.7 - 2026-06-23
 
 - Require `cuvis-ai-core>=0.10.0` and `cuvis-ai-schemas>=0.7.0`, adopting the released framework versions.
