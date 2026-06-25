@@ -2,8 +2,9 @@
 
 ## [Unreleased]
 
+- Added `SAM3PointExpansion`: single-frame interactive object selection that expands positive / negative / neutral click points into one object mask. Re-promptable in place, the ViT image embedding is cached by `frame_id` so re-sending points for the same frame only re-runs the lightweight mask decoder. Points arrive as a per-frame list of `{element_id, x, y, type}` dicts; the single object's id is the `prompt_obj_id` hparam.
+- Extracted the shared single-frame image-predictor logic into `_Sam3ImageNode` (`_sam3_image_base.py`): model build, `set_image` embedding, `predict_inst` decode, RGB-frame normalization, autocast eval context, and empty-output shape. `SAM3SegmentEverything` now subclasses it, dropping ~76 lines of duplication. The module is underscore-prefixed so `auto_register_package` skips the abstract base.
 - Added a `no-local-sources` CI workflow that fails if `pyproject.toml` declares a local `[tool.uv.sources]` path entry (a machine-specific path must not ship in a release).
-
 - CI: scope the detect-secrets scan to git-tracked files (drop `--all-files`), cutting the Security Scanning job runtime.
 
 ## 0.1.7 - 2026-06-23
