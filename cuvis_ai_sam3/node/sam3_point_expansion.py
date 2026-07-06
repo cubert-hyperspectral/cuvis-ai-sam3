@@ -64,7 +64,7 @@ class SAM3PointExpansion(_Sam3ImageNode):
     )
 
     INPUT_SPECS = {
-        "rgb_frame": PortSpec(
+        "rgb_image": PortSpec(
             dtype=torch.float32,
             shape=(1, -1, -1, 3),
             description="RGB frame [1,H,W,3] in float32 with values in [0,1].",
@@ -197,14 +197,14 @@ class SAM3PointExpansion(_Sam3ImageNode):
 
     def forward(
         self,
-        rgb_frame: torch.Tensor,
+        rgb_image: torch.Tensor,
         points: list[dict[str, Any]] | None = None,
         frame_id: torch.Tensor | None = None,
         context: Context | None = None,  # noqa: ARG002
         **_: Any,
     ) -> dict[str, torch.Tensor]:
         """Expand the current point set into one object mask on this frame."""
-        frame_np = self._normalize_frame(rgb_frame)
+        frame_np = self._normalize_frame(rgb_image)
         height, width = int(frame_np.shape[0]), int(frame_np.shape[1])
 
         # Drop neutral points; bail out early when there is nothing to segment.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -1121,6 +1122,82 @@ class TestSAM3MaskPropagation:
         assert result["object_ids"].shape == (1, 0)
         assert result["detection_scores"].shape == (1, 0)
         node._ensure_model.assert_not_called()
+
+    def test_prune_state_keeps_seed_and_bounded_recent_tracking_state(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_prune")
+        node._state_keep_recent = 4
+        node._buffer_keep_recent = 2
+        node._frame_buffer = _FrameBuffer(image_size=4, device=torch.device("cpu"))
+        for _ in range(10):
+            node._frame_buffer.add(np.zeros((4, 4, 3), dtype=np.float32))
+
+        def _frame_dict() -> dict[int, object]:
+            return {idx: object() for idx in range(10)}
+
+        tracker_state = {
+            "output_dict": {
+                "cond_frame_outputs": {0: "seed"},
+                "non_cond_frame_outputs": _frame_dict(),
+            },
+            "output_dict_per_obj": {
+                0: {
+                    "cond_frame_outputs": {0: "seed"},
+                    "non_cond_frame_outputs": _frame_dict(),
+                }
+            },
+            "temp_output_dict_per_obj": {
+                0: {"non_cond_frame_outputs": _frame_dict()}
+            },
+            "consolidated_frame_inds": {
+                "cond_frame_outputs": {0},
+                "non_cond_frame_outputs": set(range(10)),
+            },
+            "frames_already_tracked": {
+                idx: {"reverse": False} for idx in range(10)
+            },
+        }
+        node._inference_state = {
+            "cached_frame_outputs": _frame_dict(),
+            "feature_cache": {"tracking_bounds": {}, **_frame_dict()},
+            "previous_stages_out": _frame_dict(),
+            "per_frame_raw_point_input": _frame_dict(),
+            "per_frame_raw_box_input": _frame_dict(),
+            "per_frame_visual_prompt": _frame_dict(),
+            "per_frame_geometric_prompt": _frame_dict(),
+            "per_frame_cur_step": _frame_dict(),
+            "tracker_metadata": {
+                "obj_id_to_tracker_score_frame_wise": _frame_dict(),
+                "rank0_metadata": {"suppressed_obj_ids": _frame_dict()},
+            },
+            "tracker_inference_states": [tracker_state],
+            "input_batch": SimpleNamespace(
+                find_inputs=_frame_dict(),
+                find_targets=_frame_dict(),
+                find_metadatas=_frame_dict(),
+            ),
+        }
+
+        node._prune_state_for_frame(9)
+
+        assert sorted(node._frame_buffer._frames) == [8, 9]
+        assert sorted(node._inference_state["cached_frame_outputs"]) == [6, 7, 8, 9]
+        assert sorted(k for k in node._inference_state["feature_cache"] if isinstance(k, int)) == [9]
+        assert sorted(tracker_state["output_dict"]["cond_frame_outputs"]) == [0]
+        assert sorted(tracker_state["output_dict"]["non_cond_frame_outputs"]) == [6, 7, 8, 9]
+        assert sorted(
+            tracker_state["output_dict_per_obj"][0]["non_cond_frame_outputs"]
+        ) == [6, 7, 8, 9]
+        assert sorted(
+            tracker_state["temp_output_dict_per_obj"][0]["non_cond_frame_outputs"]
+        ) == [6, 7, 8, 9]
+        assert sorted(tracker_state["consolidated_frame_inds"]["cond_frame_outputs"]) == [0]
+        assert sorted(tracker_state["consolidated_frame_inds"]["non_cond_frame_outputs"]) == [
+            6,
+            7,
+            8,
+            9,
+        ]
+        assert sorted(tracker_state["frames_already_tracked"]) == [6, 7, 8, 9]
 
     def test_text_without_mask_returns_empty_output_and_skips_model_init(self) -> None:
         node = SAM3MaskPropagation(name="test_mask_text_no_seed")

@@ -24,7 +24,7 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from loguru import logger
 
-from .utils import _bbox_iou_xyxy, _binary_mask_from_xyxy, _centroid_point_from_binary_mask
+from .utils import _bbox_iou_xyxy, _binary_mask_from_xyxy, _interior_points_per_component
 
 _STREAMING_SENTINEL = 10**7
 
@@ -166,7 +166,7 @@ class SAM3TrackerInference(Node):
     }
 
     INPUT_SPECS = {
-        "rgb_frame": PortSpec(dtype=torch.float32, shape=(1, -1, -1, 3)),
+        "rgb_image": PortSpec(dtype=torch.float32, shape=(1, -1, -1, 3)),
         "frame_id": PortSpec(
             dtype=torch.int64,
             shape=(1,),
@@ -211,6 +211,7 @@ class SAM3TrackerInference(Node):
         self._internal_to_export_obj_id: dict[int, int] = {}
         self._next_export_obj_id: int = 1
         self._evict_horizon: int = 64
+        self._state_keep_recent: int = 16
         # Keep a tiny recent frame window in memory for safety.
         self._buffer_keep_recent: int = 2
 
@@ -261,7 +262,9 @@ class SAM3TrackerInference(Node):
         )
         tracker = getattr(self._model, "tracker", None)
         max_obj_ptrs = int(getattr(tracker, "max_obj_ptrs_in_encoder", 16))
-        self._evict_horizon = 4 * max_obj_ptrs
+        num_maskmem = int(getattr(tracker, "num_maskmem", 0))
+        self._state_keep_recent = max(self._buffer_keep_recent, max_obj_ptrs, num_maskmem)
+        self._evict_horizon = self._state_keep_recent
         self._install_streaming_detector_guard()
 
     def _install_streaming_detector_guard(self) -> None:
@@ -614,13 +617,23 @@ class SAM3TrackerInference(Node):
         for key in stale:
             container.pop(key, None)
 
+    @staticmethod
+    def _prune_frame_set(container: Any, keep_from: int) -> None:
+        """Remove integer frame IDs strictly less than ``keep_from`` from a set."""
+        if not isinstance(container, set):
+            return
+        stale = [k for k in container if isinstance(k, int) and k < keep_from]
+        for key in stale:
+            container.discard(key)
+
     def _prune_state_for_frame(self, frame_idx: int) -> None:
         """Free cached historical data to keep long runs bounded in memory."""
         if self._inference_state is None:
             return
         state = self._inference_state
 
-        keep_from = max(0, frame_idx - self._buffer_keep_recent + 1)
+        keep_from = max(0, frame_idx - self._state_keep_recent + 1)
+        frame_buffer_keep_from = max(0, frame_idx - self._buffer_keep_recent + 1)
 
         cached = state.get("cached_frame_outputs")
         if isinstance(cached, dict):
@@ -680,9 +693,10 @@ class SAM3TrackerInference(Node):
                         del tracked[key]
 
         if self._frame_buffer is not None:
-            self._frame_buffer.prune_before(keep_from)
+            self._frame_buffer.prune_before(frame_buffer_keep_from)
 
         self._prune_dict(state.get("previous_stages_out"), keep_from)
+        self._prune_dict(state.get("feature_cache"), frame_idx)
         self._prune_dict(state.get("per_frame_raw_point_input"), keep_from)
         self._prune_dict(state.get("per_frame_raw_box_input"), keep_from)
         self._prune_dict(state.get("per_frame_visual_prompt"), keep_from)
@@ -695,6 +709,29 @@ class SAM3TrackerInference(Node):
             self._prune_dict(input_batch.find_targets, keep_from)
             self._prune_dict(input_batch.find_metadatas, keep_from)
 
+        for tracker_state in state.get("tracker_inference_states", []):
+            if not isinstance(tracker_state, dict):
+                continue
+
+            output_dict = tracker_state.get("output_dict", {})
+            if isinstance(output_dict, dict):
+                self._prune_dict(output_dict.get("non_cond_frame_outputs"), keep_from)
+
+            for obj_dict in tracker_state.get("output_dict_per_obj", {}).values():
+                if isinstance(obj_dict, dict):
+                    self._prune_dict(obj_dict.get("non_cond_frame_outputs"), keep_from)
+
+            for temp_dict in tracker_state.get("temp_output_dict_per_obj", {}).values():
+                if isinstance(temp_dict, dict):
+                    self._prune_dict(temp_dict.get("non_cond_frame_outputs"), keep_from)
+
+            consolidated = tracker_state.get("consolidated_frame_inds", {})
+            if isinstance(consolidated, dict):
+                self._prune_frame_set(consolidated.get("non_cond_frame_outputs"), keep_from)
+
+            tracked = tracker_state.get("frames_already_tracked")
+            self._prune_dict(tracked, keep_from)
+
     def _inject_mask_prompt_for_object(
         self,
         binary_mask: np.ndarray,
@@ -702,7 +739,7 @@ class SAM3TrackerInference(Node):
         frame_idx: int,
         obj_id: int,
     ) -> None:
-        """Inject one object update into tracker state using mask + centroid point."""
+        """Inject one object update into tracker state using mask + per-component interior points."""
         device = self._model_device()
         self._inference_state["cached_frame_outputs"].setdefault(int(frame_idx), {})
 
@@ -716,16 +753,20 @@ class SAM3TrackerInference(Node):
                 mask=mask_tensor,
             )
 
-        point_xy = _centroid_point_from_binary_mask(mask_binary)
-        if point_xy is None:
+        # One positive point per connected component, each at that component's distance-transform
+        # interior (deepest-inside pixel). A single union centroid can fall in a background gap between
+        # disjoint regions of the same object; a per-component interior point keeps every region
+        # represented and never lands outside the mask.
+        interior_points = _interior_points_per_component(mask_binary)
+        if not interior_points:
             return
 
         with self._model_eval_context():
             self._model.add_prompt(
                 self._inference_state,
                 frame_idx=int(frame_idx),
-                points=torch.tensor([list(point_xy)], dtype=torch.float32, device=device),
-                point_labels=torch.tensor([1], dtype=torch.int64, device=device),
+                points=torch.tensor(interior_points, dtype=torch.float32, device=device),
+                point_labels=torch.ones(len(interior_points), dtype=torch.int64, device=device),
                 obj_id=int(obj_id),
             )
 
@@ -820,7 +861,7 @@ class SAM3TrackerInference(Node):
 
     def forward(
         self,
-        rgb_frame: torch.Tensor,
+        rgb_image: torch.Tensor,
         frame_id: torch.Tensor | None = None,
         context: Context | None = None,  # noqa: ARG002
         **_: Any,
@@ -829,7 +870,7 @@ class SAM3TrackerInference(Node):
 
         Parameters
         ----------
-        rgb_frame : torch.Tensor
+        rgb_image : torch.Tensor
             Shape ``[1, H, W, 3]``, float32, values in ``[0, 1]``.
 
         Returns
@@ -838,7 +879,7 @@ class SAM3TrackerInference(Node):
         """
         self._ensure_model()
 
-        frame_np = rgb_frame[0].detach().cpu().numpy()  # [H, W, 3] float32
+        frame_np = rgb_image[0].detach().cpu().numpy()  # [H, W, 3] float32
         frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
         stream_idx = self._frame_idx
         source_frame_id = self._resolve_source_frame_id(frame_id, fallback_stream_idx=stream_idx)
@@ -1087,14 +1128,14 @@ class SAM3TextPropagation(SAM3TrackerInference):
 
     def forward(
         self,
-        rgb_frame: torch.Tensor,
+        rgb_image: torch.Tensor,
         text_prompt: str | None = None,
         frame_id: torch.Tensor | None = None,
         context: Context | None = None,  # noqa: ARG002
         **_: Any,
     ) -> dict[str, torch.Tensor]:
         """Process one RGB frame with an optional runtime text prompt."""
-        frame_np = rgb_frame[0].detach().cpu().numpy()
+        frame_np = rgb_image[0].detach().cpu().numpy()
         frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
 
         stream_idx = self._frame_idx
@@ -1444,14 +1485,14 @@ class SAM3BboxPropagation(SAM3TrackerInference):
 
     def forward(
         self,
-        rgb_frame: torch.Tensor,
+        rgb_image: torch.Tensor,
         bboxes: list[dict[str, Any]] | None = None,
         frame_id: torch.Tensor | None = None,
         context: Context | None = None,  # noqa: ARG002
         **_: Any,
     ) -> dict[str, torch.Tensor]:
         """Process one RGB frame with optional runtime bbox prompts."""
-        frame_np = rgb_frame[0].detach().cpu().numpy()
+        frame_np = rgb_image[0].detach().cpu().numpy()
         frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
 
         stream_idx = self._frame_idx
@@ -1660,7 +1701,8 @@ class SAM3MaskPropagation(SAM3TrackerInference):
                 "Runtime mask shape does not match current RGB frame: "
                 f"mask={(actual_h, actual_w)}, rgb={(expected_h, expected_w)}."
             )
-        return np.asarray(mask[0].detach().cpu().numpy(), dtype=np.int64)
+        label_map = np.asarray(mask[0].detach().cpu().numpy(), dtype=np.int64)
+        return label_map
 
     def _push_runtime_text_context(self, text_prompt: str | None) -> dict[str, Any] | None:
         normalized_prompt = self._normalize_runtime_text_prompt(text_prompt)
@@ -1721,7 +1763,7 @@ class SAM3MaskPropagation(SAM3TrackerInference):
 
     def forward(
         self,
-        rgb_frame: torch.Tensor,
+        rgb_image: torch.Tensor,
         mask: torch.Tensor | None = None,
         text_prompt: str | None = None,
         frame_id: torch.Tensor | None = None,
@@ -1729,7 +1771,7 @@ class SAM3MaskPropagation(SAM3TrackerInference):
         **_: Any,
     ) -> dict[str, torch.Tensor]:
         """Process one RGB frame with optional runtime mask prompts."""
-        frame_np = rgb_frame[0].detach().cpu().numpy()
+        frame_np = rgb_image[0].detach().cpu().numpy()
         frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
 
         stream_idx = self._frame_idx

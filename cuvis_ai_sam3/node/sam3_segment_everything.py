@@ -64,7 +64,7 @@ class SAM3SegmentEverything(_Sam3ImageNode):
     )
 
     INPUT_SPECS = {
-        "rgb_frame": PortSpec(
+        "rgb_image": PortSpec(
             dtype=torch.float32,
             shape=(1, -1, -1, 3),
             description="RGB frame [1,H,W,3] in float32 with values in [0,1].",
@@ -651,7 +651,7 @@ class SAM3SegmentEverything(_Sam3ImageNode):
     @torch.inference_mode()
     def forward(
         self,
-        rgb_frame: torch.Tensor,
+        rgb_image: torch.Tensor,
         frame_id: torch.Tensor | None = None,  # noqa: ARG002
         context: Context | None = None,  # noqa: ARG002
         **_: Any,
@@ -659,7 +659,7 @@ class SAM3SegmentEverything(_Sam3ImageNode):
         """Segment all mask candidates in the current frame."""
         self._ensure_model()
 
-        frame_np = self._normalize_frame(rgb_frame)
+        frame_np = self._normalize_frame(rgb_image)
         frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
         candidates = self._collect_candidates(frame_np)
         result = self._pack_output(candidates, frame_shape=frame_shape)

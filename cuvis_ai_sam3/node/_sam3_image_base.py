@@ -113,13 +113,13 @@ class _Sam3ImageNode(Node):
         self._processor = None
 
     @staticmethod
-    def _normalize_frame(rgb_frame: torch.Tensor) -> np.ndarray:
+    def _normalize_frame(rgb_image: torch.Tensor) -> np.ndarray:
         """Validate the RGB frame and return an [H,W,3] float32 array clipped to [0,1]."""
-        if rgb_frame.ndim != 4 or int(rgb_frame.shape[0]) != 1:
+        if rgb_image.ndim != 4 or int(rgb_image.shape[0]) != 1:
             raise ValueError(
-                f"Expected rgb_frame shape [1,H,W,3], got {tuple(int(v) for v in rgb_frame.shape)}."
+                f"Expected rgb_image shape [1,H,W,3], got {tuple(int(v) for v in rgb_image.shape)}."
             )
-        frame_np = np.asarray(rgb_frame[0].detach().cpu().numpy(), dtype=np.float32)
+        frame_np = np.asarray(rgb_image[0].detach().cpu().numpy(), dtype=np.float32)
         if frame_np.ndim != 3 or int(frame_np.shape[2]) != 3:
             raise ValueError(f"Expected RGB frame with shape [H,W,3], got {tuple(frame_np.shape)}.")
         return np.clip(frame_np, 0.0, 1.0)
