@@ -1,29 +1,19 @@
 ![image](https://raw.githubusercontent.com/cubert-hyperspectral/cuvis.sdk/main/branding/logo/banner.png)
 
-# CUVIS.AI SAM3
+# Cuvis.AI SAM3
 
-This repository provides a port of SAM3 as a cuvis.ai plugin, enabling promptable segmentation and tracking pipelines. It is maintained by Cubert GmbH as part of the cuvis.ai ecosystem.
+Cuvis.AI plugin that adapts SAM3 for Cuvis.AI stream-mode applications, bringing promptable segmentation and tracking to Cuvis.AI pipelines. Maintained by Cubert GmbH as part of the Cuvis.AI ecosystem.
 
-## Platform
+## Capabilities
 
-cuvis.ai is split across multiple repositories:
+**Nodes**
 
-| Repository | Role |
-|---|---|
-| [cuvis-ai-core](https://github.com/cubert-hyperspectral/cuvis-ai-core) | Framework — base `Node` class, pipeline orchestration, services, and plugin system |
-| [cuvis-ai-schemas](https://github.com/cubert-hyperspectral/cuvis-ai-schemas) | Shared schema definitions and generated types |
-| [cuvis-ai](https://github.com/cubert-hyperspectral/cuvis-ai) | Node catalog and end-user pipeline examples |
-| **cuvis-ai-sam3** (this repo) | SAM3 plugin — cuvis.ai nodes for promptable segmentation and tracking |
-
-## Nodes
-
-| Node | Description |
-|---|---|
-| `SAM3TextPropagation` | Text or concept-based object detection and tracking |
-| `SAM3BboxPropagation` | Bounding-box prompt tracking |
-| `SAM3PointPropagation` | Point prompt tracking |
-| `SAM3MaskPropagation` | Mask or label-map based tracking |
-| `SAM3SegmentEverything` | Prompt-free instance segmentation |
+- `SAM3TextPropagation`: text or concept-based object detection and tracking
+- `SAM3BboxPropagation`: bounding-box prompt tracking
+- `SAM3PointPropagation`: point prompt tracking
+- `SAM3MaskPropagation`: mask or label-map based tracking
+- `SAM3SegmentEverything`: prompt-free instance segmentation on a single frame
+- `SAM3PointExpansion`: expands positive/negative click points into one object mask on a single frame
 
 ## Quick Start
 
@@ -35,7 +25,7 @@ cd cuvis-ai-sam3
 uv sync --all-extras
 ```
 
-For cuvis.ai usage examples, see the SAM3 object-tracking pipelines in [cuvis-ai](https://github.com/cubert-hyperspectral/cuvis-ai/tree/main/examples/object_tracking/sam3).
+For Cuvis.AI usage examples, see the SAM3 object-tracking pipelines in [cuvis-ai](https://github.com/cubert-hyperspectral/cuvis-ai/tree/main/examples/object_tracking/sam3).
 
 For the original upstream SAM3 repository README, installation details, research background, and example notebooks, see [README_original.md](README_original.md).
 

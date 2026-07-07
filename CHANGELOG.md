@@ -1,9 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## 0.2.0 - 2026-07-07
 
-- Added a `no-local-sources` CI workflow that fails if `pyproject.toml` declares a local `[tool.uv.sources]` path entry (a machine-specific path must not ship in a release).
-
+- Added `SAM3PointExpansion`: single-frame interactive node that expands positive / negative / neutral click points into one object mask, caching the ViT image embedding per `frame_id` so re-prompts only re-run the lightweight mask decoder.
+- Renamed the RGB input port `rgb_frame` -> `rgb_image` on every SAM3 node (breaking); pipelines wiring `<sam3_node>.inputs.rgb_frame` must switch to `.inputs.rgb_image`.
+- Fixed `SAM3MaskPropagation` collapsing a single-component seed to a tiny blob; `_interior_points_per_component` now samples several interior points per component (adaptive grid plus distance-transform anchor) instead of one.
+- Extracted the shared single-frame image-predictor logic into `_Sam3ImageNode` (`_sam3_image_base.py`); `SAM3SegmentEverything` now subclasses it, dropping ~76 lines of duplication (underscore-prefixed so `auto_register_package` skips the base).
+- Added a `no-local-sources` CI workflow that fails if `pyproject.toml` declares a local `[tool.uv.sources]` path entry.
 - CI: scope the detect-secrets scan to git-tracked files (drop `--all-files`), cutting the Security Scanning job runtime.
 
 ## 0.1.7 - 2026-06-23

@@ -7,16 +7,14 @@ independently and emits a dense per-frame label map plus per-instance scores.
 
 from __future__ import annotations
 
-import contextlib
 import math
 from dataclasses import dataclass
 from itertools import product
-from typing import Any, ClassVar
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from cuvis_ai_core.node import Node
 from cuvis_ai_schemas.enums import NodeCategory, NodeTag
 from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
@@ -24,6 +22,8 @@ from loguru import logger
 from PIL import Image
 from torchvision.ops import masks_to_boxes
 from torchvision.ops.boxes import batched_nms, box_area
+
+from ._sam3_image_base import _Sam3ImageNode
 
 
 @dataclass(slots=True)
@@ -37,7 +37,7 @@ class _MaskCandidate:
     crop_box_xyxy: torch.Tensor
 
 
-class SAM3SegmentEverything(Node):
+class SAM3SegmentEverything(_Sam3ImageNode):
     """Segment everything on one RGB frame using SAM3 point-grid prompting.
 
     The node mirrors the SAM2 automatic mask generator pattern:
@@ -63,13 +63,8 @@ class SAM3SegmentEverything(Node):
         }
     )
 
-    _AUTOCAST_DTYPE: ClassVar[dict[str, torch.dtype]] = {
-        "cuda": torch.bfloat16,
-        "cpu": torch.bfloat16,
-    }
-
     INPUT_SPECS = {
-        "rgb_frame": PortSpec(
+        "rgb_image": PortSpec(
             dtype=torch.float32,
             shape=(1, -1, -1, 3),
             description="RGB frame [1,H,W,3] in float32 with values in [0,1].",
@@ -131,10 +126,6 @@ class SAM3SegmentEverything(Node):
             if not (0.0 <= float(value) <= 1.0):
                 raise ValueError(f"{name} must be in [0, 1].")
 
-        self._checkpoint_path = checkpoint_path
-        self._requested_device = device
-        self._resolved_device = str(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self._compile_model = bool(compile_model)
         self._points_per_side = int(points_per_side)
         self._points_per_batch = int(points_per_batch)
         self._pred_iou_thresh = float(pred_iou_thresh)
@@ -149,8 +140,6 @@ class SAM3SegmentEverything(Node):
         self._min_mask_region_area = int(min_mask_region_area)
         self._multimask_output = bool(multimask_output)
 
-        self._model: Any | None = None
-        self._processor: Any | None = None
         self._warned_small_region_skip = False
         self._point_grids = self._build_point_grids(
             n_per_side=self._points_per_side,
@@ -342,69 +331,10 @@ class SAM3SegmentEverything(Node):
                 fill_labels = [int(np.argmax(sizes)) + 1]
         return np.isin(regions, fill_labels), True
 
-    def _ensure_model(self) -> None:
-        if self._model is not None and self._processor is not None:
-            return
-
-        from sam3.model.sam3_image_processor import Sam3Processor
-        from sam3.model_builder import build_sam3_image_model
-
-        build_kwargs: dict[str, Any] = {
-            "device": self._resolved_device,
-            "enable_inst_interactivity": True,
-        }
-        if self._checkpoint_path:
-            build_kwargs["checkpoint_path"] = self._checkpoint_path
-        if self._compile_model:
-            build_kwargs["compile"] = True
-
-        self._model = build_sam3_image_model(**build_kwargs)
-        self._processor = Sam3Processor(
-            self._model, device=self._resolved_device, confidence_threshold=0.0
-        )
-        logger.info(
-            "SAM3SegmentEverything model loaded (device={}, points_per_side={}, crop_n_layers={})",
-            self._resolved_device,
-            self._points_per_side,
-            self._crop_n_layers,
-        )
-
-    def _model_eval_context(self) -> contextlib.AbstractContextManager[None]:
-        """Return the appropriate autocast context for the resolved device.
-
-        The SAM3 image stack emits bfloat16 activations in its vision path and
-        expects autocast to reconcile those with float32 weights.
-        """
-        device_type = str(self._resolved_device).split(":")[0]
-        dtype = self._AUTOCAST_DTYPE.get(device_type)
-        if dtype is not None:
-            return torch.autocast(device_type=device_type, dtype=dtype)
-        return contextlib.nullcontext()
-
     def cleanup(self) -> None:
-        """Release the loaded SAM3 image model and processor handles."""
-        self._model = None
-        self._processor = None
+        """Release the SAM3 model/processor handles and reset the warning latch."""
+        super().cleanup()
         self._warned_small_region_skip = False
-
-    @staticmethod
-    def _normalize_frame(rgb_frame: torch.Tensor) -> np.ndarray:
-        if rgb_frame.ndim != 4 or int(rgb_frame.shape[0]) != 1:
-            raise ValueError(
-                f"Expected rgb_frame shape [1,H,W,3], got {tuple(int(v) for v in rgb_frame.shape)}."
-            )
-        frame_np = np.asarray(rgb_frame[0].detach().cpu().numpy(), dtype=np.float32)
-        if frame_np.ndim != 3 or int(frame_np.shape[2]) != 3:
-            raise ValueError(f"Expected RGB frame with shape [H,W,3], got {tuple(frame_np.shape)}.")
-        return np.clip(frame_np, 0.0, 1.0)
-
-    @staticmethod
-    def _empty_output(height: int, width: int) -> dict[str, torch.Tensor]:
-        return {
-            "mask": torch.zeros((1, int(height), int(width)), dtype=torch.int32),
-            "object_ids": torch.zeros((1, 0), dtype=torch.int64),
-            "detection_scores": torch.zeros((1, 0), dtype=torch.float32),
-        }
 
     def _remove_small_regions_if_enabled(
         self,
@@ -721,7 +651,7 @@ class SAM3SegmentEverything(Node):
     @torch.inference_mode()
     def forward(
         self,
-        rgb_frame: torch.Tensor,
+        rgb_image: torch.Tensor,
         frame_id: torch.Tensor | None = None,  # noqa: ARG002
         context: Context | None = None,  # noqa: ARG002
         **_: Any,
@@ -729,7 +659,7 @@ class SAM3SegmentEverything(Node):
         """Segment all mask candidates in the current frame."""
         self._ensure_model()
 
-        frame_np = self._normalize_frame(rgb_frame)
+        frame_np = self._normalize_frame(rgb_image)
         frame_shape = (int(frame_np.shape[0]), int(frame_np.shape[1]))
         candidates = self._collect_candidates(frame_np)
         result = self._pack_output(candidates, frame_shape=frame_shape)

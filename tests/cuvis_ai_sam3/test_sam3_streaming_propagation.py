@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import json
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -1122,6 +1123,86 @@ class TestSAM3MaskPropagation:
         assert result["detection_scores"].shape == (1, 0)
         node._ensure_model.assert_not_called()
 
+    def test_prune_state_keeps_seed_and_bounded_recent_tracking_state(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_prune")
+        node._state_keep_recent = 4
+        node._buffer_keep_recent = 2
+        node._frame_buffer = _FrameBuffer(image_size=4, device=torch.device("cpu"))
+        for _ in range(10):
+            node._frame_buffer.add(np.zeros((4, 4, 3), dtype=np.float32))
+
+        def _frame_dict() -> dict[int, object]:
+            return {idx: object() for idx in range(10)}
+
+        tracker_state = {
+            "output_dict": {
+                "cond_frame_outputs": {0: "seed"},
+                "non_cond_frame_outputs": _frame_dict(),
+            },
+            "output_dict_per_obj": {
+                0: {
+                    "cond_frame_outputs": {0: "seed"},
+                    "non_cond_frame_outputs": _frame_dict(),
+                }
+            },
+            "temp_output_dict_per_obj": {0: {"non_cond_frame_outputs": _frame_dict()}},
+            "consolidated_frame_inds": {
+                "cond_frame_outputs": {0},
+                "non_cond_frame_outputs": set(range(10)),
+            },
+            "frames_already_tracked": {idx: {"reverse": False} for idx in range(10)},
+        }
+        node._inference_state = {
+            "cached_frame_outputs": _frame_dict(),
+            "feature_cache": {"tracking_bounds": {}, **_frame_dict()},
+            "previous_stages_out": _frame_dict(),
+            "per_frame_raw_point_input": _frame_dict(),
+            "per_frame_raw_box_input": _frame_dict(),
+            "per_frame_visual_prompt": _frame_dict(),
+            "per_frame_geometric_prompt": _frame_dict(),
+            "per_frame_cur_step": _frame_dict(),
+            "tracker_metadata": {
+                "obj_id_to_tracker_score_frame_wise": _frame_dict(),
+                "rank0_metadata": {"suppressed_obj_ids": _frame_dict()},
+            },
+            "tracker_inference_states": [tracker_state],
+            "input_batch": SimpleNamespace(
+                find_inputs=_frame_dict(),
+                find_targets=_frame_dict(),
+                find_metadatas=_frame_dict(),
+            ),
+        }
+
+        node._prune_state_for_frame(9)
+
+        assert sorted(node._frame_buffer._frames) == [8, 9]
+        assert sorted(node._inference_state["cached_frame_outputs"]) == [6, 7, 8, 9]
+        assert sorted(k for k in node._inference_state["feature_cache"] if isinstance(k, int)) == [
+            9
+        ]
+        assert sorted(tracker_state["output_dict"]["cond_frame_outputs"]) == [0]
+        assert sorted(tracker_state["output_dict"]["non_cond_frame_outputs"]) == [6, 7, 8, 9]
+        assert sorted(tracker_state["output_dict_per_obj"][0]["non_cond_frame_outputs"]) == [
+            6,
+            7,
+            8,
+            9,
+        ]
+        assert sorted(tracker_state["temp_output_dict_per_obj"][0]["non_cond_frame_outputs"]) == [
+            6,
+            7,
+            8,
+            9,
+        ]
+        assert sorted(tracker_state["consolidated_frame_inds"]["cond_frame_outputs"]) == [0]
+        assert sorted(tracker_state["consolidated_frame_inds"]["non_cond_frame_outputs"]) == [
+            6,
+            7,
+            8,
+            9,
+        ]
+        assert sorted(tracker_state["frames_already_tracked"]) == [6, 7, 8, 9]
+
     def test_text_without_mask_returns_empty_output_and_skips_model_init(self) -> None:
         node = SAM3MaskPropagation(name="test_mask_text_no_seed")
         node._ensure_model = MagicMock()
@@ -1309,3 +1390,57 @@ class TestValidation:
         node._model = mock_model
         node._install_streaming_detector_guard()
         assert mock_detector._streaming_guard_installed is True
+
+
+class TestPruneStateGuards:
+    """Guard branches in the memory-pruning helpers."""
+
+    def test_prune_frame_set_ignores_non_set_container(self) -> None:
+        # A non-set container is left untouched (guarded early return).
+        container = {1: "a", 2: "b"}
+        SAM3TrackerInference._prune_frame_set(container, 5)
+        assert container == {1: "a", 2: "b"}
+
+    def test_prune_state_skips_non_dict_tracker_states(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_prune_nondict")
+        node._state_keep_recent = 4
+        node._buffer_keep_recent = 2
+        node._evict_horizon = 1000  # keep evict_before <= 0 so the eviction block is skipped
+        node._frame_buffer = None
+        node._inference_state = {
+            "tracker_inference_states": [None, 7, {"output_dict": {}}],
+        }
+        # Non-dict entries in the list must be skipped rather than crash.
+        node._prune_state_for_frame(9)
+        assert node._inference_state["tracker_inference_states"][0] is None
+
+
+class TestEnsureModel:
+    """Model-build path of ``_ensure_model`` with a patched builder (no real model)."""
+
+    def test_ensure_model_sizes_state_from_tracker_attrs(self) -> None:
+        node = SAM3TextPropagation(name="test_ensure_model")
+        node._buffer_keep_recent = 3
+
+        mock_model = _make_mock_model()
+        mock_model.tracker.max_obj_ptrs_in_encoder = 12
+        mock_model.tracker.num_maskmem = 7
+        mock_model.detector = None  # guard returns early, no forward to wrap
+
+        with patch("sam3.model_builder.build_sam3_video_model", return_value=mock_model):
+            node._ensure_model()
+
+        assert node._model is mock_model
+        # Eviction window is the max of the buffer floor and the tracker memory depths.
+        assert node._state_keep_recent == 12
+        assert node._evict_horizon == 12
+        assert node._model.hotstart_delay == 0
+
+    def test_ensure_model_is_idempotent(self) -> None:
+        node = SAM3TextPropagation(name="test_ensure_model_idempotent")
+        sentinel = _make_mock_model()
+        node._model = sentinel
+        with patch("sam3.model_builder.build_sam3_video_model") as builder:
+            node._ensure_model()
+        builder.assert_not_called()
+        assert node._model is sentinel
