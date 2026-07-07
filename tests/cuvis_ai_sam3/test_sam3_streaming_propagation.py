@@ -1390,3 +1390,26 @@ class TestValidation:
         node._model = mock_model
         node._install_streaming_detector_guard()
         assert mock_detector._streaming_guard_installed is True
+
+
+class TestPruneStateGuards:
+    """Guard branches in the memory-pruning helpers."""
+
+    def test_prune_frame_set_ignores_non_set_container(self) -> None:
+        # A non-set container is left untouched (guarded early return).
+        container = {1: "a", 2: "b"}
+        SAM3TrackerInference._prune_frame_set(container, 5)
+        assert container == {1: "a", 2: "b"}
+
+    def test_prune_state_skips_non_dict_tracker_states(self) -> None:
+        node = SAM3MaskPropagation(name="test_mask_prune_nondict")
+        node._state_keep_recent = 4
+        node._buffer_keep_recent = 2
+        node._evict_horizon = 1000  # keep evict_before <= 0 so the eviction block is skipped
+        node._frame_buffer = None
+        node._inference_state = {
+            "tracker_inference_states": [None, 7, {"output_dict": {}}],
+        }
+        # Non-dict entries in the list must be skipped rather than crash.
+        node._prune_state_for_frame(9)
+        assert node._inference_state["tracker_inference_states"][0] is None

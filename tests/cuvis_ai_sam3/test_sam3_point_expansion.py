@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import numpy as np
@@ -98,6 +99,52 @@ class TestSAM3PointExpansion:
     def test_parse_points_requires_positive(self) -> None:
         with pytest.raises(ValueError, match="at least one positive"):
             SAM3PointExpansion._parse_points([_neg(1.0, 1.0)])
+
+    def test_parse_points_empty_returns_empty_arrays(self) -> None:
+        coords, labels = SAM3PointExpansion._parse_points([])
+        assert coords.shape == (0, 2)
+        assert labels.shape == (0,)
+        assert coords.dtype == np.float32
+        assert labels.dtype == np.int32
+
+    def test_parse_points_rejects_non_list(self) -> None:
+        with pytest.raises(ValueError, match="list of dicts"):
+            SAM3PointExpansion._parse_points("not-a-list")  # type: ignore[arg-type]
+
+    def test_parse_points_rejects_non_dict_entry(self) -> None:
+        with pytest.raises(ValueError, match="index 0 to be a dict"):
+            SAM3PointExpansion._parse_points([42])  # type: ignore[list-item]
+
+    def test_parse_points_rejects_unknown_type(self) -> None:
+        with pytest.raises(ValueError, match="unknown type"):
+            SAM3PointExpansion._parse_points([{"x": 1.0, "y": 1.0, "type": "bogus"}])
+
+    def test_parse_points_requires_x_and_y(self) -> None:
+        with pytest.raises(ValueError, match="missing 'x' or 'y'"):
+            SAM3PointExpansion._parse_points([{"type": "positive"}])
+
+    def test_pack_output_promotes_3d_masks(self) -> None:
+        node = SAM3PointExpansion(prompt_obj_id=3, name="test_pe_pack_3d")
+        masks = np.full((1, 4, 4), 5.0, dtype=np.float32)
+        result = node._pack_output(masks, np.asarray([0.9]), height=4, width=4)
+        assert sorted(int(v) for v in torch.unique(result["mask"]).tolist()) == [3]
+        assert result["object_ids"].tolist() == [[3]]
+
+    def test_pack_output_rejects_bad_ndim(self) -> None:
+        node = SAM3PointExpansion(name="test_pe_pack_baddim")
+        with pytest.raises(ValueError, match=r"shape \[B,C,H,W\]"):
+            node._pack_output(np.zeros((4, 4)), np.asarray([0.9]), height=4, width=4)
+
+    def test_pack_output_no_candidates_returns_empty(self) -> None:
+        node = SAM3PointExpansion(name="test_pe_pack_empty")
+        result = node._pack_output(
+            np.zeros((1, 0, 4, 4), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            height=4,
+            width=4,
+        )
+        assert int(torch.count_nonzero(result["mask"]).item()) == 0
+        assert result["object_ids"].shape == (1, 0)
 
     def test_positive_negative_labels_mapped_and_multimask_off(self) -> None:
         node = SAM3PointExpansion(name="test_pe_labels")
@@ -201,3 +248,31 @@ class TestSAM3PointExpansion:
         assert specs["mask"].dtype == torch.int32
         assert specs["object_ids"].dtype == torch.int64
         assert specs["detection_scores"].dtype == torch.float32
+
+
+class TestSam3ImageBaseHelpers:
+    """Cover the shared ``_Sam3ImageNode`` helpers via a concrete subclass."""
+
+    def test_normalize_frame_rejects_wrong_batch_shape(self) -> None:
+        with pytest.raises(ValueError, match=r"shape \[1,H,W,3\]"):
+            SAM3PointExpansion._normalize_frame(torch.rand(2, 4, 4, 3))
+
+    def test_normalize_frame_rejects_non_rgb_channels(self) -> None:
+        with pytest.raises(ValueError, match=r"shape \[H,W,3\]"):
+            SAM3PointExpansion._normalize_frame(torch.rand(1, 4, 4, 4))
+
+    def test_normalize_frame_clips_to_unit_range(self) -> None:
+        frame = torch.tensor([[[[-1.0, 0.5, 2.0]]]], dtype=torch.float32)
+        out = SAM3PointExpansion._normalize_frame(frame)
+        assert out.shape == (1, 1, 3)
+        assert out.min() >= 0.0 and out.max() <= 1.0
+
+    def test_model_eval_context_is_noop_on_unsupported_device(self) -> None:
+        node = SAM3PointExpansion(name="test_pe_ctx_mps")
+        node._resolved_device = "mps"
+        assert isinstance(node._model_eval_context(), contextlib.nullcontext)
+
+    def test_model_eval_context_autocasts_on_cpu(self) -> None:
+        node = SAM3PointExpansion(name="test_pe_ctx_cpu")
+        node._resolved_device = "cpu"
+        assert isinstance(node._model_eval_context(), torch.autocast)
