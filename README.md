@@ -4,26 +4,18 @@
 
 This repository provides a port of SAM3 as a cuvis.ai plugin, enabling promptable segmentation and tracking pipelines. It is maintained by Cubert GmbH as part of the cuvis.ai ecosystem.
 
-## Platform
+## Capabilities
 
-cuvis.ai is split across multiple repositories:
+This is a cuvis.ai plugin that adapts SAM3 for cuvis.ai stream-mode applications. It brings the following capabilities to cuvis.ai:
 
-| Repository | Role |
-|---|---|
-| [cuvis-ai-core](https://github.com/cubert-hyperspectral/cuvis-ai-core) | Framework — base `Node` class, pipeline orchestration, services, and plugin system |
-| [cuvis-ai-schemas](https://github.com/cubert-hyperspectral/cuvis-ai-schemas) | Shared schema definitions and generated types |
-| [cuvis-ai](https://github.com/cubert-hyperspectral/cuvis-ai) | Node catalog and end-user pipeline examples |
-| **cuvis-ai-sam3** (this repo) | SAM3 plugin — cuvis.ai nodes for promptable segmentation and tracking |
+**Nodes**
 
-## Nodes
-
-| Node | Description |
-|---|---|
-| `SAM3TextPropagation` | Text or concept-based object detection and tracking |
-| `SAM3BboxPropagation` | Bounding-box prompt tracking |
-| `SAM3PointPropagation` | Point prompt tracking |
-| `SAM3MaskPropagation` | Mask or label-map based tracking |
-| `SAM3SegmentEverything` | Prompt-free instance segmentation |
+- `SAM3TextPropagation`: text or concept-based object detection and tracking
+- `SAM3BboxPropagation`: bounding-box prompt tracking
+- `SAM3PointPropagation`: point prompt tracking
+- `SAM3MaskPropagation`: mask or label-map based tracking
+- `SAM3SegmentEverything`: prompt-free instance segmentation on a single frame
+- `SAM3PointExpansion`: expands positive/negative click points into one object mask on a single frame
 
 ## Quick Start
 
