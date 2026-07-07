@@ -1145,16 +1145,12 @@ class TestSAM3MaskPropagation:
                     "non_cond_frame_outputs": _frame_dict(),
                 }
             },
-            "temp_output_dict_per_obj": {
-                0: {"non_cond_frame_outputs": _frame_dict()}
-            },
+            "temp_output_dict_per_obj": {0: {"non_cond_frame_outputs": _frame_dict()}},
             "consolidated_frame_inds": {
                 "cond_frame_outputs": {0},
                 "non_cond_frame_outputs": set(range(10)),
             },
-            "frames_already_tracked": {
-                idx: {"reverse": False} for idx in range(10)
-            },
+            "frames_already_tracked": {idx: {"reverse": False} for idx in range(10)},
         }
         node._inference_state = {
             "cached_frame_outputs": _frame_dict(),
@@ -1181,15 +1177,23 @@ class TestSAM3MaskPropagation:
 
         assert sorted(node._frame_buffer._frames) == [8, 9]
         assert sorted(node._inference_state["cached_frame_outputs"]) == [6, 7, 8, 9]
-        assert sorted(k for k in node._inference_state["feature_cache"] if isinstance(k, int)) == [9]
+        assert sorted(k for k in node._inference_state["feature_cache"] if isinstance(k, int)) == [
+            9
+        ]
         assert sorted(tracker_state["output_dict"]["cond_frame_outputs"]) == [0]
         assert sorted(tracker_state["output_dict"]["non_cond_frame_outputs"]) == [6, 7, 8, 9]
-        assert sorted(
-            tracker_state["output_dict_per_obj"][0]["non_cond_frame_outputs"]
-        ) == [6, 7, 8, 9]
-        assert sorted(
-            tracker_state["temp_output_dict_per_obj"][0]["non_cond_frame_outputs"]
-        ) == [6, 7, 8, 9]
+        assert sorted(tracker_state["output_dict_per_obj"][0]["non_cond_frame_outputs"]) == [
+            6,
+            7,
+            8,
+            9,
+        ]
+        assert sorted(tracker_state["temp_output_dict_per_obj"][0]["non_cond_frame_outputs"]) == [
+            6,
+            7,
+            8,
+            9,
+        ]
         assert sorted(tracker_state["consolidated_frame_inds"]["cond_frame_outputs"]) == [0]
         assert sorted(tracker_state["consolidated_frame_inds"]["non_cond_frame_outputs"]) == [
             6,
