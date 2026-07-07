@@ -1,12 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## 0.2.0 - 2026-07-07
 
-- **Fixed mask-propagation collapsing a single-component seed to a tiny blob.** `SAM3MaskPropagation` seeded a mask prompt with `add_mask` plus only one interior point per connected component; for a single-region object (for example a bus once it is clear of an occluder) that lone point collapsed the mask-conditioned segmentation to a ~1.5k px blob from a ~66k px seed. `_interior_points_per_component` now samples several interior points per component (adaptive grid spacing plus the distance-transform anchor), so a sizable object keeps enough positive anchors to hold its whole mask. Multi-component seeds were unaffected (they already got a point each).
-- **Renamed the RGB input port `rgb_frame` -> `rgb_image`** on every SAM3 node (`SAM3TrackerInference` and its `SAM3MaskPropagation` / `SAM3TextPropagation` / `SAM3BboxPropagation` / `SAM3PointPropagation` subclasses, plus `SAM3PointExpansion` and `SAM3SegmentEverything`), unifying on the port name every other RGB producer/consumer in the ecosystem already uses. Pipelines that wired `<sam3_node>.inputs.rgb_frame` must update to `.inputs.rgb_image`.
-- Added `SAM3PointExpansion`: single-frame interactive object selection that expands positive / negative / neutral click points into one object mask. Re-promptable in place, the ViT image embedding is cached by `frame_id` so re-sending points for the same frame only re-runs the lightweight mask decoder. Points arrive as a per-frame list of `{element_id, x, y, type}` dicts; the single object's id is the `prompt_obj_id` hparam.
-- Extracted the shared single-frame image-predictor logic into `_Sam3ImageNode` (`_sam3_image_base.py`): model build, `set_image` embedding, `predict_inst` decode, RGB-frame normalization, autocast eval context, and empty-output shape. `SAM3SegmentEverything` now subclasses it, dropping ~76 lines of duplication. The module is underscore-prefixed so `auto_register_package` skips the abstract base.
-- Added a `no-local-sources` CI workflow that fails if `pyproject.toml` declares a local `[tool.uv.sources]` path entry (a machine-specific path must not ship in a release).
+- Added `SAM3PointExpansion`: single-frame interactive node that expands positive / negative / neutral click points into one object mask, caching the ViT image embedding per `frame_id` so re-prompts only re-run the lightweight mask decoder.
+- Renamed the RGB input port `rgb_frame` -> `rgb_image` on every SAM3 node (breaking); pipelines wiring `<sam3_node>.inputs.rgb_frame` must switch to `.inputs.rgb_image`.
+- Fixed `SAM3MaskPropagation` collapsing a single-component seed to a tiny blob; `_interior_points_per_component` now samples several interior points per component (adaptive grid plus distance-transform anchor) instead of one.
+- Extracted the shared single-frame image-predictor logic into `_Sam3ImageNode` (`_sam3_image_base.py`); `SAM3SegmentEverything` now subclasses it, dropping ~76 lines of duplication (underscore-prefixed so `auto_register_package` skips the base).
+- Added a `no-local-sources` CI workflow that fails if `pyproject.toml` declares a local `[tool.uv.sources]` path entry.
 - CI: scope the detect-secrets scan to git-tracked files (drop `--all-files`), cutting the Security Scanning job runtime.
 
 ## 0.1.7 - 2026-06-23
