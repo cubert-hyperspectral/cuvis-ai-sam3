@@ -1,12 +1,10 @@
 ![image](https://raw.githubusercontent.com/cubert-hyperspectral/cuvis.sdk/main/branding/logo/banner.png)
 
-# CUVIS.AI SAM3
+# Cuvis.AI SAM3
 
-This repository provides a port of SAM3 as a cuvis.ai plugin, enabling promptable segmentation and tracking pipelines. It is maintained by Cubert GmbH as part of the cuvis.ai ecosystem.
+Cuvis.AI plugin that adapts SAM3 for Cuvis.AI stream-mode applications, bringing promptable segmentation and tracking to Cuvis.AI pipelines. Maintained by Cubert GmbH as part of the Cuvis.AI ecosystem.
 
 ## Capabilities
-
-This is a cuvis.ai plugin that adapts SAM3 for cuvis.ai stream-mode applications. It brings the following capabilities to cuvis.ai:
 
 **Nodes**
 
@@ -27,7 +25,7 @@ cd cuvis-ai-sam3
 uv sync --all-extras
 ```
 
-For cuvis.ai usage examples, see the SAM3 object-tracking pipelines in [cuvis-ai](https://github.com/cubert-hyperspectral/cuvis-ai/tree/main/examples/object_tracking/sam3).
+For Cuvis.AI usage examples, see the SAM3 object-tracking pipelines in [cuvis-ai](https://github.com/cubert-hyperspectral/cuvis-ai/tree/main/examples/object_tracking/sam3).
 
 For the original upstream SAM3 repository README, installation details, research background, and example notebooks, see [README_original.md](README_original.md).
 
