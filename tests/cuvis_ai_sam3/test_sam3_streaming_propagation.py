@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -1413,3 +1413,34 @@ class TestPruneStateGuards:
         # Non-dict entries in the list must be skipped rather than crash.
         node._prune_state_for_frame(9)
         assert node._inference_state["tracker_inference_states"][0] is None
+
+
+class TestEnsureModel:
+    """Model-build path of ``_ensure_model`` with a patched builder (no real model)."""
+
+    def test_ensure_model_sizes_state_from_tracker_attrs(self) -> None:
+        node = SAM3TextPropagation(name="test_ensure_model")
+        node._buffer_keep_recent = 3
+
+        mock_model = _make_mock_model()
+        mock_model.tracker.max_obj_ptrs_in_encoder = 12
+        mock_model.tracker.num_maskmem = 7
+        mock_model.detector = None  # guard returns early, no forward to wrap
+
+        with patch("sam3.model_builder.build_sam3_video_model", return_value=mock_model):
+            node._ensure_model()
+
+        assert node._model is mock_model
+        # Eviction window is the max of the buffer floor and the tracker memory depths.
+        assert node._state_keep_recent == 12
+        assert node._evict_horizon == 12
+        assert node._model.hotstart_delay == 0
+
+    def test_ensure_model_is_idempotent(self) -> None:
+        node = SAM3TextPropagation(name="test_ensure_model_idempotent")
+        sentinel = _make_mock_model()
+        node._model = sentinel
+        with patch("sam3.model_builder.build_sam3_video_model") as builder:
+            node._ensure_model()
+        builder.assert_not_called()
+        assert node._model is sentinel
