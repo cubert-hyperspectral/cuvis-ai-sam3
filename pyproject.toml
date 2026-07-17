@@ -56,13 +56,13 @@ dependencies = [
     "triton-windows; platform_system == 'Windows'",
     "triton; platform_system != 'Windows'",
     "psutil",
-    # sam3/model_builder.py imports pkg_resources at runtime. pkg_resources is
-    # deprecated but still ships in setuptools 81/82, so cap at <83 (matching the
-    # cuvis-ai launcher) instead of <81 so sam3 can co-install with it for the
-    # in-process notebooks/examples.
-    "setuptools<83",
+    # sam3/model_builder.py imports pkg_resources at runtime. setuptools removed
+    # pkg_resources in 82.0.0, so cap at <82 to keep the pkg_resources-bearing
+    # line while still satisfying the cuvis-ai launcher's setuptools>=81. The
+    # PYSEC-2026-3447 fix lands only in 83.0.0, so it is ignored in CI.
+    "setuptools<82",
     "opencv-python-headless>=4.13.0.92",
-    "click>=8.3.1",
+    "click>=8.4.2",
     "uvicorn>=0.41.0",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.2",
@@ -72,8 +72,8 @@ dependencies = [
     "python-dotenv>=1.2.2",
     # CVE-2026-41066 fix; pulled in transitively.
     "lxml>=6.1.0",
-    # CVE-2026-40192 fix; pulled in transitively (torchvision et al.).
-    "pillow>=12.2.0",
+    # CVE-2026-40192 + PYSEC-2026-2253..2257 / 3451..3453 fixes; pulled in transitively (torchvision et al.).
+    "pillow>=12.3.0",
     # gitpython / idna / urllib3 / aiohttp security floors now live in cuvis-ai-core (>=0.7.1)
     # and are inherited transitively, so they are no longer pinned here.
     # starlette stays: it is sam3-specific (fastapi REST API), not provided by core.

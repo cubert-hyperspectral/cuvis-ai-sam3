@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 - 2026-07-17
+
+- Require `cuvis-ai-schemas>=0.8.0` and `cuvis-ai-core>=0.11.0`, adopting the released framework versions.
+- Raised the `click` floor to `>=8.4.2` (locked 8.4.2) for PYSEC-2026-2132, a command-injection flaw in `click.edit()`; matches the floor cuvis-ai-core now locks.
+- Corrected the `setuptools` cap to `<82` (was `<83`): `pkg_resources`, which `sam3/model_builder.py` imports at runtime, was removed in setuptools 82.0.0, so `<83` wrongly admitted a `pkg_resources`-free line. Ignored PYSEC-2026-3447 (setuptools, fixed only in 83.0.0) in the pip-audit step accordingly.
+- Raised the `pillow` floor to `>=12.3.0` (locked 12.3.0) for the Pillow 12.3.0 advisory batch (PYSEC-2026-2253/2254/2255/2256/2257/3451/3452/3453).
+
 ## 0.2.0 - 2026-07-07
 
 - Added `SAM3PointExpansion`: single-frame interactive node that expands positive / negative / neutral click points into one object mask, caching the ViT image embedding per `frame_id` so re-prompts only re-run the lightweight mask decoder.
