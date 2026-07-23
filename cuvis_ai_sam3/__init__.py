@@ -17,6 +17,13 @@ except PackageNotFoundError:
     # Package is not installed, likely in development mode
     __version__ = "dev"
 
+from cuvis_ai_sam3.shared_backbone import (  # noqa: F401
+    build_image_model_shared,
+    build_video_model_shared,
+    claim_backbone,
+    release_shared_backbone,
+    shared_backbone_info,
+)
 from sam3.model_builder import (  # noqa: F401
     build_sam3_image_model,
     build_sam3_video_model,
@@ -43,8 +50,13 @@ def register_all_nodes() -> int:
 
 __all__ = [
     "__version__",
+    "build_image_model_shared",
     "build_sam3_image_model",
     "build_sam3_video_model",
     "build_sam3_video_predictor",
+    "build_video_model_shared",
+    "claim_backbone",
     "register_all_nodes",
+    "release_shared_backbone",
+    "shared_backbone_info",
 ]
