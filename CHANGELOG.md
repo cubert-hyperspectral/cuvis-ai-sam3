@@ -6,6 +6,7 @@
 - `build_sam3_image_model` / `build_sam3_video_model` accept optional `backbone=` and `state_dict=` injection (both default to the previous behavior), and `_load_checkpoint` gained `state_dict` / `skip_prefixes` so an injected backbone's weights are reused without a second disk read; the video builder loads `strict=False` and asserts the only missing keys are `detector.backbone.*`.
 - The shared backbone is pinned in eval (its `train()` is overridden to warn and no-op, because the ViT carries `drop_path_rate=0.1` and the text tower `dropout=0.1`), built eagerly during `to(device)`, and keyed by architecture flags, checkpoint identity, and device. `compile_model=True` and `CUVIS_SAM3_NO_BACKBONE_SHARING=1` bypass sharing for A/B timing and field diagnosis.
 - Added a pure-tensor unit suite for the registry (claims, free-at-zero, eval pin, device re-key, bypasses, mid-build failure, concurrency, builder seam) plus a GPU integration test asserting the image and video models share one backbone from a single checkpoint read.
+- Note: this shared backbone is a plugin-level mechanism for reusing the model across SAM3 pipelines within one runtime. It is an interim bridge that a future framework-level incremental pipeline reload is expected to supersede.
 
 ## 0.2.1 - 2026-07-17
 
