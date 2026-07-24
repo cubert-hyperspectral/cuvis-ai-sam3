@@ -402,15 +402,16 @@ class TestLoadCheckpointSeam:
         )
         assert "backbone.weight" in capsys.readouterr().out
 
-    def test_video_builder_raises_on_unexpected_missing_keys(self) -> None:
+    def test_video_builder_rejects_non_backbone_missing_keys(self) -> None:
+        # With an injected backbone the video builder drops detector.backbone.* keys and requires
+        # every other key to be present. Exercised against the pure rejection helper so it runs on
+        # CPU: constructing the real video model (detector/tracker) needs CUDA, which CI lacks.
         with pytest.raises(RuntimeError, match="non-backbone keys missing"):
-            mb.build_sam3_video_model(
-                checkpoint_path=None,
-                load_from_HF=False,
-                device="cpu",
-                backbone=_TinyBackbone(),
-                state_dict={"detector.bogus.weight": torch.zeros(1)},
+            mb._reject_non_backbone_missing(
+                ["detector.bogus.weight", "detector.backbone.blocks.0.weight"]
             )
+        # backbone-only misses are expected and must NOT raise
+        mb._reject_non_backbone_missing(["detector.backbone.blocks.0.weight"])
 
 
 # ---------------------------------------------------------------------------

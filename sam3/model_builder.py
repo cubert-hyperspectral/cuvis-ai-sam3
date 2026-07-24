@@ -700,6 +700,19 @@ def download_ckpt_from_hf(version="sam3"):
     return checkpoint_path
 
 
+def _reject_non_backbone_missing(missing_keys) -> None:
+    """Raise if a strict=False load with an injected backbone left a non-backbone key missing.
+
+    With an injected backbone the ``detector.backbone.*`` keys are dropped before loading, so they
+    are expected to be missing; anything else in ``missing_keys`` is a real gap and must raise.
+    """
+    non_backbone_missing = [k for k in missing_keys if not k.startswith("detector.backbone.")]
+    if non_backbone_missing:
+        raise RuntimeError(
+            f"Injected-backbone load left non-backbone keys missing: {non_backbone_missing}"
+        )
+
+
 def build_sam3_video_model(
     checkpoint_path: Optional[str] = None,
     load_from_HF=True,
@@ -842,13 +855,7 @@ def build_sam3_video_model(
             # require that they are the only keys the model reports missing.
             ckpt = {k: v for k, v in ckpt.items() if not k.startswith("detector.backbone.")}
             missing_keys, unexpected_keys = model.load_state_dict(ckpt, strict=False)
-            non_backbone_missing = [
-                k for k in missing_keys if not k.startswith("detector.backbone.")
-            ]
-            if non_backbone_missing:
-                raise RuntimeError(
-                    f"Injected-backbone load left non-backbone keys missing: {non_backbone_missing}"
-                )
+            _reject_non_backbone_missing(missing_keys)
         else:
             missing_keys, unexpected_keys = model.load_state_dict(
                 ckpt, strict=strict_state_dict_loading
