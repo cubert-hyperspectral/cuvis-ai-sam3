@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.3.0 - 2026-07-27
 
 - Added a process-wide shared SAM3 vision-language backbone: all SAM3 nodes in one runtime share a single GPU-resident ViT + text backbone through a get-or-build registry, so loading a second SAM3 pipeline (or switching between two) reuses the resident backbone and rebuilds only the lightweight heads instead of re-reading the 3.4GB `sam3.pt` and reconstructing the full 848M-parameter model. Nodes claim the entry at construction (weakref-backed) and it is freed when the last claim drops, with the head state dicts kept in CPU RAM for a cheap re-warm.
 - `build_sam3_image_model` / `build_sam3_video_model` accept optional `backbone=` and `state_dict=` injection (both default to the previous behavior), and `_load_checkpoint` gained `state_dict` / `skip_prefixes` so an injected backbone's weights are reused without a second disk read; the video builder loads `strict=False` and asserts the only missing keys are `detector.backbone.*`.
