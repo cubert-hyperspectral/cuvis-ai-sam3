@@ -109,7 +109,12 @@ jobs:
           # in a core release first (bumping it here would break the plugin/core compat audit).
           # PYSEC-2026-3447 (setuptools): fixed in 83.0.0, but sam3/model_builder.py imports
           # pkg_resources (removed in setuptools 82.0.0), so the plugin is pinned to setuptools <82.
-          uv run pip-audit --desc on --skip-editable --ignore-vuln PYSEC-2022-42969 --ignore-vuln CVE-2026-3219 --ignore-vuln CVE-2025-3000 --ignore-vuln GHSA-537c-gmf6-5ccf --ignore-vuln PYSEC-2026-3447
+          # gitpython 3.1.51 advisory batch (GHSA-v396-v7q4-x2qj, GHSA-2f96-g7mh-g2hx,
+          # GHSA-956x-8gvw-wg5v): command-injection-via-clone-options issues all fixed in 3.1.51.
+          # gitpython is pulled in via cuvis-ai-core, so the bump must land in a core release first
+          # (like cryptography above); the bypass needs attacker-controlled clone options into
+          # Repo.clone_from, which the plugin never passes.
+          uv run pip-audit --desc on --skip-editable --ignore-vuln PYSEC-2022-42969 --ignore-vuln CVE-2026-3219 --ignore-vuln CVE-2025-3000 --ignore-vuln GHSA-537c-gmf6-5ccf --ignore-vuln PYSEC-2026-3447 --ignore-vuln GHSA-v396-v7q4-x2qj --ignore-vuln GHSA-2f96-g7mh-g2hx --ignore-vuln GHSA-956x-8gvw-wg5v
 
       - name: Run detect-secrets
         run: |

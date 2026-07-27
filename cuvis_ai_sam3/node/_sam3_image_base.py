@@ -23,6 +23,8 @@ import torch
 from cuvis_ai_core.node import Node
 from loguru import logger
 
+from cuvis_ai_sam3 import shared_backbone as _shared
+
 
 class _Sam3ImageNode(Node):
     """Abstract base owning SAM3 image-model construction and frame helpers.
@@ -60,6 +62,8 @@ class _Sam3ImageNode(Node):
         self._compile_model = bool(compile_model)
         self._model: Any | None = None
         self._processor: Any | None = None
+        self._backbone_claim: _shared.BackboneClaim | None = None
+        self._claim_shared_backbone()
 
         super().__init__(
             checkpoint_path=checkpoint_path,
@@ -68,28 +72,77 @@ class _Sam3ImageNode(Node):
             **kwargs,
         )
 
+    def _claim_shared_backbone(self) -> None:
+        """(Re-)claim the shared-backbone entry unless sharing is bypassed."""
+        if self._backbone_claim is not None and not self._backbone_claim.released:
+            return
+        self._backbone_claim = _shared.claim_for_node(
+            self,
+            checkpoint_path=self._checkpoint_path or None,
+            compile_model=self._compile_model,
+        )
+
     def _ensure_model(self) -> None:
         """Lazily build the SAM3 image model and interactive processor."""
         if self._model is not None and self._processor is not None:
             return
 
         from sam3.model.sam3_image_processor import Sam3Processor
-        from sam3.model_builder import build_sam3_image_model
 
-        build_kwargs: dict[str, Any] = {
-            "device": self._resolved_device,
-            "enable_inst_interactivity": True,
-        }
-        if self._checkpoint_path:
-            build_kwargs["checkpoint_path"] = self._checkpoint_path
-        if self._compile_model:
-            build_kwargs["compile"] = True
-
-        self._model = build_sam3_image_model(**build_kwargs)
+        self._claim_shared_backbone()
+        self._model = _shared.build_image_model_shared(
+            checkpoint_path=self._checkpoint_path or None,
+            device=self._resolved_device,
+            enable_inst_interactivity=True,
+            compile_model=self._compile_model,
+            claim=self._backbone_claim,
+        )
         self._processor = Sam3Processor(
             self._model, device=self._resolved_device, confidence_threshold=0.0
         )
         logger.info("{} image model loaded (device={})", type(self).__name__, self._resolved_device)
+
+    def _apply(self, fn: Any, recurse: bool = True) -> _Sam3ImageNode:
+        """Track framework device moves; ``pipeline.to`` reaches nodes via ``_apply``."""
+        module = super()._apply(fn, recurse)
+        target = _shared.resolve_apply_target_device(fn)
+        if target is not None:
+            self._on_pipeline_device(target)
+        return module
+
+    def _on_pipeline_device(self, device: torch.device) -> None:
+        """Adopt the framework-assigned device and eagerly build on CUDA targets.
+
+        ``super()._apply`` has already moved any built heads; the pinned shared
+        backbone never moves, so a device change drops the model and rebuilds
+        it against the new registry key. Without a CUDA target the build stays
+        lazy (today's first-forward behavior).
+        """
+        new_key = _shared.device_key(device)
+        if self._model is not None:
+            if _shared.device_key(self._resolved_device) == new_key:
+                return
+            self._model = None
+            self._processor = None
+            reset = getattr(self, "reset", None)
+            if callable(reset):
+                reset()
+        self._resolved_device = str(device)
+        if device.type == "cuda":
+            self._try_eager_build()
+
+    def _try_eager_build(self) -> None:
+        """Build the model now if possible; failures defer to the first forward."""
+        if _shared.sharing_bypassed(self._compile_model):
+            return
+        try:
+            self._ensure_model()
+        except Exception as exc:
+            logger.warning(
+                "{} eager SAM3 build failed; deferring to first forward: {}",
+                type(self).__name__,
+                exc,
+            )
 
     def _model_eval_context(self) -> contextlib.AbstractContextManager[None]:
         """Return the autocast context the SAM3 image stack expects, or a no-op.
@@ -104,13 +157,17 @@ class _Sam3ImageNode(Node):
         return contextlib.nullcontext()
 
     def cleanup(self) -> None:
-        """Release the loaded SAM3 image model and processor handles.
+        """Release the loaded SAM3 image model, processor, and backbone claim.
 
         Subclasses that hold extra per-frame state override this, call
-        ``super().cleanup()``, and then drop their own caches.
+        ``super().cleanup()``, and then drop their own caches. Only the node's
+        own claim is released; the shared registry is never cleared here.
         """
         self._model = None
         self._processor = None
+        if self._backbone_claim is not None:
+            self._backbone_claim.release()
+            self._backbone_claim = None
 
     @staticmethod
     def _normalize_frame(rgb_image: torch.Tensor) -> np.ndarray:

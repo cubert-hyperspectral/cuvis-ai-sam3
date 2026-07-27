@@ -1427,7 +1427,9 @@ class TestEnsureModel:
         mock_model.tracker.num_maskmem = 7
         mock_model.detector = None  # guard returns early, no forward to wrap
 
-        with patch("sam3.model_builder.build_sam3_video_model", return_value=mock_model):
+        with patch(
+            "cuvis_ai_sam3.shared_backbone.build_video_model_shared", return_value=mock_model
+        ):
             node._ensure_model()
 
         assert node._model is mock_model
@@ -1440,7 +1442,7 @@ class TestEnsureModel:
         node = SAM3TextPropagation(name="test_ensure_model_idempotent")
         sentinel = _make_mock_model()
         node._model = sentinel
-        with patch("sam3.model_builder.build_sam3_video_model") as builder:
+        with patch("cuvis_ai_sam3.shared_backbone.build_video_model_shared") as builder:
             node._ensure_model()
         builder.assert_not_called()
         assert node._model is sentinel

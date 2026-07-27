@@ -24,6 +24,8 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from loguru import logger
 
+from cuvis_ai_sam3 import shared_backbone as _shared
+
 from .utils import _bbox_iou_xyxy, _binary_mask_from_xyxy, _interior_points_per_component
 
 _STREAMING_SENTINEL = 10**7
@@ -203,6 +205,9 @@ class SAM3TrackerInference(Node):
 
         # Runtime state (initialized on first forward)
         self._model: Any = None
+        self._resolved_device: str | None = None
+        self._backbone_claim: _shared.BackboneClaim | None = None
+        self._claim_shared_backbone()
         self._frame_buffer: _FrameBuffer | None = None
         self._inference_state: dict[str, Any] | None = None
         self._generator: Any = None
@@ -228,19 +233,28 @@ class SAM3TrackerInference(Node):
 
     # -- Model loading --------------------------------------------------------
 
+    def _claim_shared_backbone(self) -> None:
+        """(Re-)claim the shared-backbone entry unless sharing is bypassed."""
+        if self._backbone_claim is not None and not self._backbone_claim.released:
+            return
+        self._backbone_claim = _shared.claim_for_node(
+            self,
+            checkpoint_path=self._checkpoint_path or None,
+            compile_model=self._compile_model,
+        )
+
     def _ensure_model(self) -> None:
         if self._model is not None:
             return
 
-        from sam3.model_builder import build_sam3_video_model
-
-        build_kwargs: dict[str, Any] = {}
-        if self._checkpoint_path:
-            build_kwargs["checkpoint_path"] = self._checkpoint_path
-        if self._compile_model:
-            build_kwargs["compile"] = True
-
-        self._model = build_sam3_video_model(**build_kwargs)
+        self._claim_shared_backbone()
+        self._model = _shared.build_video_model_shared(
+            checkpoint_path=self._checkpoint_path or None,
+            device=self._resolved_device,
+            compile_model=self._compile_model,
+            claim=self._backbone_claim,
+        )
+        self._resolved_device = str(self._model_device())
 
         # Disable hotstart look-ahead for streaming (incompatible with frame-at-a-time
         # buffering) but keep recondition_every_nth_frame=16 for performance.
@@ -297,6 +311,48 @@ class SAM3TrackerInference(Node):
         except StopIteration:
             return torch.device("cpu")
 
+    def _apply(self, fn: Any, recurse: bool = True) -> SAM3TrackerInference:
+        """Track framework device moves; ``pipeline.to`` reaches nodes via ``_apply``."""
+        module = super()._apply(fn, recurse)
+        target = _shared.resolve_apply_target_device(fn)
+        if target is not None:
+            self._on_pipeline_device(target)
+        return module
+
+    def _on_pipeline_device(self, device: torch.device) -> None:
+        """Adopt the framework-assigned device and eagerly build on CUDA targets.
+
+        ``super()._apply`` has already moved any built heads; the pinned shared
+        backbone never moves, so a device change resets the stream, drops the
+        model, and rebuilds against the new registry key. Without a CUDA target
+        the build stays lazy (today's first-forward behavior).
+        """
+        new_key = _shared.device_key(device)
+        if self._model is not None:
+            if self._resolved_device is not None and (
+                _shared.device_key(self._resolved_device) == new_key
+            ):
+                return
+            # Mid-stream device moves restart the stream on the new device.
+            self.reset()
+            self._model = None
+        self._resolved_device = str(device)
+        if device.type == "cuda":
+            self._try_eager_build()
+
+    def _try_eager_build(self) -> None:
+        """Build the model now if possible; failures defer to the first forward."""
+        if _shared.sharing_bypassed(self._compile_model):
+            return
+        try:
+            self._ensure_model()
+        except Exception as exc:
+            logger.warning(
+                "{} eager SAM3 build failed; deferring to first forward: {}",
+                type(self).__name__,
+                exc,
+            )
+
     def _model_eval_context(self) -> contextlib.AbstractContextManager[None]:
         """Return the appropriate autocast context for the model's current device."""
         if self._model is None:
@@ -328,10 +384,17 @@ class SAM3TrackerInference(Node):
         self._next_export_obj_id = 1
 
     def cleanup(self) -> None:
-        """Release streaming runtime state and the loaded SAM3 video model."""
+        """Release streaming runtime state, the loaded SAM3 video model, and the claim.
+
+        Only the node's own shared-backbone claim is released; the shared
+        registry itself is never cleared here.
+        """
         self.reset()
         self._model = None
         self._evict_horizon = 64
+        if self._backbone_claim is not None:
+            self._backbone_claim.release()
+            self._backbone_claim = None
 
     # -- State initialization -------------------------------------------------
 
