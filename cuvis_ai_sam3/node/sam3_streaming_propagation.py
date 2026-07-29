@@ -131,6 +131,65 @@ class _FrameBuffer:
         return self
 
 
+class _PinnedFeatureCache(dict):
+    """Per-frame feature cache whose pinned entries survive every eviction path.
+
+    The image features of a prompt frame must stay available until the tracker has
+    consolidated that frame's temp outputs (periodic reconditioning consolidates PAST prompt
+    frames), but the cache is evicted from three places: this node's ``_prune_state_for_frame``,
+    the detector's ``feature_cache.pop(frame_idx - 1)`` after every step, and the tracker's
+    miss-path dict rebind. Installing this container at state creation makes the first two
+    pin-safe without touching the vendored ``sam3/`` code; the rebind
+    (``inference_state["cached_features"] = {...}``) is unreachable in this video configuration
+    because the tracker runs with ``backbone=None`` and raises before it.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pinned: set[int] = set()
+
+    @property
+    def pinned_keys(self) -> frozenset[int]:
+        """Snapshot of the currently pinned frame keys."""
+        return frozenset(self._pinned)
+
+    def pin(self, key: int) -> None:
+        """Protect ``key`` from every eviction path until :meth:`unpin`."""
+        self._pinned.add(key)
+
+    def unpin(self, key: int) -> None:
+        """Lift the pin on ``key``; normal eviction semantics resume for it."""
+        self._pinned.discard(key)
+
+    def unpin_all(self) -> None:
+        """Lift every pin (stream teardown)."""
+        self._pinned.clear()
+
+    def pop(self, key: Any, *default: Any) -> Any:
+        """Like ``dict.pop`` but a pinned key is retained (its default is returned)."""
+        if key in self._pinned:
+            return default[0] if default else None
+        return super().pop(key, *default)
+
+    def __delitem__(self, key: Any) -> None:
+        if key in self._pinned:
+            return
+        super().__delitem__(key)
+
+    def clear(self) -> None:
+        """Drop every unpinned entry; pinned entries survive."""
+        keep = {k: self[k] for k in self._pinned if k in self}
+        super().clear()
+        super().update(keep)
+
+    def popitem(self) -> tuple[Any, Any]:
+        """Pop the most recently added unpinned item (``KeyError`` when none exists)."""
+        for key in reversed(list(self.keys())):
+            if key not in self._pinned:
+                return key, super().pop(key)
+        raise KeyError("popitem(): no unpinned entries in _PinnedFeatureCache")
+
+
 # =============================================================================
 # Base class
 # =============================================================================
@@ -219,6 +278,12 @@ class SAM3TrackerInference(Node):
         self._state_keep_recent: int = 16
         # Keep a tiny recent frame window in memory for safety.
         self._buffer_keep_recent: int = 2
+        # Original error of a torn-down stream: surfaced once when it happens, then referenced
+        # by the tombstone message until the next seed prompt starts a fresh stream.
+        self._last_stream_error: str | None = None
+        # Bounded unpin fallback for prompt-frame features: 2x the tracker's recondition
+        # interval (16), in case a pending temp output is never consolidated.
+        self._pin_max_age: int = 32
 
         super().__init__(
             checkpoint_path=checkpoint_path,
@@ -382,6 +447,7 @@ class SAM3TrackerInference(Node):
         self._source_frame_ids.clear()
         self._internal_to_export_obj_id.clear()
         self._next_export_obj_id = 1
+        self._last_stream_error = None
 
     def cleanup(self) -> None:
         """Release streaming runtime state, the loaded SAM3 video model, and the claim.
@@ -431,7 +497,7 @@ class SAM3TrackerInference(Node):
             "visual_prompt_mask": None,
             "tracker_inference_states": [],
             "tracker_metadata": {},
-            "feature_cache": {},
+            "feature_cache": _PinnedFeatureCache(),
             "cached_frame_outputs": {},
             "action_history": [],
             "is_image_only": False,
@@ -495,18 +561,53 @@ class SAM3TrackerInference(Node):
                 if int(tracker_state.get("num_frames", 0)) < frame_idx + 1:
                     tracker_state["num_frames"] = frame_idx + 1
 
+    def _teardown_stream_after_error(self, message: str) -> None:
+        """Reset the stream after a generator failure so the node can be re-seeded.
+
+        Reuses the polymorphic :meth:`reset` (subclasses clear their seed/category state too);
+        the loaded ``_model``, ``_evict_horizon`` and the shared-backbone claim survive. The
+        original error message is remembered for the tombstone raised by any further call that
+        arrives before the next seed prompt.
+        """
+        self.reset()
+        self._last_stream_error = message
+
     def _next_generator_output(self, requested_frame_idx: int) -> tuple[int, dict | None]:
-        """Advance the SAM3 propagation generator with a clear error on early exhaustion."""
+        """Advance the SAM3 propagation generator; tear the stream down on any failure.
+
+        A generator that raised once is closed for good (every later ``next()`` is a bare
+        ``StopIteration``), so leaving it in place would mask the original error behind
+        "exhausted early" reports forever. Instead the stream state is torn down so the next
+        seed prompt starts fresh, and the ORIGINAL exception surfaces exactly once.
+        """
         if self._generator is None:
+            if self._last_stream_error is not None:
+                raise RuntimeError(
+                    f"{self.__class__.__name__} propagation stream was torn down after an "
+                    f"earlier error: {self._last_stream_error} "
+                    "The next prompt starts a fresh stream."
+                )
             raise RuntimeError("Propagation generator is not initialized.")
         self._mark_cudagraph_step_begin()
         try:
             with self._model_eval_context():
-                return next(self._generator)
-        except StopIteration as exc:
-            raise RuntimeError(
-                f"{self.__class__.__name__} generator exhausted early at frame {requested_frame_idx}."
-            ) from exc
+                output = next(self._generator)
+        except StopIteration:
+            message = f"{self.__class__.__name__} generator exhausted early at frame {requested_frame_idx}."
+            self._teardown_stream_after_error(message)
+            raise RuntimeError(message) from None
+        except Exception as exc:
+            if "No points are provided" in str(exc):
+                message = (
+                    f"{self.__class__.__name__} propagation stream has no seed prompt; "
+                    "provide a mask/points prompt first."
+                )
+                self._teardown_stream_after_error(message)
+                raise RuntimeError(message) from exc
+            self._teardown_stream_after_error(str(exc))
+            raise
+        self._last_stream_error = None
+        return output
 
     def _resolve_source_frame_id(
         self,
@@ -689,11 +790,59 @@ class SAM3TrackerInference(Node):
         for key in stale:
             container.discard(key)
 
+    def _pin_prompt_frame(self, frame_idx: int) -> None:
+        """Pin a prompt frame's image features against eviction until consolidated."""
+        if self._inference_state is None:
+            return
+        cache = self._inference_state.get("feature_cache")
+        if isinstance(cache, _PinnedFeatureCache):
+            cache.pin(int(frame_idx))
+
+    @staticmethod
+    def _pending_prompt_frames(state: dict[str, Any]) -> set[int]:
+        """Frame indices still pending in any tracker state's temp outputs.
+
+        Consolidation (including the periodic reconditioning pass) clears a frame's temp
+        outputs, so membership here is the signal that its pinned features are still needed.
+        """
+        pending: set[int] = set()
+        for tracker_state in state.get("tracker_inference_states", []):
+            if not isinstance(tracker_state, dict):
+                continue
+            for temp_dict in tracker_state.get("temp_output_dict_per_obj", {}).values():
+                if not isinstance(temp_dict, dict):
+                    continue
+                for storage in temp_dict.values():
+                    if isinstance(storage, dict):
+                        pending.update(k for k in storage if isinstance(k, int))
+        return pending
+
+    def _unpin_consolidated_feature_frames(self, frame_idx: int) -> None:
+        """Lift feature pins for prompt frames the tracker no longer needs.
+
+        Primary signal: the frame left every ``temp_output_dict_per_obj`` (its outputs were
+        consolidated). Fallback: an age bound of ``_pin_max_age`` frames guards against a
+        pending entry that never consolidates.
+        """
+        state = self._inference_state
+        if state is None:
+            return
+        cache = state.get("feature_cache")
+        if not isinstance(cache, _PinnedFeatureCache):
+            return
+        pending = self._pending_prompt_frames(state)
+        for key in cache.pinned_keys:
+            if key >= frame_idx:
+                continue
+            if key not in pending or frame_idx - key > self._pin_max_age:
+                cache.unpin(key)
+
     def _prune_state_for_frame(self, frame_idx: int) -> None:
         """Free cached historical data to keep long runs bounded in memory."""
         if self._inference_state is None:
             return
         state = self._inference_state
+        self._unpin_consolidated_feature_frames(frame_idx)
 
         keep_from = max(0, frame_idx - self._state_keep_recent + 1)
         frame_buffer_keep_from = max(0, frame_idx - self._buffer_keep_recent + 1)
@@ -795,6 +944,32 @@ class SAM3TrackerInference(Node):
             tracked = tracker_state.get("frames_already_tracked")
             self._prune_dict(tracked, keep_from)
 
+            # Point/mask inputs must stay in lockstep with the (post-prune) consolidated and
+            # pending frame sets: the tracker's propagation preflight asserts that every frame
+            # holding an input is either consolidated or still pending in the temp outputs.
+            keep_frames: set[int] = set()
+            if isinstance(consolidated, dict):
+                for frame_set in consolidated.values():
+                    if isinstance(frame_set, set):
+                        keep_frames.update(k for k in frame_set if isinstance(k, int))
+            for temp_dict in tracker_state.get("temp_output_dict_per_obj", {}).values():
+                if not isinstance(temp_dict, dict):
+                    continue
+                for storage in temp_dict.values():
+                    if isinstance(storage, dict):
+                        keep_frames.update(k for k in storage if isinstance(k, int))
+            for inputs_key in ("point_inputs_per_obj", "mask_inputs_per_obj"):
+                for obj_inputs in tracker_state.get(inputs_key, {}).values():
+                    if not isinstance(obj_inputs, dict):
+                        continue
+                    stale = [
+                        k
+                        for k in obj_inputs
+                        if isinstance(k, int) and k < keep_from and k not in keep_frames
+                    ]
+                    for key in stale:
+                        obj_inputs.pop(key, None)
+
     def _inject_mask_prompt_for_object(
         self,
         binary_mask: np.ndarray,
@@ -805,6 +980,9 @@ class SAM3TrackerInference(Node):
         """Inject one object update into tracker state using mask + per-component interior points."""
         device = self._model_device()
         self._inference_state["cached_frame_outputs"].setdefault(int(frame_idx), {})
+        # This frame's image features must survive eviction until the tracker consolidates the
+        # prompt (periodic reconditioning consolidates PAST prompt frames via the memory encoder).
+        self._pin_prompt_frame(int(frame_idx))
 
         mask_binary = np.asarray(binary_mask > 0, dtype=np.float32)
         mask_tensor = torch.from_numpy(mask_binary).to(device=device, dtype=torch.float32)
@@ -1127,6 +1305,7 @@ class SAM3TextPropagation(SAM3TrackerInference):
     ) -> dict | None:
         if self._inference_state is None:
             raise RuntimeError("Inference state must be initialized before applying a text prompt.")
+        self._pin_prompt_frame(int(frame_idx))
 
         state = self._inference_state
         clamped_num_frames = int(frame_idx) + 1
@@ -1658,6 +1837,7 @@ class SAM3PointPropagation(SAM3TrackerInference):
         device = self._model_device()
         points = torch.tensor(self._prompt_points, dtype=torch.float32, device=device)
         point_labels = torch.tensor(self._prompt_point_labels, dtype=torch.int64, device=device)
+        self._pin_prompt_frame(0)
         with self._model_eval_context():
             self._model.add_prompt(
                 self._inference_state,

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-07-29
+
+- Streaming propagation nodes now survive a failed stream instead of poisoning the session: any exception inside the propagation generator tears the stream state down to an explicit needs-seed state and surfaces the ORIGINAL error exactly once (previously every later frame reported "generator exhausted early", hiding the real failure with no way to recover short of a pipeline reload). A seed-less generator start (the upstream "No points are provided" case) gets the same teardown and a clear needs-seed message, and the next non-empty prompt starts a fresh stream.
+- Prompt-frame image features are now pinned against eviction until the tracker has consolidated that frame's outputs. The cache is evicted from three places (the node's pruning, the detector's per-step pop, and the tracker's miss-path rebind), and the periodic reconditioning pass still needs PAST prompt frames' features while the video tracker runs with `backbone=None` — previously this raised "Image features for frame N are not cached" mid-stream. A pin-aware cache container installed at state creation covers all eviction paths without patching vendored code; point/mask inputs are pruned in lockstep with the consolidated and pending frame sets so the tracker's propagation preflight invariant holds.
+- `SAM3PointExpansion`'s per-frame embedding cache now keys on frame content in addition to `frame_id`: ids repeat across videos and counter restarts, and a stale hit decoded clicks against the previous scene's embedding (wrong-object masks).
+
 ## 0.3.0 - 2026-07-27
 
 - Added a process-wide shared SAM3 vision-language backbone: all SAM3 nodes in one runtime share a single GPU-resident ViT + text backbone through a get-or-build registry, so loading a second SAM3 pipeline (or switching between two) reuses the resident backbone and rebuilds only the lightweight heads instead of re-reading the 3.4GB `sam3.pt` and reconstructing the full 848M-parameter model. Nodes claim the entry at construction (weakref-backed) and it is freed when the last claim drops, with the head state dicts kept in CPU RAM for a cheap re-warm.
