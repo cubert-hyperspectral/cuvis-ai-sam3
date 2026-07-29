@@ -180,12 +180,26 @@ class TestSAM3PointExpansion:
         node = SAM3PointExpansion(name="test_pe_cache")
         processor = _wire(node)
 
-        node.forward(_frame(), points=[_pos(1.0, 1.0)], frame_id=_fid(11))
-        node.forward(_frame(), points=[_pos(1.0, 1.0), _neg(3.0, 3.0)], frame_id=_fid(11))
+        # The cache keys on frame_id AND content, so the re-prompt must carry the same frame.
+        frame = _frame()
+        node.forward(frame, points=[_pos(1.0, 1.0)], frame_id=_fid(11))
+        node.forward(frame, points=[_pos(1.0, 1.0), _neg(3.0, 3.0)], frame_id=_fid(11))
         assert len(processor.images) == 1  # re-prompt of frame 11 did NOT re-embed
 
         node.forward(_frame(), points=[_pos(1.0, 1.0)], frame_id=_fid(12))
         assert len(processor.images) == 2  # new frame re-embeds
+
+    def test_same_frame_id_new_content_reembeds(self) -> None:
+        # Frame ids repeat across videos and counter restarts; different pixels under the same
+        # id must be a cache miss, or clicks decode against the previous scene's embedding.
+        node = SAM3PointExpansion(name="test_pe_content")
+        processor = _wire(node)
+
+        torch.manual_seed(1)
+        node.forward(_frame(), points=[_pos(1.0, 1.0)], frame_id=_fid(11))
+        torch.manual_seed(2)
+        node.forward(_frame(), points=[_pos(1.0, 1.0)], frame_id=_fid(11))
+        assert len(processor.images) == 2  # same id, new content -> re-embed
 
     def test_missing_frame_id_reembeds_each_call(self) -> None:
         node = SAM3PointExpansion(name="test_pe_no_fid")

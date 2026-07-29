@@ -18,6 +18,7 @@ from cuvis_ai_sam3.node.sam3_streaming_propagation import (
     SAM3TextPropagation,
     SAM3TrackerInference,
     _FrameBuffer,
+    _PinnedFeatureCache,
 )
 
 # ---------------------------------------------------------------------------
@@ -1446,3 +1447,282 @@ class TestEnsureModel:
             node._ensure_model()
         builder.assert_not_called()
         assert node._model is sentinel
+
+
+# ---------------------------------------------------------------------------
+# Generator self-heal / needs-seed semantics
+# ---------------------------------------------------------------------------
+
+
+def _frame_output(frame_idx: int, h: int = 10, w: int = 12) -> tuple[int, dict]:
+    return (
+        frame_idx,
+        {
+            "out_obj_ids": np.array([1], dtype=np.int64),
+            "out_probs": np.array([0.9], dtype=np.float32),
+            "out_binary_masks": np.ones((1, h, w), dtype=bool),
+            "out_boxes_xywh": np.array([[0.1, 0.2, 0.3, 0.4]], dtype=np.float32),
+        },
+    )
+
+
+def _seed_label_map(h: int = 10, w: int = 12) -> torch.Tensor:
+    mask = np.zeros((h, w), dtype=np.int32)
+    mask[2:8, 3:9] = 1
+    return torch.from_numpy(mask).unsqueeze(0)
+
+
+def _node_with_generators(generator_factories: list) -> SAM3MaskPropagation:
+    """Mask node whose successive propagate_in_video calls use the given generators."""
+    node = SAM3MaskPropagation(name="test_selfheal")
+    mock_model = _make_mock_model()
+    factories = list(generator_factories)
+
+    def _next_generator(_inference_state, **kwargs):  # noqa: ANN001
+        del kwargs
+        if not factories:
+            raise AssertionError("propagate_in_video called more often than expected")
+        return factories.pop(0)()
+
+    mock_model.propagate_in_video.side_effect = _next_generator
+    node._model = mock_model
+    node._ensure_model = MagicMock()
+    return node
+
+
+def _rgb(h: int = 10, w: int = 12) -> torch.Tensor:
+    return torch.rand(1, h, w, 3, dtype=torch.float32)
+
+
+class TestGeneratorSelfHeal:
+    def test_midstream_error_surfaces_once_and_tears_down(self) -> None:
+        def _failing_gen():
+            yield _frame_output(0)
+            raise RuntimeError("backbone exploded")
+
+        node = _node_with_generators([_failing_gen])
+        node.forward(_rgb(), mask=_seed_label_map())  # seed + frame 0 ok
+
+        with pytest.raises(RuntimeError, match="backbone exploded"):
+            node.forward(_rgb(), mask=None)
+
+        assert node._generator is None
+        assert node._inference_state is None
+        assert node._frame_buffer is None
+        assert node._frame_idx == 0
+        assert node._source_frame_ids == []
+        assert node._model is not None
+        assert "backbone exploded" in (node._last_stream_error or "")
+
+    def test_promptless_frames_after_teardown_return_empty_output(self) -> None:
+        def _failing_gen():
+            yield _frame_output(0)
+            raise RuntimeError("backbone exploded")
+
+        node = _node_with_generators([_failing_gen])
+        node.forward(_rgb(), mask=_seed_label_map())
+        with pytest.raises(RuntimeError, match="backbone exploded"):
+            node.forward(_rgb(), mask=None)
+
+        result = node.forward(_rgb(), mask=None)  # needs-seed state: empty, no raise
+        assert torch.count_nonzero(result["mask"]).item() == 0
+
+    def test_new_seed_starts_fresh_stream_and_clears_error(self) -> None:
+        def _failing_gen():
+            yield _frame_output(0)
+            raise RuntimeError("backbone exploded")
+
+        node = _node_with_generators([_failing_gen, _make_propagation_generator])
+        node.forward(_rgb(), mask=_seed_label_map())
+        with pytest.raises(RuntimeError, match="backbone exploded"):
+            node.forward(_rgb(), mask=None)
+
+        result = node.forward(_rgb(), mask=_seed_label_map())  # fresh stream
+        assert result["mask"].shape == (1, 10, 12)
+        assert node._last_stream_error is None
+        assert node._model.propagate_in_video.call_count == 2
+
+    def test_tombstone_names_class_and_original_error(self) -> None:
+        def _failing_gen():
+            yield _frame_output(0)
+            raise RuntimeError("backbone exploded")
+
+        node = _node_with_generators([_failing_gen])
+        node.forward(_rgb(), mask=_seed_label_map())
+        with pytest.raises(RuntimeError, match="backbone exploded"):
+            node.forward(_rgb(), mask=None)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            node._next_generator_output(5)
+        message = str(excinfo.value)
+        assert "SAM3MaskPropagation" in message
+        assert "backbone exploded" in message
+        assert "fresh stream" in message
+        assert "exhausted early" not in message
+
+    def test_genuine_exhaustion_tears_down_and_reseeds(self) -> None:
+        def _short_gen():
+            yield _frame_output(0)
+
+        node = _node_with_generators([_short_gen, _make_propagation_generator])
+        node.forward(_rgb(), mask=_seed_label_map())
+
+        with pytest.raises(RuntimeError, match="exhausted early at frame"):
+            node.forward(_rgb(), mask=None)
+        assert node._inference_state is None
+
+        result = node.forward(_rgb(), mask=_seed_label_map())
+        assert result["mask"].shape == (1, 10, 12)
+
+
+class TestSeedlessStart:
+    def test_no_points_rewritten_as_needs_seed(self) -> None:
+        def _seedless_gen():
+            raise RuntimeError("No points are provided; please add points first")
+            yield  # pragma: no cover - makes this a generator function
+
+        node = _node_with_generators([_seedless_gen, _make_propagation_generator])
+
+        with pytest.raises(RuntimeError, match="no seed prompt") as excinfo:
+            node.forward(_rgb(), mask=_seed_label_map())
+        assert "SAM3MaskPropagation" in str(excinfo.value)
+        assert node._inference_state is None
+
+        result = node.forward(_rgb(), mask=_seed_label_map())  # clean restart
+        assert result["mask"].shape == (1, 10, 12)
+
+
+# ---------------------------------------------------------------------------
+# Pin-aware feature cache
+# ---------------------------------------------------------------------------
+
+
+class TestPinnedFeatureCache:
+    def test_pop_del_clear_retain_pinned_keys(self) -> None:
+        cache = _PinnedFeatureCache({1: "a", 2: "b", 3: "c"})
+        cache.pin(2)
+
+        assert cache.pop(2, None) is None
+        assert 2 in cache  # retained
+        assert cache.pop(1) == "a"
+        with pytest.raises(KeyError):
+            cache.pop(9)  # unpinned miss keeps dict semantics
+
+        del cache[2]
+        assert 2 in cache
+        del cache[3]
+        assert 3 not in cache
+
+        cache[4] = "d"
+        cache.clear()
+        assert dict(cache) == {2: "b"}
+
+    def test_popitem_skips_pinned(self) -> None:
+        cache = _PinnedFeatureCache({1: "a", 2: "b"})
+        cache.pin(2)
+        assert cache.popitem() == (1, "a")
+        with pytest.raises(KeyError):
+            cache.popitem()
+
+    def test_unpin_restores_normal_eviction(self) -> None:
+        cache = _PinnedFeatureCache({5: "x"})
+        cache.pin(5)
+        cache.unpin(5)
+        assert cache.pop(5, None) == "x"
+        assert 5 not in cache
+
+    def test_survives_detector_pop_and_node_prune(self) -> None:
+        cache = _PinnedFeatureCache({6: "prompt", 7: "current"})
+        cache.pin(6)
+        cache.pop(6, None)  # detector: feature_cache.pop(frame_idx - 1, None)
+        SAM3TrackerInference._prune_dict(cache, 8)  # node prune drops keys < 8, except pins
+        assert 6 in cache
+        assert 7 not in cache
+
+    def test_build_state_installs_pinned_cache_and_seed_pins_frame(self) -> None:
+        def _two_frame_gen():
+            yield _frame_output(0)
+            yield _frame_output(1)
+
+        node = _node_with_generators([_two_frame_gen])
+        node.forward(_rgb(), mask=_seed_label_map())
+
+        cache = node._inference_state["feature_cache"]
+        assert isinstance(cache, _PinnedFeatureCache)
+        assert 0 in cache.pinned_keys  # the seed prompt frame is pinned
+
+        # With no tracker temp outputs pending (mocked model), the next step unpins it.
+        node.forward(_rgb(), mask=None)
+        assert 0 not in node._inference_state["feature_cache"].pinned_keys
+
+    def test_unpin_signal_membership_and_age_fallback(self) -> None:
+        node = SAM3MaskPropagation(name="test_unpin")
+        cache = _PinnedFeatureCache({3: "feat"})
+        cache.pin(3)
+        tracker_state = {
+            "temp_output_dict_per_obj": {
+                0: {"cond_frame_outputs": {3: "pending"}, "non_cond_frame_outputs": {}}
+            }
+        }
+        node._inference_state = {
+            "feature_cache": cache,
+            "tracker_inference_states": [tracker_state],
+        }
+
+        node._unpin_consolidated_feature_frames(10)
+        assert 3 in cache.pinned_keys  # still pending -> pinned
+
+        tracker_state["temp_output_dict_per_obj"][0]["cond_frame_outputs"].clear()
+        node._unpin_consolidated_feature_frames(10)
+        assert 3 not in cache.pinned_keys  # consolidated -> unpinned
+
+        cache.pin(3)
+        tracker_state["temp_output_dict_per_obj"][0]["cond_frame_outputs"][3] = "stuck"
+        node._unpin_consolidated_feature_frames(40)  # 40 - 3 > 32: age fallback
+        assert 3 not in cache.pinned_keys
+
+
+class TestPruneInputConsistency:
+    def test_inputs_stay_lockstep_with_consolidated_and_pending(self) -> None:
+        node = SAM3MaskPropagation(name="test_prune_inputs")
+        node._state_keep_recent = 4
+        tracker_state = {
+            "output_dict": {"cond_frame_outputs": {0: "seed"}, "non_cond_frame_outputs": {}},
+            "output_dict_per_obj": {},
+            "temp_output_dict_per_obj": {
+                0: {"cond_frame_outputs": {8: "pending"}, "non_cond_frame_outputs": {}}
+            },
+            "consolidated_frame_inds": {
+                "cond_frame_outputs": {0},
+                "non_cond_frame_outputs": {3},
+            },
+            "frames_already_tracked": {},
+            "point_inputs_per_obj": {0: {0: "in0", 3: "in3", 8: "in8"}},
+            "mask_inputs_per_obj": {0: {0: "m0"}},
+        }
+        node._inference_state = {
+            "cached_frame_outputs": {},
+            "tracker_metadata": {},
+            "previous_stages_out": {},
+            "feature_cache": _PinnedFeatureCache(),
+            "per_frame_raw_point_input": {},
+            "per_frame_raw_box_input": {},
+            "per_frame_visual_prompt": {},
+            "per_frame_geometric_prompt": {},
+            "per_frame_cur_step": {},
+            "input_batch": None,
+            "tracker_inference_states": [tracker_state],
+        }
+
+        node._prune_state_for_frame(9)  # keep_from = 6
+
+        point_inputs = tracker_state["point_inputs_per_obj"][0]
+        assert set(point_inputs) == {0, 8}  # 3 dropped with its consolidated entry
+        assert set(tracker_state["mask_inputs_per_obj"][0]) == {0}
+
+        consolidated = set()
+        for frame_set in tracker_state["consolidated_frame_inds"].values():
+            consolidated.update(frame_set)
+        pending = SAM3TrackerInference._pending_prompt_frames(node._inference_state)
+        input_frames = set(point_inputs) | set(tracker_state["mask_inputs_per_obj"][0])
+        assert input_frames == consolidated | pending  # the tracker preflight invariant

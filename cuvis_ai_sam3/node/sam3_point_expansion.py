@@ -121,6 +121,7 @@ class SAM3PointExpansion(_Sam3ImageNode):
 
         self._cached_frame_id: int | None = None
         self._cached_state: Any | None = None
+        self._cached_content_signature: tuple[Any, float, float] | None = None
         self._warned_missing_frame_id = False
 
         super().__init__(
@@ -138,6 +139,7 @@ class SAM3PointExpansion(_Sam3ImageNode):
         super().cleanup()
         self._cached_frame_id = None
         self._cached_state = None
+        self._cached_content_signature = None
 
     def reset(self) -> None:
         """Drop the cached image embedding so the next predict run re-embeds.
@@ -147,6 +149,20 @@ class SAM3PointExpansion(_Sam3ImageNode):
         """
         self._cached_frame_id = None
         self._cached_state = None
+        self._cached_content_signature = None
+
+    @staticmethod
+    def _content_signature(frame_np: np.ndarray) -> tuple[Any, float, float]:
+        """Cheap content fingerprint of a frame (shape + strided-sample sums).
+
+        Frame ids alone cannot key the embedding cache: they repeat across videos and
+        counter restarts, and serving another scene's embedding decodes the click against
+        the wrong image. The signature samples a strided slice so it stays O(1)-ish per call.
+        """
+        height, width = frame_np.shape[0], frame_np.shape[1]
+        stride = max(1, min(height, width) // 32)
+        sample = frame_np[::stride, ::stride].astype(np.float64)
+        return (frame_np.shape, float(sample.sum()), float(np.square(sample).sum()))
 
     @staticmethod
     def _resolve_frame_id(frame_id: torch.Tensor | None) -> int | None:
@@ -233,11 +249,18 @@ class SAM3PointExpansion(_Sam3ImageNode):
         return self._pack_output(masks_np, scores_np, height=height, width=width)
 
     def _embed_frame(self, frame_np: np.ndarray, frame_id: torch.Tensor | None) -> Any:
-        """Return the cached image embedding state, re-embedding only when the frame changed."""
+        """Return the cached image embedding state, re-embedding only when the frame changed.
+
+        A cache hit requires the frame id AND the frame content signature to match: frame ids
+        repeat across videos and counter restarts, and a stale embedding would decode the
+        click against the previous scene.
+        """
         current_frame_id = self._resolve_frame_id(frame_id)
+        signature = self._content_signature(frame_np)
         if (
             current_frame_id is not None
             and current_frame_id == self._cached_frame_id
+            and signature == self._cached_content_signature
             and self._cached_state is not None
         ):
             return self._cached_state
@@ -255,6 +278,7 @@ class SAM3PointExpansion(_Sam3ImageNode):
 
         self._cached_frame_id = current_frame_id
         self._cached_state = inference_state
+        self._cached_content_signature = signature
         return inference_state
 
     def _pack_output(
