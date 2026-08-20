@@ -123,16 +123,13 @@ include = ["sam3*", "cuvis_ai_sam3*", "rest_api*"]
 [tool.setuptools.package-data]
 sam3 = ["assets/*.txt.gz"]
 
+# torch flavour in composed child environments is mirrored from the host by
+# cuvis-ai-core >= 0.12.1 (see the cuvis-ai plugin-development docs); this repo
+# does not pin a torch index: torch is not a direct dependency and the committed
+# lock resolves it from PyPI, so an index pin here would bind nothing.
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
 # Local development alternative (uncomment to use local path instead)
 # cuvis-ai-core = { path = "../../cuvis-ai-core/cuvis-ai-core-sam3", editable = true }
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
 
 [tool.ruff]
 target-version = "py311"

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2 - 2026-08-20
+
+- Removed the dead `[tool.uv.sources]` / `[[tool.uv.index]]` torch cu128 configuration: torch is not a direct dependency of this package and the committed lock resolves it from PyPI, so the tables had no effect anywhere (uv honours them only at the resolution root). Composed child environments receive the host-mirrored torch build from cuvis-ai-core >= 0.12.1.
+
 ## 0.3.1 - 2026-07-29
 
 - Streaming propagation nodes now survive a failed stream instead of poisoning the session: any exception inside the propagation generator tears the stream state down to an explicit needs-seed state and surfaces the ORIGINAL error exactly once (previously every later frame reported "generator exhausted early", hiding the real failure with no way to recover short of a pipeline reload). A seed-less generator start (the upstream "No points are provided" case) gets the same teardown and a clear needs-seed message, and the next non-empty prompt starts a fresh stream.
