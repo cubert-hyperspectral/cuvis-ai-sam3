@@ -51,7 +51,12 @@ dependencies = [
     "typing_extensions",
     "huggingface_hub",
     "einops",
-    "decord",
+    # decord 0.6.0 ships wheels only for linux x86_64 and windows amd64 (no aarch64,
+    # no macOS, no sdist). It is lazily imported by upstream video-file loaders only;
+    # the plugin nodes and REST API use the cv2 loader path, so the dependency is
+    # gated to the platforms that have wheels instead of failing installation
+    # elsewhere (e.g. composed child environments on Jetson).
+    "decord; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     # Triton is imported by sam3/model/edt.py on module import.
     "triton-windows; platform_system == 'Windows'",
     "triton; platform_system != 'Windows'",
@@ -98,8 +103,8 @@ dev = [
     # --- Release automation & security ---
     "twine>=6.2.0",
     "pip-audit>=2.7.0",
-    # CVE-2026-6357 / PYSEC-2026-196 fix; pip-audit pulls pip into the dev env.
-    "pip>=26.1.2",
+    # CVE-2026-6357 / PYSEC-2026-196 / PYSEC-2026-3721 fixes; pip-audit pulls pip into the dev env.
+    "pip>=26.2",
     "bandit[toml]>=1.7.0",
     "detect-secrets>=1.4.0",
     "pip-licenses>=4.0.0",

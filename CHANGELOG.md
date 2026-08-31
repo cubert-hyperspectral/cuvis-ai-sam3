@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3 - 2026-08-31
+
+- Security: refreshed the locked environment for the advisory batch published since 0.3.2 - aiohttp 3.14.3 (PYSEC-2026-3545/3546/3547), gitpython 3.1.61 (CVE-2026-73620, CVE-2026-76217 and the intermediate GHSA batch; this also retires the three 3.1.51-era pip-audit ignores), hydra-core 1.3.6 (CVE-2026-68508), pip floor raised to >=26.2 (PYSEC-2026-3721). The three cryptography 46.0.7 advisories (PYSEC-2026-3552/3553/3554) have no fixed release yet and are ignored with a comment in CI.
+- Gated the `decord` dependency to the platforms it ships wheels for (linux x86_64 and windows amd64): decord 0.6.0 has no aarch64 or macOS wheels and no sdist, so composed child environments on aarch64 hosts (e.g. Jetson Thor) failed `uv sync` with "decord==0.6.0 ... doesn't have a source distribution or wheel for the current platform". decord is only imported lazily by the upstream video-file loaders; the plugin nodes and the REST API use the cv2 loader path throughout. Added a regression test that imports every shipped `cuvis_ai_sam3` and `rest_api` module (plus the upstream loader modules) in a fresh interpreter with decord import-blocked. Local x86 development environments still install decord and are unchanged.
+
 ## 0.3.2 - 2026-08-20
 
 - Removed the dead `[tool.uv.sources]` / `[[tool.uv.index]]` torch cu128 configuration: torch is not a direct dependency of this package and the committed lock resolves it from PyPI, so the tables had no effect anywhere (uv honours them only at the resolution root). Composed child environments receive the host-mirrored torch build from cuvis-ai-core >= 0.12.1.
