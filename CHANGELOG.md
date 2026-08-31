@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3 - 2026-08-31
+
+- Gated the `decord` dependency to the platforms it ships wheels for (linux x86_64 and windows amd64): decord 0.6.0 has no aarch64 or macOS wheels and no sdist, so composed child environments on aarch64 hosts (e.g. Jetson Thor) failed `uv sync` with "decord==0.6.0 ... doesn't have a source distribution or wheel for the current platform". decord is only imported lazily by the upstream video-file loaders; the plugin nodes and the REST API use the cv2 loader path throughout. Added a regression test that imports every shipped `cuvis_ai_sam3` and `rest_api` module (plus the upstream loader modules) in a fresh interpreter with decord import-blocked. Local x86 development environments still install decord and are unchanged.
+
 ## 0.3.2 - 2026-08-20
 
 - Removed the dead `[tool.uv.sources]` / `[[tool.uv.index]]` torch cu128 configuration: torch is not a direct dependency of this package and the committed lock resolves it from PyPI, so the tables had no effect anywhere (uv honours them only at the resolution root). Composed child environments receive the host-mirrored torch build from cuvis-ai-core >= 0.12.1.
