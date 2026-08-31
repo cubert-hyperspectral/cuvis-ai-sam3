@@ -103,8 +103,8 @@ dev = [
     # --- Release automation & security ---
     "twine>=6.2.0",
     "pip-audit>=2.7.0",
-    # CVE-2026-6357 / PYSEC-2026-196 fix; pip-audit pulls pip into the dev env.
-    "pip>=26.1.2",
+    # CVE-2026-6357 / PYSEC-2026-196 / PYSEC-2026-3721 fixes; pip-audit pulls pip into the dev env.
+    "pip>=26.2",
     "bandit[toml]>=1.7.0",
     "detect-secrets>=1.4.0",
     "pip-licenses>=4.0.0",
