@@ -301,11 +301,17 @@ def _pin_shared_module(module: nn.Module) -> nn.Module:
 
 
 def _resolve_entry_checkpoint(entry: _Entry) -> str:
-    """Return the entry's on-disk checkpoint path, resolving the HF default once."""
-    if entry.checkpoint_path is None:
-        from sam3.model_builder import download_ckpt_from_hf
+    """Return the entry's on-disk checkpoint path, resolving it through core once.
 
-        entry.checkpoint_path = download_ckpt_from_hf(version="sam3")
+    Without an explicit ``checkpoint_path`` the weights come from cuvis-ai-core's
+    registry (the ``cubert-gmbh/sam3`` mirror): the cached file when present, a
+    download when online, or ``ModelWeightsMissingError`` naming the provisioning
+    command in the offline child.
+    """
+    if entry.checkpoint_path is None:
+        from cuvis_ai_core.data.model_weights import ModelWeights
+
+        entry.checkpoint_path = str(ModelWeights.resolve("sam3"))
     return entry.checkpoint_path
 
 
