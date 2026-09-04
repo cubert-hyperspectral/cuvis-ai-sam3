@@ -1,20 +1,26 @@
-"""Download default SAM3 model weights for packaged server installs."""
+"""Download the default SAM3 model weights for packaged server installs.
+
+Provisions through cuvis-ai-core's weight registry (the ``cubert-gmbh/sam3``
+mirror: public, commit-pinned, sha256-verified) and copies the checkpoint to the
+install's ``models/`` directory. ``--repo-id`` / ``--filename`` override the
+registry for a custom source.
+"""
 
 from __future__ import annotations
 
 import argparse
-import shutil
+import sys
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
+from cuvis_ai_core.data.model_weights import ModelDownloadError, ModelWeights
 
-DEFAULT_REPO_ID = "facebook/sam3"
+DEFAULT_MODEL = "sam3"
 DEFAULT_FILENAME = "sam3.pt"
 
 
 def _default_target() -> Path:
-    if getattr(__import__("sys"), "frozen", False):
-        base = Path(__import__("sys").executable).resolve().parent
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent
     else:
         base = Path(__file__).resolve().parent.parent
     return base / "models" / DEFAULT_FILENAME
@@ -30,13 +36,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--repo-id",
-        default=DEFAULT_REPO_ID,
-        help="Hugging Face repository ID.",
+        default=None,
+        help="Hugging Face repository ID (default: the cubert-gmbh/sam3 mirror).",
     )
     parser.add_argument(
         "--filename",
-        default=DEFAULT_FILENAME,
-        help="Checkpoint filename in repository.",
+        default=None,
+        help="Checkpoint filename in the repository (default: sam3.pt).",
     )
     parser.add_argument(
         "--force",
@@ -46,20 +52,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def download_checkpoint(target_path: Path, repo_id: str, filename: str, force: bool) -> Path:
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    downloaded = Path(
-        hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            force_download=force,
-            local_dir=str(target_path.parent),
-            local_dir_use_symlinks=False,
-        )
+def download_checkpoint(
+    target_path: Path, repo_id: str | None, filename: str | None, force: bool
+) -> Path:
+    """Provision the checkpoint into the shared cache and copy it to ``target_path``."""
+    name = DEFAULT_MODEL if repo_id is None and filename is None else None
+    return ModelWeights.download_model(
+        name, repo_id=repo_id, filename=filename, out=target_path, force=force
     )
-    if downloaded.resolve() != target_path.resolve():
-        shutil.copy2(downloaded, target_path)
-    return target_path
 
 
 def main() -> int:
@@ -71,7 +71,7 @@ def main() -> int:
             filename=args.filename,
             force=args.force,
         )
-    except Exception as exc:  # pragma: no cover - exercised in installer integration, not unit
+    except ModelDownloadError as exc:
         print(f"ERROR: weight download failed: {exc}")
         return 1
 

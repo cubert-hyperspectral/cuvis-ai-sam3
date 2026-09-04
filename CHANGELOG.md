@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.0 - unreleased
+
+- **SAM3 weights come from the `cubert-gmbh/sam3` Hugging Face mirror through cuvis-ai-core's weight registry.** The shared backbone resolves its checkpoint with `ModelWeights.resolve("sam3")` (cached path, download when online, `ModelWeightsMissingError` naming `download-model download sam3` when offline) instead of `sam3.model_builder.download_ckpt_from_hf`, so no Hugging Face account, Meta gate or token is needed and the offline child finds the weights under `models--cubert-gmbh--sam3`. `installer/download_weights.py` provisions through the same registry (`--repo-id` / `--filename` still override it). Requires cuvis-ai-core 0.16.0. A cache under the old `models--facebook--sam3` folder is not reused; the weights download once more.
+
 ## 0.3.3 - 2026-08-31
 
 - Security: refreshed the locked environment for the advisory batch published since 0.3.2 - aiohttp 3.14.3 (PYSEC-2026-3545/3546/3547), gitpython 3.1.61 (CVE-2026-73620, CVE-2026-76217 and the intermediate GHSA batch; this also retires the three 3.1.51-era pip-audit ignores), hydra-core 1.3.6 (CVE-2026-68508), pip floor raised to >=26.2 (PYSEC-2026-3721). The three cryptography 46.0.7 advisories (PYSEC-2026-3552/3553/3554) have no fixed release yet and are ignored with a comment in CI.
