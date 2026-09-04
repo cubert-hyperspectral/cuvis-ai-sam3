@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 - unreleased
+## 0.4.0 - 2026-09-04
 
 - **SAM3 weights come from the `cubert-gmbh/sam3` Hugging Face mirror through cuvis-ai-core's weight registry.** The shared backbone resolves its checkpoint with `ModelWeights.resolve("sam3")` (cached path, download when online, `ModelWeightsMissingError` naming `download-model download sam3` when offline) instead of `sam3.model_builder.download_ckpt_from_hf`, so no Hugging Face account, Meta gate or token is needed and the offline child finds the weights under `models--cubert-gmbh--sam3`. `installer/download_weights.py` provisions through the same registry (`--repo-id` / `--filename` still override it). Requires cuvis-ai-core 0.16.0. A cache under the old `models--facebook--sam3` folder is not reused; the weights download once more.
 
