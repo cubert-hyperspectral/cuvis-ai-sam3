@@ -6,6 +6,8 @@ This package lives inside the forked SAM3 repository and provides:
   (see :mod:`sam3.model_builder`).
 - cuvis.ai-compatible Nodes for video object tracking
   (see :mod:`cuvis_ai_sam3.node`).
+- The plugin's weight declarations (see :mod:`cuvis_ai_sam3.weights`), registered
+  with cuvis-ai-core's model-weight registry when the package is imported.
 """
 
 from importlib.metadata import PackageNotFoundError, version
@@ -17,6 +19,8 @@ except PackageNotFoundError:
     # Package is not installed, likely in development mode
     __version__ = "dev"
 
+from cuvis_ai_core.data.model_weights import ModelWeights
+
 from cuvis_ai_sam3.shared_backbone import (  # noqa: F401
     build_image_model_shared,
     build_video_model_shared,
@@ -24,11 +28,17 @@ from cuvis_ai_sam3.shared_backbone import (  # noqa: F401
     release_shared_backbone,
     shared_backbone_info,
 )
+from cuvis_ai_sam3.weights import PLUGIN_NAME, WEIGHTS
 from sam3.model_builder import (  # noqa: F401
     build_sam3_image_model,
     build_sam3_video_model,
     build_sam3_video_predictor,
 )
+
+# Declaring the weights here (idempotent) is what lets ``ModelWeights.resolve("sam3")``
+# in the shared backbone, and ``download-model`` in the same environment, know the
+# mirror pins without a plugin manifest on disk.
+ModelWeights.register(PLUGIN_NAME, WEIGHTS)
 
 
 def register_all_nodes() -> int:
@@ -50,6 +60,8 @@ def register_all_nodes() -> int:
 
 __all__ = [
     "__version__",
+    "PLUGIN_NAME",
+    "WEIGHTS",
     "build_image_model_shared",
     "build_sam3_image_model",
     "build_sam3_video_model",

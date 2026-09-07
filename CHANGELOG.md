@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0 - 2026-09-07
+
+- `cuvis_ai_sam3/weights.py` declares the plugin's weights (`WEIGHTS`: the `sam3` row with the `cubert-gmbh/sam3` pin, its `config.json` aux file, size, licence, and `checkpoint_path` as the hparam that bypasses the cache) and the package registers them with `ModelWeights.register` at import; cuvis-ai's `emit_metadata` projects the same tuple into the plugin manifest's `weights:` block, so CuvisNEXT and the installer can provision SAM3 without importing the plugin. Floors `cuvis-ai-core>=0.17.0` (the registry is populated by plugin declarations and the built-in plugin rows left core, so upgrade the plugins together with core) and `cuvis-ai-schemas>=0.12.0` (`PluginWeightEntry`).
+
 ## 0.4.0 - 2026-09-04
 
 - **SAM3 weights come from the `cubert-gmbh/sam3` Hugging Face mirror through cuvis-ai-core's weight registry.** The shared backbone resolves its checkpoint with `ModelWeights.resolve("sam3")` (cached path, download when online, `ModelWeightsMissingError` naming `download-model download sam3` when offline) instead of `sam3.model_builder.download_ckpt_from_hf`, so no Hugging Face account, Meta gate or token is needed and the offline child finds the weights under `models--cubert-gmbh--sam3`. `installer/download_weights.py` provisions through the same registry (`--repo-id` / `--filename` still override it). Requires cuvis-ai-core 0.16.0. A cache under the old `models--facebook--sam3` folder is not reused; the weights download once more.
