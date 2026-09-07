@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 - unreleased
+## 0.5.0 - 2026-09-07
 
 - `cuvis_ai_sam3/weights.py` declares the plugin's weights (`WEIGHTS`: the `sam3` row with the `cubert-gmbh/sam3` pin, its `config.json` aux file, size, licence, and `checkpoint_path` as the hparam that bypasses the cache) and the package registers them with `ModelWeights.register` at import; cuvis-ai's `emit_metadata` projects the same tuple into the plugin manifest's `weights:` block, so CuvisNEXT and the installer can provision SAM3 without importing the plugin. Floors `cuvis-ai-core>=0.17.0` (the registry is populated by plugin declarations and the built-in plugin rows left core, so upgrade the plugins together with core) and `cuvis-ai-schemas>=0.12.0` (`PluginWeightEntry`).
 
