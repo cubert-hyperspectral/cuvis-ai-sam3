@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1 - 2026-09-16
+
+- `SAM3PointExpansion._parse_points` no longer raises `ValueError` for a prompt with no positive point (all-negative or empty). `forward()` already gates on the same condition and returns an empty mask without calling the model, matching `RTSAM2PointExpansion`; the parse step raised where `forward` returned empty, so a caller reading the parsed arrays directly saw an error the pipeline itself does not. Parsing now agrees with the empty-return contract.
+- Security: raised the `pytorch-lightning` floor to `>=2.6.6` (was resolving to 2.6.1 transitively via cuvis-ai-core) for PYSEC-2026-3967, a remote-code-execution vulnerability in the checkpoint `_load_state` path that can execute attacker-controlled module names from a crafted checkpoint's `_instantiator` hyperparameters, bypassing `weights_only=True`. Floor equals the locked version.
+
 ## 0.5.0 - 2026-09-07
 
 - `cuvis_ai_sam3/weights.py` declares the plugin's weights (`WEIGHTS`: the `sam3` row with the `cubert-gmbh/sam3` pin, its `config.json` aux file, size, licence, and `checkpoint_path` as the hparam that bypasses the cache) and the package registers them with `ModelWeights.register` at import; cuvis-ai's `emit_metadata` projects the same tuple into the plugin manifest's `weights:` block, so CuvisNEXT and the installer can provision SAM3 without importing the plugin. Floors `cuvis-ai-core>=0.17.0` (the registry is populated by plugin declarations and the built-in plugin rows left core, so upgrade the plugins together with core) and `cuvis-ai-schemas>=0.12.0` (`PluginWeightEntry`).

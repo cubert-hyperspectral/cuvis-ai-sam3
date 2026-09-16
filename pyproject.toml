@@ -79,6 +79,8 @@ dependencies = [
     "lxml>=6.1.0",
     # CVE-2026-40192 + PYSEC-2026-2253..2257 / 3451..3453 fixes; pulled in transitively (torchvision et al.).
     "pillow>=12.3.0",
+    # PYSEC-2026-3967 fix (checkpoint _load_state RCE); pulled in transitively via cuvis-ai-core.
+    "pytorch-lightning>=2.6.6",
     # gitpython / idna / urllib3 / aiohttp security floors now live in cuvis-ai-core (>=0.7.1)
     # and are inherited transitively, so they are no longer pinned here.
     # starlette stays: it is sam3-specific (fastapi REST API), not provided by core.
