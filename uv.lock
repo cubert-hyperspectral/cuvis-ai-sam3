@@ -393,7 +393,7 @@ nvtx = [
 
 [[package]]
 name = "cuvis-ai-core"
-version = "0.17.0"
+version = "0.17.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -427,9 +427,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/94/c3/47700359872818c35b452ba135e30dd6fec3592ba2b51fff85c0ae05c262/cuvis_ai_core-0.17.0.tar.gz", hash = "sha256:092d029be8c3c564fff9f2ce61de586b96a5c47a3a62b55f2bfdef7b765fd275", size = 902694, upload-time = "2026-09-07T11:55:57.346Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5c/17/57f86a1583620272e3f26c485ae708f8740421e3406f65463c1444e83cd6/cuvis_ai_core-0.17.3.tar.gz", hash = "sha256:2d432854107c1e3a298efdfadab2473a22164a6e7e9767c09acd08530580011c", size = 905103, upload-time = "2026-09-16T10:01:53.013Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/65/7d/1d3abf58f957e3fd5a84caea62d9ed5489253d57432150e760fa95a5d901/cuvis_ai_core-0.17.0-py3-none-any.whl", hash = "sha256:7193fa1d2b423f3d04e4b2d2f23fc7f3570d84e4609f135fe598a02c552b238d", size = 317828, upload-time = "2026-09-07T11:55:55.339Z" },
+    { url = "https://files.pythonhosted.org/packages/35/81/dc0263975199e98ba7fb9827787d978f494dbd622cd35316b9a106ecab4b/cuvis_ai_core-0.17.3-py3-none-any.whl", hash = "sha256:1a10934657c1b2a867b45eebd5c5f18309247d8f62f04a3b7a5c6c340b5f5ba1", size = 318606, upload-time = "2026-09-16T10:01:50.873Z" },
 ]
 
 [[package]]
@@ -498,7 +498,7 @@ dev = [
 requires-dist = [
     { name = "bandit", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=1.7.0" },
     { name = "click", specifier = ">=8.4.2" },
-    { name = "cuvis-ai-core", specifier = ">=0.17.0" },
+    { name = "cuvis-ai-core", specifier = ">=0.17.3" },
     { name = "cuvis-ai-schemas", specifier = ">=0.12.0" },
     { name = "cyclonedx-bom", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "decord", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },

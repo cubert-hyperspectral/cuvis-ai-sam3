@@ -3,7 +3,7 @@
 ## 0.5.1 - 2026-09-16
 
 - `SAM3PointExpansion._parse_points` no longer raises `ValueError` for a prompt with no positive point (all-negative or empty). `forward()` already gates on the same condition and returns an empty mask without calling the model, matching `RTSAM2PointExpansion`; the parse step raised where `forward` returned empty, so a caller reading the parsed arrays directly saw an error the pipeline itself does not. Parsing now agrees with the empty-return contract.
-- Security: raised the `pytorch-lightning` floor to `>=2.6.6` (was resolving to 2.6.1 transitively via cuvis-ai-core) for PYSEC-2026-3967, a remote-code-execution vulnerability in the checkpoint `_load_state` path that can execute attacker-controlled module names from a crafted checkpoint's `_instantiator` hyperparameters, bypassing `weights_only=True`. Floor equals the locked version.
+- Security: floors `cuvis-ai-core>=0.17.3` and `pytorch-lightning>=2.6.6` for PYSEC-2026-3967, a remote-code-execution vulnerability in Lightning's checkpoint `_load_state` path that executes attacker-controlled module names from a crafted checkpoint's `_instantiator` hyperparameters, bypassing `weights_only=True`. cuvis-ai-core 0.17.3 raised the same floor and lock, so the fix is inherited through core; the explicit plugin floor keeps the `--strict` core-lock audit consistent. Floors equal the locked versions.
 
 ## 0.5.0 - 2026-09-07
 
