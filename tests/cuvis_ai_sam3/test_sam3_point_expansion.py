@@ -96,9 +96,13 @@ class TestSAM3PointExpansion:
         result = node.forward(_frame(), points=[_neg(1.0, 1.0)])
         assert int(torch.count_nonzero(result["mask"]).item()) == 0
 
-    def test_parse_points_requires_positive(self) -> None:
-        with pytest.raises(ValueError, match="at least one positive"):
-            SAM3PointExpansion._parse_points([_neg(1.0, 1.0)])
+    def test_parse_points_negative_only_returns_arrays_not_error(self) -> None:
+        # A negative-only prompt is not a parse error: forward() gates on "has a positive point" and
+        # returns an empty mask without calling the model, and parsing agrees rather than raising.
+        coords, labels = SAM3PointExpansion._parse_points([_neg(1.0, 1.0)])
+        assert coords.shape == (1, 2)
+        assert labels.tolist() == [0]
+        assert not any(label == 1 for label in labels)
 
     def test_parse_points_empty_returns_empty_arrays(self) -> None:
         coords, labels = SAM3PointExpansion._parse_points([])

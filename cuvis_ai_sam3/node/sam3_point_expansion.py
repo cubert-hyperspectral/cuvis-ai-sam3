@@ -203,9 +203,10 @@ class SAM3PointExpansion(_Sam3ImageNode):
             coords.append([float(raw["x"]), float(raw["y"])])
             labels.append(1 if point_type == _POSITIVE else 0)
 
-        if not any(label == 1 for label in labels):
-            raise ValueError("SAM3PointExpansion requires at least one positive point.")
-
+        # A prompt with no positive point (all negative, or empty) is not an error: there is simply
+        # nothing to segment. forward() gates on the same condition and returns an empty mask without
+        # calling the model, matching RTSAM2PointExpansion; parsing must agree, or a caller that reads
+        # the parsed arrays directly sees a raise where forward sees an empty result.
         return (
             np.asarray(coords, dtype=np.float32),
             np.asarray(labels, dtype=np.int32),
