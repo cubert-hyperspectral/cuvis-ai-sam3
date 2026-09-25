@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Security: refreshed the locked `anyio` to 4.14.2 (was 4.12.1) for CVE-2026-63374 (certificate validation of IDNA-encoded host names in `connect_tcp()` / `TLSStream.wrap()`) and CVE-2026-64847 (process-pool workers wedge on an undrained stderr pipe). anyio is pulled in transitively by httpx, starlette, sse-starlette and watchfiles, so there is no floor of ours to raise; nothing else in the lock moved.
+
 ## 0.5.1 - 2026-09-16
 
 - `SAM3PointExpansion._parse_points` no longer raises `ValueError` for a prompt with no positive point (all-negative or empty). `forward()` already gates on the same condition and returns an empty mask without calling the model, matching `RTSAM2PointExpansion`; the parse step raised where `forward` returned empty, so a caller reading the parsed arrays directly saw an error the pipeline itself does not. Parsing now agrees with the empty-return contract.
