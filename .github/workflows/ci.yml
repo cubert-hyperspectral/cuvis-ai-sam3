@@ -104,16 +104,14 @@ jobs:
 
       - name: Run pip-audit for vulnerabilities
         run: |
-          # CVE-2025-3000 (torch): no fixed release exists.
-          # cryptography 46.0.7: GHSA-537c-gmf6-5ccf is fixed in 48.0.1 but cuvis-ai-core
-          # pins cryptography 46.x, so the bump must land in a core release first (bumping
-          # it here would break the plugin/core compat audit); PYSEC-2026-3552/3553/3554
-          # have no fixed release at all yet.
+          # CVE-2025-3000 (torch): fixed in 2.13.0; the pinned line stays on 2.11 until the next
+          # torch release is qualified for the ecosystem, so the advisory is ignored until then.
           # PYSEC-2026-3447 (setuptools): fixed in 83.0.0, but sam3/model_builder.py imports
           # pkg_resources (removed in setuptools 82.0.0), so the plugin is pinned to setuptools <82.
           # (The gitpython 3.1.51-era ignores are gone: the lock now resolves gitpython
-          # >=3.1.61, which fixes that batch and the later 3.1.5x advisories.)
-          uv run pip-audit --desc on --skip-editable --ignore-vuln PYSEC-2022-42969 --ignore-vuln CVE-2026-3219 --ignore-vuln CVE-2025-3000 --ignore-vuln GHSA-537c-gmf6-5ccf --ignore-vuln PYSEC-2026-3552 --ignore-vuln PYSEC-2026-3553 --ignore-vuln PYSEC-2026-3554 --ignore-vuln PYSEC-2026-3447
+          # >=3.1.61, which fixes that batch and the later 3.1.5x advisories. The cryptography
+          # 46.0.7 ignores are gone too: the lock resolves cryptography 50.0.1.)
+          uv run pip-audit --desc on --skip-editable --ignore-vuln PYSEC-2022-42969 --ignore-vuln CVE-2026-3219 --ignore-vuln CVE-2025-3000 --ignore-vuln PYSEC-2026-3447
 
       - name: Run detect-secrets
         run: |

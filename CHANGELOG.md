@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Security: refreshed the locked `anyio` to 4.14.2 (was 4.12.1) for CVE-2026-63374 (certificate validation of IDNA-encoded host names in `connect_tcp()` / `TLSStream.wrap()`) and CVE-2026-64847 (process-pool workers wedge on an undrained stderr pipe). anyio is pulled in transitively by httpx, starlette, sse-starlette and watchfiles, so there is no floor of ours to raise; nothing else in the lock moved.
+- Security: refreshed the locked `cryptography` to 50.0.1 (was 46.0.7) for GHSA-537c-gmf6-5ccf and PYSEC-2026-3552/3553/3554 and dropped their four pip-audit ignores. The note that tied this bump to a cuvis-ai-core release was wrong: the plugin compat audit compares this plugin's declared specifiers with core's lock, not the two locks with each other, and core locks 50.0.1 now as well.
 
 ## 0.5.1 - 2026-09-16
 
