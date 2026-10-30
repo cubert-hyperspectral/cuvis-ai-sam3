@@ -183,8 +183,9 @@ def _run_streaming(
     text_prompts: list[str | None] | None = None,
     masks: list[torch.Tensor | None] | None = None,
     bbox_prompts: list[list[dict[str, float | int]] | None] | None = None,
+    device: str = "cpu",
 ) -> list[dict[str, torch.Tensor]]:
-    """Run the node through num_frames with a mocked model."""
+    """Run the node through num_frames with a mocked model; frames live on ``device``."""
     mock_model = node._model if node._model is not None else _make_mock_model()
     if mock_model.propagate_in_video.side_effect is None:
 
@@ -207,7 +208,7 @@ def _run_streaming(
     if bbox_prompts is not None and len(bbox_prompts) != num_frames:
         raise ValueError("bbox_prompts length must match num_frames.")
     for i in range(num_frames):
-        rgb = torch.rand(1, h, w, 3, dtype=torch.float32)
+        rgb = torch.rand(1, h, w, 3, dtype=torch.float32, device=device)
         frame_id_t = (
             torch.tensor([int(frame_ids[i])], dtype=torch.int64) if frame_ids is not None else None
         )
@@ -1726,3 +1727,52 @@ class TestPruneInputConsistency:
         pending = SAM3TrackerInference._pending_prompt_frames(node._inference_state)
         input_frames = set(point_inputs) | set(tracker_state["mask_inputs_per_obj"][0])
         assert input_frames == consolidated | pending  # the tracker preflight invariant
+
+
+def _autocast_nesting_level() -> int:
+    """Current autocast nesting depth; torch has no getter, so probe with a paired step."""
+    level = torch.autocast_increment_nesting()
+    torch.autocast_decrement_nesting()
+    return level - 1
+
+
+def test_ensure_model_restores_the_autocast_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sam3 library enters a bfloat16 autocast in its constructors and never leaves it."""
+    from cuvis_ai_sam3 import shared_backbone as _shared
+
+    def leaking_build_video_model_shared(**kwargs: object) -> MagicMock:
+        # The library enters the cuda device type; on this cpu-only torch a cuda autocast is
+        # a near no-op, so the fake leaks the cpu device type to keep the assertions real.
+        torch.autocast(device_type="cpu", dtype=torch.bfloat16).__enter__()
+        return _make_mock_model()
+
+    monkeypatch.setattr(_shared, "build_video_model_shared", leaking_build_video_model_shared)
+    node = SAM3TextPropagation(name="test_streaming_autocast")
+    enabled, dtype, level = (
+        torch.is_autocast_enabled("cpu"),
+        torch.get_autocast_dtype("cpu"),
+        _autocast_nesting_level(),
+    )
+    try:
+        node._ensure_model()
+        assert node._model is not None
+        assert torch.is_autocast_enabled("cpu") is enabled
+        assert torch.get_autocast_dtype("cpu") == dtype
+        assert _autocast_nesting_level() == level
+    finally:
+        torch.set_autocast_enabled("cpu", enabled)
+        torch.set_autocast_dtype("cpu", dtype)
+        while _autocast_nesting_level() > level:
+            torch.autocast_decrement_nesting()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+def test_outputs_follow_the_input_device() -> None:
+    """The tracker tensor outputs land where the pipeline frame lives."""
+    node = SAM3TextPropagation(name="test_streaming_device")
+    results = _run_streaming(
+        node, num_frames=3, h=10, w=12, text_prompts=[None, "person", None], device="cuda"
+    )
+    for result in results:
+        devices = {v.device.type for v in result.values() if isinstance(v, torch.Tensor)}
+        assert devices == {"cuda"}

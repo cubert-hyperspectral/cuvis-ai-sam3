@@ -313,12 +313,15 @@ class SAM3TrackerInference(Node):
             return
 
         self._claim_shared_backbone()
-        self._model = _shared.build_video_model_shared(
-            checkpoint_path=self._checkpoint_path or None,
-            device=self._resolved_device,
-            compile_model=self._compile_model,
-            claim=self._backbone_claim,
-        )
+        # The sam3 library switches a bfloat16 autocast on in its constructors and never
+        # switches it off; keep the thread's state as it was before the build.
+        with _shared.preserve_autocast_state():
+            self._model = _shared.build_video_model_shared(
+                checkpoint_path=self._checkpoint_path or None,
+                device=self._resolved_device,
+                compile_model=self._compile_model,
+                claim=self._backbone_claim,
+            )
         self._resolved_device = str(self._model_device())
 
         # Disable hotstart look-ahead for streaming (incompatible with frame-at-a-time
@@ -1164,7 +1167,7 @@ class SAM3TrackerInference(Node):
         #         n_objs,
         #     )
 
-        return result
+        return _shared.outputs_on_device(result, rgb_image.device)
 
 
 # =============================================================================
@@ -1399,7 +1402,7 @@ class SAM3TextPropagation(SAM3TrackerInference):
         if self._inference_state is None:
             if not has_prompt:
                 self._frame_idx += 1
-                return self._empty_output(*frame_shape)
+                return _shared.outputs_on_device(self._empty_output(*frame_shape), rgb_image.device)
 
             self._initialize_stream_state(frame_np)
             self._seed_source_stream_idx = stream_idx
@@ -1440,7 +1443,7 @@ class SAM3TextPropagation(SAM3TrackerInference):
             torch.cuda.empty_cache()
 
         self._frame_idx += 1
-        return result
+        return _shared.outputs_on_device(result, rgb_image.device)
 
 
 class SAM3BboxPropagation(SAM3TrackerInference):
@@ -1748,7 +1751,7 @@ class SAM3BboxPropagation(SAM3TrackerInference):
         if self._inference_state is None:
             if not has_prompt:
                 self._frame_idx += 1
-                return self._empty_output(*frame_shape)
+                return _shared.outputs_on_device(self._empty_output(*frame_shape), rgb_image.device)
 
             self._ensure_model()
             self._initialize_stream_state(frame_np)
@@ -1786,7 +1789,7 @@ class SAM3BboxPropagation(SAM3TrackerInference):
             torch.cuda.empty_cache()
 
         self._frame_idx += 1
-        return result
+        return _shared.outputs_on_device(result, rgb_image.device)
 
 
 class SAM3PointPropagation(SAM3TrackerInference):
@@ -2028,7 +2031,7 @@ class SAM3MaskPropagation(SAM3TrackerInference):
         if self._inference_state is None:
             if not has_prompt:
                 self._frame_idx += 1
-                return self._empty_output(*frame_shape)
+                return _shared.outputs_on_device(self._empty_output(*frame_shape), rgb_image.device)
 
             self._ensure_model()
             self._initialize_stream_state(frame_np)
@@ -2064,7 +2067,7 @@ class SAM3MaskPropagation(SAM3TrackerInference):
             torch.cuda.empty_cache()
 
         self._frame_idx += 1
-        return result
+        return _shared.outputs_on_device(result, rgb_image.device)
 
 
 __all__ = [

@@ -294,3 +294,25 @@ class TestSam3ImageBaseHelpers:
         node = SAM3PointExpansion(name="test_pe_ctx_cpu")
         node._resolved_device = "cpu"
         assert isinstance(node._model_eval_context(), torch.autocast)
+
+
+_DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+    ),
+]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_outputs_follow_the_input_device(device: str) -> None:
+    """mask, object_ids and detection_scores land where the pipeline frame lives."""
+    node = SAM3PointExpansion(name=f"test_pe_device_{device}")
+    _wire(node)
+
+    result = node.forward(_frame().to(device), points=[_pos(1.0, 1.0)], frame_id=_fid(0))
+    assert int(torch.count_nonzero(result["mask"]).item()) > 0
+    assert {t.device.type for t in result.values()} == {device}
+
+    empty = node.forward(_frame().to(device), points=None)
+    assert {t.device.type for t in empty.values()} == {device}

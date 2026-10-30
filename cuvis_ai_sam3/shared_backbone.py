@@ -26,9 +26,11 @@ bypass sharing entirely and build standalone models exactly as before.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import weakref
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,58 @@ _HF_DEFAULT_IDENTITY: tuple[str, str] = ("hf", "sam3")
 _LOCK = threading.RLock()
 _ENTRIES: dict[tuple[str, tuple[Any, ...]], _Entry] = {}
 _PINNED_CLASSES: dict[type, type] = {}
+
+
+_AUTOCAST_DEVICE_TYPES = ("cuda", "cpu")
+
+
+def _autocast_depth() -> int:
+    """Current autocast nesting depth (torch has no getter; a paired step reads it)."""
+    level = torch.autocast_increment_nesting()
+    torch.autocast_decrement_nesting()
+    return level - 1
+
+
+@contextlib.contextmanager
+def preserve_autocast_state() -> Iterator[None]:
+    """Put the thread's autocast state back after the block, whatever the block left behind.
+
+    The sam3 library enters ``torch.autocast(device_type="cuda", dtype=torch.bfloat16)``
+    in its model constructors with a bare ``__enter__()`` and never leaves it, so after a
+    model build every convolution or matmul in the thread runs in bfloat16 and a float32
+    output port downstream fails its dtype check. The nodes wrap their own predict calls
+    in an autocast context of their own, so nothing in the plugin needs the leaked state.
+    The enabled flag and dtype per device type, the cache flag and the nesting depth are
+    restored to what they were on entry, as ``torch.autocast.__exit__`` would have done.
+    """
+    enabled = {dt: torch.is_autocast_enabled(dt) for dt in _AUTOCAST_DEVICE_TYPES}
+    dtypes = {dt: torch.get_autocast_dtype(dt) for dt in _AUTOCAST_DEVICE_TYPES}
+    cache_enabled = torch.is_autocast_cache_enabled()
+    depth = _autocast_depth()
+    try:
+        yield
+    finally:
+        for dt in _AUTOCAST_DEVICE_TYPES:
+            torch.set_autocast_enabled(dt, enabled[dt])
+            torch.set_autocast_dtype(dt, dtypes[dt])
+        torch.set_autocast_cache_enabled(cache_enabled)
+        while _autocast_depth() > depth:
+            torch.autocast_decrement_nesting()
+        if depth == 0:
+            torch.clear_autocast_cache()
+
+
+def outputs_on_device(outputs: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    """Move every tensor in a node's output dict to ``device``; other values pass through.
+
+    The nodes assemble their masks, object ids and scores from numpy on the cpu; the
+    pipeline expects a node's outputs where its inputs live, so every forward hands its
+    result through here with the device of the incoming ``rgb_image``.
+    """
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in outputs.items()
+    }
 
 
 def sharing_bypassed(compile_model: bool = False) -> bool:
@@ -598,6 +652,8 @@ def shared_backbone_info() -> dict[str, Any]:
 
 
 __all__ = [
+    "outputs_on_device",
+    "preserve_autocast_state",
     "BackboneClaim",
     "build_image_model_shared",
     "build_video_model_shared",

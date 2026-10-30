@@ -23,6 +23,8 @@ from PIL import Image
 from torchvision.ops import masks_to_boxes
 from torchvision.ops.boxes import batched_nms, box_area
 
+from cuvis_ai_sam3 import shared_backbone as _shared
+
 from ._sam3_image_base import _Sam3ImageNode
 
 
@@ -670,7 +672,7 @@ class SAM3SegmentEverything(_Sam3ImageNode):
             frame_shape[1],
             result["object_ids"].shape[1],
         )
-        return result
+        return _shared.outputs_on_device(result, rgb_image.device)
 
 
 __all__ = ["SAM3SegmentEverything"]
