@@ -6,7 +6,10 @@ interactive image predictor: they build the model with
 through ``set_image`` and the light mask decoder through ``predict_inst``, and
 share the same RGB-frame normalization, autocast eval context, and empty-output
 shape. This module factors those out so the concrete nodes only carry their own
-prompting logic and port specs.
+prompting logic and port specs. Both nodes hand their outputs through
+``shared_backbone.outputs_on_device`` so masks, object ids and scores land on the
+device of the incoming frame, the pipeline's device, rather than on the cpu where
+they are assembled.
 
 The module name is underscore-prefixed so ``NodeRegistry.auto_register_package``
 skips it: ``_Sam3ImageNode`` is an abstract base (it defines no ``forward``) and
@@ -83,23 +86,28 @@ class _Sam3ImageNode(Node):
         )
 
     def _ensure_model(self) -> None:
-        """Lazily build the SAM3 image model and interactive processor."""
+        """Lazily build the SAM3 image model and interactive processor.
+
+        The build runs inside ``preserve_autocast_state`` because the sam3 library
+        switches a bfloat16 autocast on in its constructors and never switches it off.
+        """
         if self._model is not None and self._processor is not None:
             return
 
         from sam3.model.sam3_image_processor import Sam3Processor
 
         self._claim_shared_backbone()
-        self._model = _shared.build_image_model_shared(
-            checkpoint_path=self._checkpoint_path or None,
-            device=self._resolved_device,
-            enable_inst_interactivity=True,
-            compile_model=self._compile_model,
-            claim=self._backbone_claim,
-        )
-        self._processor = Sam3Processor(
-            self._model, device=self._resolved_device, confidence_threshold=0.0
-        )
+        with _shared.preserve_autocast_state():
+            self._model = _shared.build_image_model_shared(
+                checkpoint_path=self._checkpoint_path or None,
+                device=self._resolved_device,
+                enable_inst_interactivity=True,
+                compile_model=self._compile_model,
+                claim=self._backbone_claim,
+            )
+            self._processor = Sam3Processor(
+                self._model, device=self._resolved_device, confidence_threshold=0.0
+            )
         logger.info("{} image model loaded (device={})", type(self).__name__, self._resolved_device)
 
     def _apply(self, fn: Any, recurse: bool = True) -> _Sam3ImageNode:

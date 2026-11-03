@@ -25,6 +25,8 @@ from cuvis_ai_schemas.pipeline import PortSpec
 from loguru import logger
 from PIL import Image
 
+from cuvis_ai_sam3 import shared_backbone as _shared
+
 from ._sam3_image_base import _Sam3ImageNode
 
 _POSITIVE = "positive"
@@ -229,7 +231,7 @@ class SAM3PointExpansion(_Sam3ImageNode):
             points and any(str(p.get("type", _POSITIVE)).lower() == _POSITIVE for p in points)
         )
         if not has_positive:
-            return self._empty_output(height, width)
+            return _shared.outputs_on_device(self._empty_output(height, width), rgb_image.device)
 
         point_coords, point_labels = self._parse_points(points)
 
@@ -247,7 +249,9 @@ class SAM3PointExpansion(_Sam3ImageNode):
                 normalize_coords=True,
             )
 
-        return self._pack_output(masks_np, scores_np, height=height, width=width)
+        return _shared.outputs_on_device(
+            self._pack_output(masks_np, scores_np, height=height, width=width), rgb_image.device
+        )
 
     def _embed_frame(self, frame_np: np.ndarray, frame_id: torch.Tensor | None) -> Any:
         """Return the cached image embedding state, re-embedding only when the frame changed.

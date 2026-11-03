@@ -455,3 +455,127 @@ class TestSAM3SegmentEverything:
         assert specs["mask"].dtype == torch.int32
         assert specs["object_ids"].dtype == torch.int64
         assert specs["detection_scores"].dtype == torch.float32
+
+
+def _autocast_nesting_level() -> int:
+    """Current autocast nesting depth; torch has no getter, so probe with a paired step."""
+    level = torch.autocast_increment_nesting()
+    torch.autocast_decrement_nesting()
+    return level - 1
+
+
+@contextlib.contextmanager
+def _restore_cpu_autocast():
+    """Undo whatever autocast state a test leaves behind, so later tests start clean."""
+    enabled, dtype, level = (
+        torch.is_autocast_enabled("cpu"),
+        torch.get_autocast_dtype("cpu"),
+        _autocast_nesting_level(),
+    )
+    try:
+        yield
+    finally:
+        torch.set_autocast_enabled("cpu", enabled)
+        torch.set_autocast_dtype("cpu", dtype)
+        while _autocast_nesting_level() > level:
+            torch.autocast_decrement_nesting()
+
+
+def _leak_autocast() -> None:
+    """What the sam3 library does in its constructors: enter an autocast and never leave it.
+
+    The library enters the cuda device type; this suite runs on a cpu-only torch, where a
+    cuda autocast is a near no-op, so the fake leaks the cpu device type instead. That
+    makes the enabled-flag and dtype assertions load-bearing here; the cuda shape itself
+    is covered by building the real model on a GPU, not by this suite.
+    """
+    torch.autocast(device_type="cpu", dtype=torch.bfloat16).__enter__()
+
+
+def test_ensure_model_restores_the_autocast_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The standalone build path (compile_model=True bypasses the shared backbone)."""
+    import sam3.model.sam3_image_processor as sam3_image_processor
+    import sam3.model_builder as sam3_model_builder
+
+    def leaking_build_sam3_image_model(**kwargs: object) -> object:
+        _leak_autocast()
+        return object()
+
+    class FakeSam3Processor:
+        def __init__(self, model: object, **kwargs: object) -> None:
+            self.model = model
+
+    monkeypatch.setattr(
+        sam3_model_builder, "build_sam3_image_model", leaking_build_sam3_image_model
+    )
+    monkeypatch.setattr(sam3_image_processor, "Sam3Processor", FakeSam3Processor)
+    node = SAM3SegmentEverything(checkpoint_path="weights.pt", device="cpu", compile_model=True)
+
+    with _restore_cpu_autocast():
+        enabled, dtype, level = (
+            torch.is_autocast_enabled("cpu"),
+            torch.get_autocast_dtype("cpu"),
+            _autocast_nesting_level(),
+        )
+        node._ensure_model()
+        assert node._model is not None
+        assert torch.is_autocast_enabled("cpu") is enabled
+        assert torch.get_autocast_dtype("cpu") == dtype
+        assert _autocast_nesting_level() == level
+
+
+def test_ensure_model_restores_the_autocast_state_on_the_shared_build_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default build path (compile_model=False goes through the shared backbone)."""
+    import sam3.model.sam3_image_processor as sam3_image_processor
+    from cuvis_ai_sam3 import shared_backbone as _shared
+
+    def leaking_build_image_model_shared(**kwargs: object) -> object:
+        _leak_autocast()
+        return object()
+
+    class FakeSam3Processor:
+        def __init__(self, model: object, **kwargs: object) -> None:
+            self.model = model
+
+    monkeypatch.setattr(_shared, "build_image_model_shared", leaking_build_image_model_shared)
+    monkeypatch.setattr(sam3_image_processor, "Sam3Processor", FakeSam3Processor)
+    node = SAM3SegmentEverything(checkpoint_path="weights.pt", device="cpu", compile_model=False)
+
+    with _restore_cpu_autocast():
+        enabled, dtype, level = (
+            torch.is_autocast_enabled("cpu"),
+            torch.get_autocast_dtype("cpu"),
+            _autocast_nesting_level(),
+        )
+        node._ensure_model()
+        assert node._model is not None
+        assert torch.is_autocast_enabled("cpu") is enabled
+        assert torch.get_autocast_dtype("cpu") == dtype
+        assert _autocast_nesting_level() == level
+
+
+_DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+    ),
+]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_outputs_follow_the_input_device(device: str) -> None:
+    """mask, object_ids and detection_scores land where the pipeline frame lives."""
+    node = SAM3SegmentEverything(name=f"test_segment_everything_device_{device}", device="cpu")
+    node._ensure_model = MagicMock()
+    candidate = _candidate(score=0.9, box_xyxy=(2, 2, 6, 6), crop_box_xyxy=(0, 0, 12, 10))
+    node._collect_candidates = MagicMock(return_value=[candidate])
+
+    result = node.forward(torch.rand(1, 10, 12, 3, dtype=torch.float32, device=device))
+    assert int(result["object_ids"].shape[1]) == 1
+    assert {t.device.type for t in result.values()} == {device}
+
+    node._collect_candidates = MagicMock(return_value=[])
+    empty = node.forward(torch.rand(1, 10, 12, 3, dtype=torch.float32, device=device))
+    assert {t.device.type for t in empty.values()} == {device}
