@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Security: the locked environment is refreshed for the advisories published since 0.5.2: aiohttp 3.14.5, certifi 2026.10.23, filelock 4.2.7, fsspec 2026.9.0, gitpython 3.2.1, hydra-core 1.3.8, msgpack 1.2.4, multidict 7.2.1, pillow 13.0.0 and urllib3 2.8.0. Ignored with a comment in CI next to the existing entries: setuptools GHSA-xmj3-9gf7-h52w (fixed in 84.1.0, behind the `<82` cap that keeps pkg_resources for the upstream model builder; the flaw sits in the legacy egg install of a crafted wheel on Windows).
+
 ## 0.5.2 - 2026-11-03
 
 - The SAM3 image nodes (`SAM3SegmentEverything`, `SAM3PointExpansion`) and the streaming trackers build their model inside `shared_backbone.preserve_autocast_state()`: the sam3 library enters `torch.autocast(device_type="cuda", dtype=torch.bfloat16)` in its constructors with a bare `__enter__()` and never leaves it, so after `pipeline.to("cuda")` every convolution or matmul in the thread ran in bfloat16 and the next float32 output port downstream failed its dtype check (`PortCompatibilityError: Dtype mismatch: source has torch.bfloat16, target expects torch.float32`). The nodes wrap their own predict calls in an autocast context already; the enabled flag, dtype, cache flag and nesting depth are now restored after the build.
