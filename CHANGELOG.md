@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 - 2026-11-03
 
 - The SAM3 image nodes (`SAM3SegmentEverything`, `SAM3PointExpansion`) and the streaming trackers build their model inside `shared_backbone.preserve_autocast_state()`: the sam3 library enters `torch.autocast(device_type="cuda", dtype=torch.bfloat16)` in its constructors with a bare `__enter__()` and never leaves it, so after `pipeline.to("cuda")` every convolution or matmul in the thread ran in bfloat16 and the next float32 output port downstream failed its dtype check (`PortCompatibilityError: Dtype mismatch: source has torch.bfloat16, target expects torch.float32`). The nodes wrap their own predict calls in an autocast context already; the enabled flag, dtype, cache flag and nesting depth are now restored after the build.
 - Every forward of those nodes returns `mask`, `object_ids` and `detection_scores` on the device of the incoming `rgb_image` (`shared_backbone.outputs_on_device`) instead of the cpu where they are assembled, so consumers on a cuda pipeline no longer have to move the mask themselves.
