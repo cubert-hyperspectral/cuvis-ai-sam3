@@ -7,7 +7,7 @@ name = "cuvis-ai-sam3"
 dynamic = ["version"]
 description = "SAM3 (Segment Anything Model 3) with a cuvis.ai-compatible plugin package."
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11,<3.14"
 license = { file = "LICENSE" }
 authors = [
     { name = "Meta AI Research" },
@@ -20,6 +20,8 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Image Processing",

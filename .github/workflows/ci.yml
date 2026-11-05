@@ -13,8 +13,15 @@ concurrency:
 
 jobs:
   test:
-    name: Test Suite
+    name: Test Suite (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of requires-python (>=3.11,<3.14).
+        python-version: ["3.11", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
 
     steps:
       - name: Checkout code
@@ -25,7 +32,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -45,6 +52,7 @@ jobs:
             -v
 
       - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.11'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
