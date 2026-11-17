@@ -43,7 +43,7 @@ def test_declares_the_sam3_checkpoint_with_full_pins() -> None:
     assert len(entry.revision) == 40 and len(entry.sha256) == 64
     assert entry.size_bytes > 3_000_000_000
     assert [aux.path for aux in entry.aux_files] == ["config.json"]
-    assert entry.selected_by is None and entry.default is False
+    assert entry.selected_by == "weight_name" and entry.default is True
     assert entry.explicit_path_hparams == ["checkpoint_path"]
     assert entry.license == "SAM License" and entry.license_file == "LICENSE"
     assert entry.used_for and entry.summary and entry.description
@@ -65,16 +65,31 @@ def test_declares_the_sam31_checkpoint_as_a_row_a_node_selects() -> None:
     assert entry.used_for and entry.summary and entry.description
 
 
-def test_only_the_sam3_checkpoint_is_needed_by_every_node() -> None:
-    """A consumer provisions the rows without a selector for every node of the plugin.
+def test_weight_name_picks_one_checkpoint_per_node_and_sam3_is_the_default() -> None:
+    """Both rows sit in the ``weight_name`` group and ``sam3`` is its default row.
 
-    The SAM 3.1 checkpoint is for one node, so it stays behind its selector and no row of that
-    selector is the default: a node that does not set ``weight_name`` asks for ``sam3`` alone.
+    A consumer gives a node that does not set ``weight_name`` the default row and a node that
+    sets it the row it names. The SAM 3 nodes have no such hparam, so they ask for ``sam3``
+    alone; a ``SAM31TextPropagation`` that names ``sam3.1`` asks for ``sam3.1`` alone. A row
+    without a selector would be asked of every node of the plugin, the SAM 3.1 node included.
     """
-    assert [entry.name for entry in WEIGHTS if entry.selected_by is None] == ["sam3"]
-    assert [entry.name for entry in WEIGHTS if entry.default] == []
+    assert [entry.name for entry in WEIGHTS if entry.selected_by is None] == []
+    assert {entry.selected_by for entry in WEIGHTS} == {"weight_name"}
+    assert [entry.name for entry in WEIGHTS if entry.default] == ["sam3"]
     assert ModelWeights.get("sam3").plugin_default is True
     assert ModelWeights.get("sam3.1").plugin_default is False
+
+
+def test_only_the_sam31_node_takes_weight_name() -> None:
+    """The group default is right for every node that cannot name a row itself.
+
+    If a SAM 3 node gained ``weight_name``, a pipeline could point it at the SAM 3.1 file, and
+    if the SAM 3.1 node lost it, a consumer could no longer tell which checkpoint it loads.
+    """
+    takes_it = sorted(
+        cls.__name__ for cls in _node_classes() if "weight_name" in _constructor_params(cls)
+    )
+    assert takes_it == ["SAM31TextPropagation"]
 
 
 def test_register_called_at_import() -> None:
