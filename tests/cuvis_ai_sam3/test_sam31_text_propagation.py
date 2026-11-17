@@ -603,6 +603,33 @@ def test_a_failed_build_leaves_the_node_ready_for_the_next_prompt(
     assert output["object_ids"].shape == (1, 2)
 
 
+def test_a_failure_while_opening_the_stream_leaves_no_half_built_stream(
+    fake_model, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prompt whose stream cannot be set up must not leave state the next frame trips over."""
+    add_frame = SAM31TextPropagation._add_frame_to_state
+    calls: list[int] = []
+
+    def fail_on_the_first_frame(self: SAM31TextPropagation, frame_idx: int) -> None:
+        calls.append(frame_idx)
+        if len(calls) == 1:
+            raise RuntimeError("out of memory")
+        add_frame(self, frame_idx)
+
+    monkeypatch.setattr(SAM31TextPropagation, "_add_frame_to_state", fail_on_the_first_frame)
+    node = SAM31TextPropagation()
+
+    with pytest.raises(RuntimeError, match="out of memory"):
+        node.forward(rgb_image=_frame(), text_prompt="person")
+    assert node._inference_state is None and node._frame_buffer is None
+
+    unprompted = node.forward(rgb_image=_frame())
+    assert unprompted["object_ids"].shape == (1, 0)
+
+    (output,) = _run(node, {0: "person"}, 1)
+    assert output["object_ids"].shape == (1, 2)
+
+
 def test_build_leaves_the_autocast_state_as_it_found_it(monkeypatch: pytest.MonkeyPatch) -> None:
     """The sam3 library enters a bfloat16 autocast in its constructors and never leaves it."""
     builder = _patch_build(monkeypatch, {"weight"})

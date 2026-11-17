@@ -476,13 +476,13 @@ class SAM31TextPropagation(Node):
         """
         self._ensure_model()
         self._drop_stream()
-        self._frame_buffer = _FrameBuffer31(
-            image_size=int(self._model.image_size), device=self._model_device()
-        )
-        self._frame_buffer.add(frame)
-        state = self._inference_state = self._build_state(frame.shape[0], frame.shape[1])
-        self._add_frame_to_state(0)
         try:
+            self._frame_buffer = _FrameBuffer31(
+                image_size=int(self._model.image_size), device=self._model_device()
+            )
+            self._frame_buffer.add(frame)
+            state = self._inference_state = self._build_state(frame.shape[0], frame.shape[1])
+            self._add_frame_to_state(0)
             with self._inference_context():
                 self._model.add_prompt(state, frame_idx=0, text_str=prompt)
                 # An empty history makes the model track every object of the prompt.
