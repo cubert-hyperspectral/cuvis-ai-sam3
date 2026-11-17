@@ -476,7 +476,7 @@ def test_build_uses_the_registry_checkpoint_and_streaming_safe_arguments(
 
     monkeypatch.setattr(ModelWeights, "resolve", staticmethod(resolve))
 
-    model = node_module._build_multiplex_model(None, max_num_objects=64)
+    model = node_module._build_multiplex_model(None, weight_name="sam3.1", max_num_objects=64)
 
     assert isinstance(model, _BuiltModel)
     assert resolved == ["sam3.1"]
@@ -497,16 +497,64 @@ def test_build_takes_an_explicit_checkpoint_without_asking_the_registry(
         ModelWeights, "resolve", staticmethod(lambda _name: pytest.fail("registry was asked"))
     )
 
-    node_module._build_multiplex_model("local/sam3.1_multiplex.pt", max_num_objects=16)
+    node_module._build_multiplex_model(
+        "local/sam3.1_multiplex.pt", weight_name="sam3.1", max_num_objects=16
+    )
 
     assert builder.call_args.kwargs["checkpoint_path"] == "local/sam3.1_multiplex.pt"
+
+
+def test_build_resolves_the_weights_the_node_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cuvis_ai_core.data.model_weights import ModelWeights
+
+    builder = _patch_build(monkeypatch, {"weight"})
+    monkeypatch.setattr(ModelWeights, "resolve", staticmethod(lambda name: f"registry/{name}.pt"))
+
+    node_module._build_multiplex_model(None, weight_name="another-row", max_num_objects=16)
+
+    assert builder.call_args.kwargs["checkpoint_path"] == "registry/another-row.pt"
+
+
+def test_the_node_hands_its_weight_name_to_the_build(fake_model) -> None:
+    node = SAM31TextPropagation(weight_name="another-row")
+
+    _run(node, {0: "person"}, 1)
+
+    assert fake_model.builds.call_args.kwargs["weight_name"] == "another-row"
+    assert node.hparams["weight_name"] == "another-row"
+
+
+def test_the_default_weight_name_is_the_row_the_plugin_declares() -> None:
+    from cuvis_ai_sam3.weights import WEIGHTS
+
+    node = SAM31TextPropagation()
+
+    (row,) = [entry for entry in WEIGHTS if entry.name == node.hparams["weight_name"]]
+    assert row.selected_by == "weight_name"
+    assert "checkpoint_path" in row.explicit_path_hparams
+
+
+def test_an_unknown_weight_name_fails_with_the_registry_error_and_keeps_no_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cuvis_ai_core.data.model_weights import ModelDownloadError
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    node = SAM31TextPropagation(weight_name="no-such-weights")
+
+    with pytest.raises(ModelDownloadError, match="no-such-weights"):
+        node.forward(rgb_image=_frame(), text_prompt="person")
+
+    assert node._model is None and node._inference_state is None
 
 
 def test_build_needs_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="CUDA"):
-        node_module._build_multiplex_model("local/sam3.1_multiplex.pt", max_num_objects=16)
+        node_module._build_multiplex_model(
+            "local/sam3.1_multiplex.pt", weight_name="sam3.1", max_num_objects=16
+        )
 
 
 def test_build_refuses_a_checkpoint_that_leaves_weights_unset(
@@ -515,7 +563,9 @@ def test_build_refuses_a_checkpoint_that_leaves_weights_unset(
     _patch_build(monkeypatch, {"something_else"})
 
     with pytest.raises(RuntimeError, match="weight"):
-        node_module._build_multiplex_model("local/sam3.pt", max_num_objects=16)
+        node_module._build_multiplex_model(
+            "local/sam3.pt", weight_name="sam3.1", max_num_objects=16
+        )
 
 
 def test_missing_checkpoint_keys_ignores_the_computed_rotary_buffers() -> None:
@@ -566,7 +616,9 @@ def test_build_leaves_the_autocast_state_as_it_found_it(monkeypatch: pytest.Monk
     builder.side_effect = leaking_builder
     enabled, dtype = torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu")
     try:
-        node_module._build_multiplex_model("local/sam3.1_multiplex.pt", max_num_objects=16)
+        node_module._build_multiplex_model(
+            "local/sam3.1_multiplex.pt", weight_name="sam3.1", max_num_objects=16
+        )
         assert torch.is_autocast_enabled("cpu") is enabled
         assert torch.get_autocast_dtype("cpu") == dtype
     finally:

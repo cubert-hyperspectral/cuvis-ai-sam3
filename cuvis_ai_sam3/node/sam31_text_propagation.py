@@ -27,8 +27,8 @@ from cuvis_ai_sam3 import shared_backbone as _shared
 
 from .sam3_streaming_propagation import _STREAMING_SENTINEL, SAM3TextPropagation, _FrameBuffer
 
-_WEIGHT_NAME = "sam3.1"
-"""Name of the SAM 3.1 checkpoint in cuvis-ai-core's model-weight registry."""
+_DEFAULT_WEIGHT_NAME = "sam3.1"
+"""Registry name of the SAM 3.1 checkpoint the node loads unless ``weight_name`` says otherwise."""
 
 _COMPUTED_BUFFER_SUFFIXES = ("freqs_cis_real", "freqs_cis_imag")
 """Rotary-encoding buffers the model computes at construction; no checkpoint stores them."""
@@ -110,7 +110,9 @@ def _missing_checkpoint_keys(model_keys: Iterable[str], checkpoint_keys: set[str
     ]
 
 
-def _build_multiplex_model(checkpoint_path: str | None, *, max_num_objects: int) -> Any:
+def _build_multiplex_model(
+    checkpoint_path: str | None, *, weight_name: str, max_num_objects: int
+) -> Any:
     """Build the SAM 3.1 Object Multiplex video model on the GPU and check its weights.
 
     ``sam3.model_builder`` loads the checkpoint non-strictly and only prints what is missing,
@@ -120,7 +122,10 @@ def _build_multiplex_model(checkpoint_path: str | None, *, max_num_objects: int)
     Parameters
     ----------
     checkpoint_path : str | None
-        Local ``sam3.1_multiplex.pt``; ``None`` resolves it through cuvis-ai-core's registry.
+        Local ``sam3.1_multiplex.pt``; ``None`` resolves ``weight_name`` through cuvis-ai-core's
+        registry.
+    weight_name : str
+        Registry name of the checkpoint; not read when ``checkpoint_path`` is given.
     max_num_objects : int
         Most objects the tracker holds at once; see :class:`SAM31TextPropagation`.
 
@@ -141,7 +146,7 @@ def _build_multiplex_model(checkpoint_path: str | None, *, max_num_objects: int)
     if checkpoint_path is None:
         from cuvis_ai_core.data.model_weights import ModelWeights
 
-        checkpoint_path = str(ModelWeights.resolve(_WEIGHT_NAME))
+        checkpoint_path = str(ModelWeights.resolve(weight_name))
 
     from sam3.model_builder import build_sam3_multiplex_video_predictor
 
@@ -193,7 +198,11 @@ class SAM31TextPropagation(Node):
     Parameters
     ----------
     checkpoint_path : str | None
-        Local ``sam3.1_multiplex.pt``. ``None`` takes the registered ``sam3.1`` weights.
+        Local ``sam3.1_multiplex.pt``. ``None`` takes the registered weights ``weight_name``
+        names.
+    weight_name : str
+        Registry name of the checkpoint. A pipeline that sets it lets a host application see
+        which weights the pipeline needs before it loads; ``checkpoint_path`` wins over it.
     score_threshold_detection : float
         Lowest detection score that counts as a detection of the prompt.
     new_det_thresh : float
@@ -230,6 +239,7 @@ class SAM31TextPropagation(Node):
     def __init__(
         self,
         checkpoint_path: str | None = None,
+        weight_name: str = _DEFAULT_WEIGHT_NAME,
         score_threshold_detection: float = 0.4,
         new_det_thresh: float = 0.65,
         det_nms_thresh: float = 0.1,
@@ -238,6 +248,7 @@ class SAM31TextPropagation(Node):
         **kwargs: Any,
     ) -> None:
         self._checkpoint_path = checkpoint_path
+        self._weight_name = weight_name
         self._score_threshold_detection = score_threshold_detection
         self._new_det_thresh = new_det_thresh
         self._det_nms_thresh = det_nms_thresh
@@ -258,6 +269,7 @@ class SAM31TextPropagation(Node):
 
         super().__init__(
             checkpoint_path=checkpoint_path,
+            weight_name=weight_name,
             score_threshold_detection=score_threshold_detection,
             new_det_thresh=new_det_thresh,
             det_nms_thresh=det_nms_thresh,
@@ -273,7 +285,9 @@ class SAM31TextPropagation(Node):
         if self._model is not None:
             return
         model = _build_multiplex_model(
-            self._checkpoint_path or None, max_num_objects=self._max_num_objects
+            self._checkpoint_path or None,
+            weight_name=self._weight_name,
+            max_num_objects=self._max_num_objects,
         )
         # The builder is set up for whole videos: it holds outputs back for fifteen frames to
         # drop short-lived tracks, hands results out sixteen at a time and runs the detector

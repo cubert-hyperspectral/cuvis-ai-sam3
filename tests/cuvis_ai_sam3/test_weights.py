@@ -35,8 +35,8 @@ def _constructor_params(cls: type) -> set[str]:
 
 
 def test_declares_the_sam3_checkpoint_with_full_pins() -> None:
-    assert [entry.name for entry in WEIGHTS] == ["sam3"]
-    (entry,) = WEIGHTS
+    assert [entry.name for entry in WEIGHTS] == ["sam3", "sam3.1"]
+    entry = WEIGHTS[0]
     assert isinstance(entry, PluginWeightEntry)
     assert entry.repo_id == "cubert-gmbh/sam3"
     assert entry.filename == "sam3.pt"
@@ -49,12 +49,41 @@ def test_declares_the_sam3_checkpoint_with_full_pins() -> None:
     assert entry.used_for and entry.summary and entry.description
 
 
+def test_declares_the_sam31_checkpoint_as_a_row_a_node_selects() -> None:
+    entry = WEIGHTS[1]
+    assert isinstance(entry, PluginWeightEntry)
+    assert entry.name == "sam3.1"
+    assert entry.repo_id == "cubert-gmbh/sam3.1"
+    assert entry.filename == "sam3.1_multiplex.pt"
+    assert entry.revision == "8f2b686066130b1bc20e94f94d0b2ac69aa7f362"
+    assert entry.sha256 == "0567debeec80ba4ac6369540c6c248025283cb3ff2b92827509e57e2b3541cb6"
+    assert entry.size_bytes == 3_502_755_717
+    assert [aux.path for aux in entry.aux_files] == ["config.json"]
+    assert entry.selected_by == "weight_name" and entry.default is False
+    assert entry.explicit_path_hparams == ["checkpoint_path"]
+    assert entry.license == "SAM License" and entry.license_file == "LICENSE"
+    assert entry.used_for and entry.summary and entry.description
+
+
+def test_only_the_sam3_checkpoint_is_needed_by_every_node() -> None:
+    """A consumer provisions the rows without a selector for every node of the plugin.
+
+    The SAM 3.1 checkpoint is for one node, so it stays behind its selector and no row of that
+    selector is the default: a node that does not set ``weight_name`` asks for ``sam3`` alone.
+    """
+    assert [entry.name for entry in WEIGHTS if entry.selected_by is None] == ["sam3"]
+    assert [entry.name for entry in WEIGHTS if entry.default] == []
+    assert ModelWeights.get("sam3").plugin_default is True
+    assert ModelWeights.get("sam3.1").plugin_default is False
+
+
 def test_register_called_at_import() -> None:
-    row = ModelWeights.get("sam3")
     assert PLUGIN_NAME == "sam3"
-    assert row.plugin == PLUGIN_NAME
-    assert row.source == "plugin"
-    assert row.entry == WEIGHTS[0]
+    for entry in WEIGHTS:
+        row = ModelWeights.get(entry.name)
+        assert row.plugin == PLUGIN_NAME
+        assert row.source == "plugin"
+        assert row.entry == entry
     assert cuvis_ai_sam3.WEIGHTS is WEIGHTS
 
 
@@ -96,7 +125,7 @@ def test_weights_module_is_side_effect_free() -> None:
         f"spec = importlib.util.spec_from_file_location('weights_probe', {str(path)!r})\n"
         "mod = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(mod)\n"
-        "assert len(mod.WEIGHTS) == 1\n"
+        "assert len(mod.WEIGHTS) == 2\n"
         "for heavy in ('torch', 'cuvis_ai_core', 'sam3', 'cuvis_ai_sam3'):\n"
         "    assert heavy not in sys.modules, heavy\n"
     )
