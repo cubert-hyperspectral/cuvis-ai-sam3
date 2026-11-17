@@ -12,10 +12,12 @@ from .sam3_streaming_propagation import (
     SAM3TextPropagation,
     SAM3TrackerInference,
 )
+from .sam31_text_propagation import SAM31TextPropagation
 
 __all__ = [
     "SAM3TrackerInference",
     "SAM3TextPropagation",
+    "SAM31TextPropagation",
     "SAM3BboxPropagation",
     "SAM3PointPropagation",
     "SAM3MaskPropagation",
