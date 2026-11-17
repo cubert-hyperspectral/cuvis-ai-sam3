@@ -9,6 +9,7 @@ Cuvis.AI plugin that adapts SAM3 for Cuvis.AI stream-mode applications, bringing
 **Nodes**
 
 - `SAM3TextPropagation`: text or concept-based object detection and tracking
+- `SAM31TextPropagation`: the same on the SAM 3.1 Object Multiplex model; faster once several objects are tracked (needs CUDA and the `sam3.1` weights; a pipeline sets `weight_name: sam3.1` on the node)
 - `SAM3BboxPropagation`: bounding-box prompt tracking
 - `SAM3PointPropagation`: point prompt tracking
 - `SAM3MaskPropagation`: mask or label-map based tracking
