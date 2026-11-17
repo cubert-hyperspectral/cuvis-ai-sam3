@@ -580,6 +580,30 @@ def test_missing_checkpoint_keys_ignores_the_computed_rotary_buffers() -> None:
     assert _missing_checkpoint_keys(model_keys, {"a.weight"}) == ["b.bias"]
 
 
+def test_checkpoint_prefix_renames_are_the_ones_the_vendored_loader_applies() -> None:
+    """The weight check repeats the loader's renames; this fails when the loader moves on."""
+    import inspect
+
+    import sam3.model_builder as model_builder
+
+    source = inspect.getsource(model_builder.build_sam3_multiplex_video_predictor)
+    for old, new in node_module._CHECKPOINT_KEY_RENAMES:
+        assert f'k.startswith("{old}")' in source
+        assert f'"{new}" + k[len("{old}")' in source
+
+
+def test_a_model_built_for_several_ranks_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A multi-rank detector reads a whole chunk of frames; the stream keeps the last two."""
+    model = _FakeMultiplexModel()
+    model.world_size = 4  # type: ignore[attr-defined]
+    monkeypatch.setattr(node_module, "_build_multiplex_model", lambda *_a, **_k: model)
+    node = SAM31TextPropagation()
+
+    with pytest.raises(RuntimeError, match="WORLD_SIZE"):
+        node.forward(rgb_image=_frame(), text_prompt="person")
+    assert node._model is None and node._inference_state is None
+
+
 def test_a_failed_build_leaves_the_node_ready_for_the_next_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -750,6 +774,36 @@ def test_build_enters_the_requested_cuda_index(monkeypatch: pytest.MonkeyPatch) 
         device=torch.device("cuda"),
     )
     assert events == ["build"]
+
+
+def test_model_calls_run_with_the_models_gpu_as_the_current_one(
+    fake_model, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The vendored tracker allocates state on a bare ``cuda``, which is the current device."""
+    entered: list[int] = []
+
+    class _RecordedDevice:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def __enter__(self) -> None:
+            entered.append(self.index)
+
+        def __exit__(self, *_exc: Any) -> None:
+            return None
+
+    monkeypatch.setattr(torch.cuda, "device", _RecordedDevice)
+    node = SAM31TextPropagation()
+    node._ensure_model()
+
+    with node._inference_context():  # the stand-in model lives on the cpu
+        pass
+    assert entered == []
+
+    monkeypatch.setattr(node, "_model_device", lambda: torch.device("cuda", 1))
+    with node._inference_context():
+        pass
+    assert entered == [1]
 
 
 def test_a_model_that_cannot_load_on_the_move_waits_for_the_first_prompt(

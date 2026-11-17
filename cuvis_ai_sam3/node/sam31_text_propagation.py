@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import numpy as np
@@ -188,9 +188,11 @@ class SAM31TextPropagation(Node):
     """Track the objects a text prompt names across RGB frames with SAM 3.1 Object Multiplex.
 
     Same ports as :class:`~cuvis_ai_sam3.node.sam3_streaming_propagation.SAM3TextPropagation`,
-    so a pipeline changes the class name only. Frames before the first ``text_prompt`` return
-    an empty label map. A prompt starts the tracker on its frame; every later frame advances
-    it by one step and keeps finding new objects of the prompt.
+    so a pipeline keeps its wiring. To move one over, swap the class name, set
+    ``weight_name: sam3.1`` and replace the SAM 3 hparam ``max_tracker_states`` by
+    ``max_num_objects``. Frames before the first ``text_prompt`` return an empty label map. A
+    prompt starts the tracker on its frame; every later frame advances it by one step and
+    keeps finding new objects of the prompt.
 
     Where it differs from the SAM 3 node:
 
@@ -220,7 +222,9 @@ class SAM31TextPropagation(Node):
     new_det_thresh : float
         Lowest detection score that opens a new track.
     det_nms_thresh : float
-        IoU above which the weaker of two detections is dropped.
+        Overlap above which the weaker of two detections is dropped, measured as the
+        intersection over the smaller of the two masks (not IoU): a mask nested in another
+        overlaps it fully.
     overlap_suppress_thresh : float
         Overlap above which the more recently occluded of two tracks is hidden.
     max_num_objects : int
@@ -304,6 +308,17 @@ class SAM31TextPropagation(Node):
             max_num_objects=self._max_num_objects,
             device=self._pipeline_device,
         )
+        # A model launched for several ranks runs its detector on a chunk of that many frames
+        # at once; the stream holds the last two and has no earlier frame to give it.
+        ranks = max(
+            int(getattr(model, "world_size", 1)),
+            int(getattr(getattr(model, "detector", None), "world_size", 1)),
+        )
+        if ranks > 1:
+            raise RuntimeError(
+                f"SAM31TextPropagation streams in one process, but the SAM 3.1 model was built "
+                f"for {ranks} ranks (WORLD_SIZE={ranks}). Unset WORLD_SIZE for this node."
+            )
         # The builder is set up for whole videos: it holds outputs back for fifteen frames to
         # drop short-lived tracks, hands results out sixteen at a time and runs the detector
         # on batches of frames. A stream has one frame at a time and needs its mask now.
@@ -361,9 +376,21 @@ class SAM31TextPropagation(Node):
         except StopIteration:
             return torch.device("cpu")
 
-    def _inference_context(self) -> torch.autocast:
-        """Autocast the model was trained to run under (bfloat16)."""
-        return torch.autocast(device_type=self._model_device().type, dtype=torch.bfloat16)
+    @contextlib.contextmanager
+    def _inference_context(self) -> Iterator[None]:
+        """Run the model under bfloat16 autocast with its own GPU as the current CUDA device.
+
+        The vendored tracker allocates part of its state on a bare ``cuda`` device, which is
+        whichever GPU is current; on a host with several GPUs that has to be the model's.
+        """
+        device = self._model_device()
+        on_device = (
+            torch.cuda.device(device.index)
+            if device.type == "cuda" and device.index is not None
+            else contextlib.nullcontext()
+        )
+        with on_device, torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            yield
 
     def _apply(self, fn: Any, recurse: bool = True) -> SAM31TextPropagation:
         """Follow the pipeline's device: load on a GPU move, start over when the device changes.
