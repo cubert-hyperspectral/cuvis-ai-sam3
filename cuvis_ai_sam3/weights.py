@@ -8,10 +8,12 @@ The pins come from ``tools/mirror_weights.py`` in cuvis-ai-core (the mirrors are
 ``cubert-gmbh/sam3``, a byte-identical copy of ``facebook/sam3`` at 3c879f39, and
 ``cubert-gmbh/sam3.1``, the same for ``facebook/sam3.1`` at daa63191).
 
-A consumer provisions every row without ``selected_by`` for every node of the plugin.
-``sam3`` is such a row. ``sam3.1`` serves one node, so it is selected by that node's
-``weight_name`` and the group has no default row: a pipeline needs it only where its
-node names it.
+Both rows are selected by the hyper-parameter ``weight_name`` and ``sam3`` is the default
+of that group. A consumer gives a node that does not set ``weight_name`` the default row
+and a node that sets it the row it names. Only ``SAM31TextPropagation`` takes the
+hyper-parameter, so every other node asks for ``sam3`` and a pipeline needs ``sam3.1``
+only where that node names it. A row without ``selected_by`` would be provisioned for
+every node of the plugin, the SAM 3.1 node included.
 """
 
 from __future__ import annotations
@@ -41,10 +43,12 @@ WEIGHTS: tuple[PluginWeightEntry, ...] = (
         ],
         license="SAM License",
         license_file="LICENSE",
+        selected_by="weight_name",
+        default=True,
         explicit_path_hparams=["checkpoint_path"],
         description=(
             "SAM3 checkpoint for the magic-wand point expansion, text / box / mask "
-            "propagation and segment-everything nodes; every sam3 node needs it unless "
+            "propagation and segment-everything nodes; every SAM 3 node needs it unless "
             "checkpoint_path points at a local file (mirror of facebook/sam3 at 3c879f39)."
         ),
     ),

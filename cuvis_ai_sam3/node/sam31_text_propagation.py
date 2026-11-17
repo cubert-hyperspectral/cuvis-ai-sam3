@@ -215,8 +215,9 @@ class SAM31TextPropagation(Node):
         Local ``sam3.1_multiplex.pt``. ``None`` takes the registered weights ``weight_name``
         names.
     weight_name : str
-        Registry name of the checkpoint. A pipeline that sets it lets a host application see
-        which weights the pipeline needs before it loads; ``checkpoint_path`` wins over it.
+        Registry name of the checkpoint. Set it in the pipeline: a host application provisions
+        the row it names, and for a node that leaves it out the default row of the group,
+        which is the SAM 3 checkpoint. ``checkpoint_path`` wins over it.
     score_threshold_detection : float
         Lowest detection score that counts as a detection of the prompt.
     new_det_thresh : float
