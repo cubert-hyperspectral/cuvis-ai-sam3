@@ -12,6 +12,7 @@ count. This module therefore drives the model with its own, smaller streaming ad
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import Iterable
 from typing import Any
@@ -111,7 +112,11 @@ def _missing_checkpoint_keys(model_keys: Iterable[str], checkpoint_keys: set[str
 
 
 def _build_multiplex_model(
-    checkpoint_path: str | None, *, weight_name: str, max_num_objects: int
+    checkpoint_path: str | None,
+    *,
+    weight_name: str,
+    max_num_objects: int,
+    device: torch.device | None = None,
 ) -> Any:
     """Build the SAM 3.1 Object Multiplex video model on the GPU and check its weights.
 
@@ -128,6 +133,9 @@ def _build_multiplex_model(
         Registry name of the checkpoint; not read when ``checkpoint_path`` is given.
     max_num_objects : int
         Most objects the tracker holds at once; see :class:`SAM31TextPropagation`.
+    device : torch.device | None
+        CUDA device to build on. Only an index is honoured (``cuda:1``); ``None`` or a device
+        without one builds on the current CUDA device.
 
     Returns
     -------
@@ -150,9 +158,13 @@ def _build_multiplex_model(
 
     from sam3.model_builder import build_sam3_multiplex_video_predictor
 
+    # The builder moves the model with a bare ``.cuda()``, which lands on the current CUDA
+    # device; a pipeline on another GPU gets its model there by making that one current.
+    index = device.index if device is not None and device.type == "cuda" else None
+    on_device = torch.cuda.device(index) if index is not None else contextlib.nullcontext()
     # The sam3 library switches a bfloat16 autocast on in its constructors and never switches
     # it off; keep the thread's state as it was before the build.
-    with _shared.preserve_autocast_state():
+    with on_device, _shared.preserve_autocast_state():
         predictor = build_sam3_multiplex_video_predictor(
             checkpoint_path=checkpoint_path,
             max_num_objects=max_num_objects,
@@ -256,6 +268,8 @@ class SAM31TextPropagation(Node):
         self._max_num_objects = max_num_objects
 
         self._model: Any = None
+        # Device the pipeline was last moved to; the model is built there.
+        self._pipeline_device: torch.device | None = None
         # Frames of tracker memory to keep; read off the model when it is built.
         self._keep_recent: int = 16
         self._frame_buffer: _FrameBuffer31 | None = None
@@ -288,6 +302,7 @@ class SAM31TextPropagation(Node):
             self._checkpoint_path or None,
             weight_name=self._weight_name,
             max_num_objects=self._max_num_objects,
+            device=self._pipeline_device,
         )
         # The builder is set up for whole videos: it holds outputs back for fifteen frames to
         # drop short-lived tracks, hands results out sixteen at a time and runs the detector
@@ -351,10 +366,23 @@ class SAM31TextPropagation(Node):
         return torch.autocast(device_type=self._model_device().type, dtype=torch.bfloat16)
 
     def _apply(self, fn: Any, recurse: bool = True) -> SAM31TextPropagation:
-        """Load the model when the pipeline moves to a GPU, not on the first prompt."""
-        module = super()._apply(fn, recurse)
+        """Follow the pipeline's device: load on a GPU move, start over when the device changes.
+
+        A running stream keeps its frames and tracker state on the device it was opened on,
+        so a move to another device drops the stream and the model; the model is built again
+        on the new device and the next prompt opens a new stream there.
+        """
         target = _shared.resolve_apply_target_device(fn)
-        if target is not None and target.type == "cuda" and self._model is None:
+        if target is not None and self._model is not None:
+            current = self._pipeline_device or self._model_device()
+            if _shared.device_key(target) != _shared.device_key(current):
+                self.reset()
+                self._model = None
+        module = super()._apply(fn, recurse)
+        if target is None:
+            return module
+        self._pipeline_device = target
+        if target.type == "cuda" and self._model is None:
             try:
                 self._ensure_model()
             except Exception as exc:

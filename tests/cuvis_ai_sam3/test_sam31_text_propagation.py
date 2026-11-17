@@ -669,6 +669,89 @@ def test_moving_the_pipeline_to_a_gpu_loads_the_model(
     fake_model.builds.assert_called_once()
 
 
+def test_moving_the_pipeline_to_a_gpu_builds_on_that_gpu(
+    fake_model, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cuvis_ai_sam3 import shared_backbone
+
+    monkeypatch.setattr(
+        shared_backbone, "resolve_apply_target_device", lambda _fn: torch.device("cuda", 1)
+    )
+    node = SAM31TextPropagation()
+
+    node._apply(lambda tensor: tensor)
+
+    assert fake_model.builds.call_args.kwargs["device"] == torch.device("cuda", 1)
+
+
+def test_moving_a_running_stream_to_another_device_starts_over(
+    fake_model, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stream's tensors live on the device it was opened on; a moved pipeline starts fresh."""
+    from cuvis_ai_sam3 import shared_backbone
+
+    target = {"device": torch.device("cuda", 0)}
+    monkeypatch.setattr(
+        shared_backbone, "resolve_apply_target_device", lambda _fn: target["device"]
+    )
+    node = SAM31TextPropagation()
+    node._apply(lambda tensor: tensor)
+    _run(node, {0: "person"}, 2)
+
+    node._apply(lambda tensor: tensor)  # the same device again: nothing changes
+    assert node._inference_state is not None
+    assert fake_model.builds.call_count == 1
+
+    target["device"] = torch.device("cuda", 1)
+    node._apply(lambda tensor: tensor)
+
+    assert node._inference_state is None
+    assert fake_model.builds.call_count == 2
+    assert fake_model.builds.call_args.kwargs["device"] == torch.device("cuda", 1)
+    unprompted = node.forward(rgb_image=_frame())
+    assert unprompted["object_ids"].shape == (1, 0)
+
+
+def test_build_enters_the_requested_cuda_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The upstream builder calls ``.cuda()`` with no index, so the build selects the device."""
+    builder = _patch_build(monkeypatch, {"weight"})
+    events: list[str] = []
+
+    class _RecordedDevice:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def __enter__(self) -> None:
+            events.append(f"enter {self.index}")
+
+        def __exit__(self, *_exc: Any) -> None:
+            events.append(f"exit {self.index}")
+
+    def build(**_kwargs: Any) -> SimpleNamespace:
+        events.append("build")
+        return SimpleNamespace(model=_BuiltModel())
+
+    builder.side_effect = build
+    monkeypatch.setattr(torch.cuda, "device", _RecordedDevice)
+
+    node_module._build_multiplex_model(
+        "local/sam3.1_multiplex.pt",
+        weight_name="sam3.1",
+        max_num_objects=16,
+        device=torch.device("cuda", 1),
+    )
+    assert events == ["enter 1", "build", "exit 1"]
+
+    events.clear()
+    node_module._build_multiplex_model(
+        "local/sam3.1_multiplex.pt",
+        weight_name="sam3.1",
+        max_num_objects=16,
+        device=torch.device("cuda"),
+    )
+    assert events == ["build"]
+
+
 def test_a_model_that_cannot_load_on_the_move_waits_for_the_first_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
