@@ -1011,7 +1011,17 @@ def functional_attention(
         assert dropout == 0.0
         out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     else:
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        # cuvis fork: upstream asks for the flash kernel alone. PyTorch's Windows wheels have
+        # none, so the call fails there with "No available kernel" (upstream issue
+        # https://github.com/facebookresearch/sam3/issues/523). Flash stays the first choice
+        # where it exists; the other two are in every build.
+        with sdpa_kernel(
+            [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+        ):
             out = torchF.scaled_dot_product_attention(q, k, v, dropout_p=dropout)
         out = out.transpose(1, 2)  #  B * n * n_heads * (cv // num_heads)
 
